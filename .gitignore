@@ -221,3 +221,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── H2Vault: never commit local secrets, keys, vault stores or outputs ────────────────────────────────────────────
+_user/
+secrets.enc.json
+secrets.passphrase
+*.h2vkey
+*.h2vault-key.txt
+*-recovery-codes.txt
+*.h2vault.json
+*.encrypted.txt
+output/
+outputs/
+node_modules/
