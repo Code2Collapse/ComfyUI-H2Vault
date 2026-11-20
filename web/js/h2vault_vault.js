@@ -236,7 +236,7 @@ function applyInterface(node) {
   if (!node.__h2vMinWidth && typeof node.computeSize === "function") {
     // a DOM widget's computeSize gives a height only: the status card's minimum width comes from the node
     const cs = node.computeSize;
-    node.computeSize = function (...a) { const r = cs.apply(this, a); if (Array.isArray(r)) r[0] = Math.max(r[0], 340); return r; };
+    node.computeSize = function (...a) { const r = cs.apply(this, a); if (Array.isArray(r)) r[0] = Math.max(r[0], 380); return r; };
     node.__h2vMinWidth = true;
   }
   node.setSize?.(node.computeSize?.() ?? node.size);
@@ -913,7 +913,8 @@ async function enterOpened(v, res, payload) {
     const inputMap = vaultInfo(v).input_map;
     const wires = replaceNode(graph, v, sg);
     if (res.ui.size) sg.size = [...res.ui.size];
-    sg.title = res.ui.title || v.title;
+    sg.title = v.title || res.ui.title;            // the vault node's title wins (the layout keeps the pre-lock one)
+    try { if (sg.title) subgraph.name = sg.title; } catch (_) { /* the breadcrumb then shows the layout's name */ }
     restoreWires(graph, wires, sg, (slot) => subgraphSlotOf(v, inputMap, slot));
   } else {
     // H2Vault never writes the first (flattened) vault layout, so a vault without an editable layout is foreign
