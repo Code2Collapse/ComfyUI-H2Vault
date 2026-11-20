@@ -58,6 +58,12 @@ def _register_server_side() -> None:
             _ps.install_message_filter(server)
         except Exception as exc:  # noqa: BLE001
             _fail("vault message filter", exc)
+        try:                       # V3: AFTER the vault filter - concealment must be the outermost wrapper
+            from .nodes import concealment as _conceal
+            if not _conceal.install(server):
+                _fail("vault concealment", RuntimeError("not installed"))
+        except Exception as exc:  # noqa: BLE001
+            _fail("vault concealment", exc)
         try:
             from .nodes import routes as _routes
             _routes.register_routes(server)

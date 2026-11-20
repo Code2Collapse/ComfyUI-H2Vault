@@ -21,6 +21,7 @@ import re
 import threading
 from typing import Any, Optional
 
+from . import concealment
 from .crypto import VaultError
 
 log = logging.getLogger("h2vault")
@@ -397,9 +398,14 @@ class H2Vault_ProtectedSubgraph:
         me = dynprompt.get_node(unique_id) if dynprompt is not None else {}
         my_inputs = dict((me or {}).get("inputs") or {})
         params = {k[len(PARAM_PREFIX):]: v for k, v in kw.items() if k.startswith(PARAM_PREFIX)}
+        try:                                                   # V3: aliases resolve here; no-op unless concealed
+            params = concealment.resolve_params(plain, params)
+        except concealment.ConcealError as exc:
+            raise RuntimeError(str(exc)) from None
         from comfy_execution.graph_utils import GraphBuilder
         prefix = GraphBuilder.alloc_prefix()
         graph, result = build_expansion(api, my_inputs, params, prefix, str(unique_id))
+        graph = concealment.after_expansion(str(unique_id), plain, graph, prefix)   # V3: registers a concealed run
         _ACTIVE_VAULTS.add(str(unique_id))
         _INNER_TYPES[str(unique_id)] = {k: str(n["class_type"]) for k, n in graph.items()}
         result += [None] * (len(self.RETURN_TYPES) - len(result))
@@ -469,8 +475,9 @@ _INNER_ID_RE = re.compile(r"[\w:]+\.\d+\.\d+\.[\w:.-]+")    # "9:10.0.0.3" insid
 
 def public_node_type(vault_id: str, inner_type: Optional[str]) -> Optional[str]:
     """What an error may say about the inner node that failed (docs/ARCHITECTURE.md s7: the V3 concealment seam).
-    Today its class type (the A18 rule "type + message, no values")."""
-    return inner_type
+    The class type for an ordinary vault (the A18 rule "type + message, no values"); a neutral label for a concealed
+    one (V3, nodes/concealment.py)."""
+    return concealment.public_node_type(vault_id, inner_type)
 
 
 def _inner_type(vault: str, inner: Optional[str]) -> Optional[str]:

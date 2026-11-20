@@ -744,6 +744,12 @@ def hosted_enabled() -> bool:
     return os.environ.get("H2VAULT_HOSTED", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def hosted_allowed_classes() -> frozenset:
+    """HOSTED_ALLOWED_CLASSES plus the operator's own (env H2VAULT_HOSTED_ALLOW, comma-separated class ids)."""
+    extra = {c.strip() for c in os.environ.get("H2VAULT_HOSTED_ALLOW", "").split(",") if c.strip()}
+    return HOSTED_ALLOWED_CLASSES | frozenset(extra)
+
+
 def _server_model_names() -> set:
     now = time.monotonic()
     if _model_cache.get("t", -1e9) + 60 > now:
@@ -785,11 +791,12 @@ def _redact_object_info(info, model_names: set):
 
 
 def hosted_middleware(*, model_names: Optional[Callable[[], set]] = None,
-                      allowed_classes: frozenset = HOSTED_ALLOWED_CLASSES):
+                      allowed_classes: Optional[frozenset] = None):
     """aiohttp middleware for the Hosted profile: every client is a Recipient (design 4.4)."""
     from aiohttp import web
     import json as _json
     names_fn = model_names or _server_model_names
+    allowed_classes = allowed_classes if allowed_classes is not None else hosted_allowed_classes()
 
     def refuse():
         return web.json_response({"error": _HOSTED_REFUSAL}, status=403)

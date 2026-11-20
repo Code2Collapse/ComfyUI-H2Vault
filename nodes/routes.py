@@ -155,6 +155,22 @@ def _validate_api(api: dict, interface: dict) -> None:
         raise VaultError(str(exc)) from None
 
 
+def _with_conceal(plain: dict, conceal) -> Optional[dict]:
+    """V3 concealment (nodes/concealment.py): a concealed vault carries its `conceal` section INSIDE the payload, and
+    sealing refuses one whose public half would name its inside. -> the whitelisted public interface, or None for an
+    ordinary vault."""
+    if conceal is None:
+        return None
+    from . import concealment
+    if not isinstance(conceal, dict):
+        raise VaultError("The concealment settings of this vault are malformed.")
+    plain["conceal"] = conceal
+    problems = concealment.check_public(plain)
+    if problems:
+        raise VaultError(" ".join(problems))
+    return concealment.public_interface(plain)
+
+
 def protect(body: dict) -> dict:
     from . import protected_subgraph as SS
     from . import crypto as v2
@@ -178,13 +194,17 @@ def protect(body: dict) -> dict:
     plain = {"exec": boundary_exec(interface), "api": api, "ui": body.get("ui"), "interface": interface,
              "editors": editors, "profile": profile, "packs": vault_packs.record_safely(api),          # L9.50
              "created": int(time.time())}
+    public = _with_conceal(plain, body.get("conceal"))
     payload, kek = v2.lock(plain, password, vault_id=vault_id, mode=PROFILES[profile], iface=_iface(interface),
                            recipients=recipients)
     if profile == "locked" and body.get("client_id"):
         SS.RUN_SESSIONS.put(str(body["client_id"]), vault_id, kek)   # the creator can run it right away
         _note_pending(vault_id, str(body["client_id"]))
-    return {"vault_id": vault_id, "payload": payload, "profile": profile,
-            "outputs_node": bool(body.get("outputs_node")), "node_count": len(api["nodes"])}
+    out = {"vault_id": vault_id, "payload": payload, "profile": profile,
+           "outputs_node": bool(body.get("outputs_node")), "node_count": len(api["nodes"])}
+    if public is not None:
+        out["public_interface"] = public
+    return out
 
 
 def _note_pending(vault_id: str, client_id: str) -> None:
@@ -294,9 +314,12 @@ def open_for_edit(body: dict) -> dict:
                          "profile": plain.get("profile") or PROFILE_NAMES.get(_mode_of(payload), "locked"),
                          "editors": editors or [me], "recipients": plain.get("recipients") or [],
                          "packs": plain.get("packs") or [], "at": time.time(),
+                         "conceal": plain.get("conceal"),
                          "client_id": str(body.get("client_id") or "")}
     out = {"ok": True, "edit_token": token, "interface": plain.get("interface"), "profile": _EDITS[token]["profile"],
            "second_factor": detail["reason"]}
+    if isinstance(plain.get("conceal"), dict):
+        out["conceal"] = plain["conceal"]                      # the author may change what the recipient sees
     if isinstance(plain.get("ui"), dict):
         out["ui"] = plain["ui"]
     else:                                                      # an old vault: the editor rebuilds it from the nodes
@@ -487,6 +510,8 @@ def commit(body: dict) -> dict:
              "editors": s["editors"], "profile": s["profile"],
              "packs": vault_packs.record_safely(api, s["packs"]),                                    # L9.50
              "updated": int(time.time())}
+    # an edit that does not resend the conceal section keeps the vault concealed (never silently published)
+    public = _with_conceal(plain, body["conceal"] if "conceal" in body else s.get("conceal"))
     recipients = None
     if s["profile"] == "sealed_installs":
         recipients = [base64.b64decode(r) for r in s["recipients"]] or _codes_to_keys([_this_install_code()])
@@ -498,8 +523,11 @@ def commit(body: dict) -> dict:
     if not body.get("_keep_open"):
         with _lock:
             _EDITS.pop(str(body.get("edit_token")), None)
-    return {"ok": True, "payload": payload, "vault_id": s["vault_id"], "profile": s["profile"],
-            "node_count": len(api["nodes"])}
+    out = {"ok": True, "payload": payload, "vault_id": s["vault_id"], "profile": s["profile"],
+           "node_count": len(api["nodes"])}
+    if public is not None:
+        out["public_interface"] = public
+    return out
 
 
 def cancel(body: dict) -> dict:
