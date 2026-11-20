@@ -1,0 +1,51 @@
+ComfyUI-H2Vault
+Copyright (C) 2026 Code2Collapse
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General
+Public License as published by the Free Software Foundation, version 3 (see LICENSE).
+
+This product includes software from the following projects. Their notices are kept as their licences require.
+
+-------------------------------------------------------------------------------------------------------------------
+1. ComfyUI-Workflow-Encrypt
+   https://github.com/jtydhr88/ComfyUI-Workflow-Encrypt (commit 5ec45fd)
+   Copyright (C) jtydhr88
+   Licence: GNU Affero General Public License v3.0
+
+   Ported: the encrypted workflow save / load feature (Fernet key shown once, encrypted file, decrypt on load) and its
+   file format. Files: nodes/workflow_encrypt.py, web/js/h2vault_workflow.js (marked "PORTED FROM").
+   Modified: the key is never printed to the server console; the file is wrapped in JSON so ComfyUI's own loader opens
+   it; keys can be remembered in the H2Vault secrets store; a password mode was added; the routes answer only the
+   ComfyUI page on this machine.
+
+-------------------------------------------------------------------------------------------------------------------
+2. Code2Collapse ComfyUI-CustomNodePacks (the "C2C Vault")
+   https://github.com/Code2Collapse/ComfyUI-CustomNodePacks
+   Copyright (C) Code2Collapse
+   Licence: Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+
+   Derived files (each carries a "Derived from" header naming its source and stating that it was modified):
+     nodes/crypto.py             from nodes/vault_crypto_v2.py and nodes/vault_crypto.py
+     nodes/protected_subgraph.py from nodes/secure_subgraph.py
+     nodes/routes.py             from nodes/secure_subgraph_routes.py and nodes/vault_node.py (2FA routes, lockout)
+     nodes/twofactor.py          from nodes/vault_2fa.py
+     nodes/keys.py               from nodes/vault_keys.py
+     nodes/store.py              from nodes/vault_store.py
+     nodes/secrets_store.py      from nodes/_c2c_secrets.py
+     nodes/packs.py              from nodes/vault_packs.py
+     nodes/local_guard.py        from nodes/_local_ui_guard.py and nodes/magnific/security.py
+     web/js/h2vault_vault.js     from js/c2c_secure_subgraph.js
+     web/js/_h2v_protect_tx.js   from js/_vault_protect_tx.js
+   Changes: H2Vault names (node ids, routes, settings, storage, envelope magic and key-derivation domain strings), the
+   first vault format and the legacy vault nodes removed, password lockout extended to every password route, local-UI
+   guard on second-factor setup, no automatic pip install of custom-node requirements.
+
+   Licensed under the Apache License, Version 2.0 (the "License"); you may not use these files except in compliance
+   with the License. Unless required by applicable law or agreed to in writing, software distributed under the
+   License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+   implied. See the License for the specific language governing permissions and limitations under the License.
+
+-------------------------------------------------------------------------------------------------------------------
+3. QR Code generator library (Python)
+   https://github.com/nayuki/QR-Code-generator - nodes/_vendor/qrcodegen.py, unchanged
+   Copyright (c) Project Nayuki. MIT License (the full notice is at the top of the file).
