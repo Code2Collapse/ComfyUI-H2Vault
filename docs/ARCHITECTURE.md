@@ -32,9 +32,10 @@ It needs no other Code2Collapse pack. Installing it next to CNP must not clash (
 | `nodes/packs.py` | `nodes/vault_packs.py` | kill switch `H2VAULT_INSTALL`; requirements are NOT pip-installed (CNP's `integrity_guard` installer is not vendored); the user is told to finish them in ComfyUI-Manager |
 | `nodes/local_guard.py` | `nodes/_local_ui_guard.py` + `is_local_ui_origin` and helpers of `nodes/magnific/security.py` | inlined (no Magnific import) |
 | `nodes/_vendor/qrcodegen.py` | `nodes/_vendor/qrcodegen.py` (Nayuki, MIT) | unchanged |
-| `web/js/h2vault_vault.js` | `js/c2c_secure_subgraph.js` | names, routes, CSS prefix; dialogs rebuilt on the shared kit `_h2v_ui.js`; legacy-node upgrade removed |
+| `web/js/h2vault_vault.js` | `js/c2c_secure_subgraph.js` (V1 working copy, 2026-11-20 23:35) | names, routes, CSS prefix; legacy-node upgrade removed |
 | `web/js/_h2v_protect_tx.js` | `js/_vault_protect_tx.js` | unchanged logic, header + names |
-| `web/js/_h2v_ui.js` | new (dialog kit: modal, buttons, fields, toasts, theme tokens, `h2v-` CSS) | - |
+| `web/js/_h2v_ui.js` | `js/_vault_ui.js` (V1 design system) | `h2v-` classes, `--h2v-*` tokens on ComfyUI's theme variables |
+| `web/js/_h2v_selection.js`, `_h2v_rebind.js` | `js/_vault_selection.js`, `js/_vue_dom_rebind.js` | H2Vault types only |
 
 Not taken, on purpose (they exist in CNP only so that CNP saves made before A18 keep loading; H2Vault has no such
 saves): `nodes/vault_node.py` (C2C_VaultLocked / Sealed / EditInput / EditOutput nodes, `/c2c_vault/*` legacy routes),
@@ -90,6 +91,8 @@ nodes/
 web/js/
   _h2v_ui.js             dialog kit + CSS (h2v-)                  <- the two below
   _h2v_protect_tx.js     protect transaction                     <- h2vault_vault.js
+  _h2v_selection.js      what a protect acts on, stage labels    <- h2vault_vault.js
+  _h2v_rebind.js         Nodes 2.0 DOM-widget rebind (extension "H2Vault.VueDomRebind")
   h2vault_vault.js       vault front end (extension "H2Vault.Vault")
   h2vault_workflow.js    encrypted files (extension "H2Vault.WorkflowEncrypt")
 tests/                   pytest (comfy_env python) + node --test for the .mjs
