@@ -34,8 +34,12 @@ This product includes software from the following projects. Their notices are ke
      nodes/secrets_store.py      from nodes/_c2c_secrets.py
      nodes/packs.py              from nodes/vault_packs.py
      nodes/local_guard.py        from nodes/_local_ui_guard.py and nodes/magnific/security.py
-     web/js/h2vault_vault.js     from js/c2c_secure_subgraph.js
+     web/js/h2vault_vault.js     from js/c2c_secure_subgraph.js (with the V1 one-step protect and dialog overhaul)
      web/js/_h2v_protect_tx.js   from js/_vault_protect_tx.js
+     web/js/_h2v_ui.js           from js/_vault_ui.js (the V1 vault design system)
+     web/js/_h2v_selection.js    from js/_vault_selection.js
+     web/js/_h2v_rebind.js       from js/_vue_dom_rebind.js
+     nodes/concealment.py        its id-mapping approach follows nodes/secure_subgraph.py
    Changes: H2Vault names (node ids, routes, settings, storage, envelope magic and key-derivation domain strings), the
    first vault format and the legacy vault nodes removed, password lockout extended to every password route, local-UI
    guard on second-factor setup, no automatic pip install of custom-node requirements.

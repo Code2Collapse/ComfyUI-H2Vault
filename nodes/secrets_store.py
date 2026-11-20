@@ -34,12 +34,17 @@ _SERVICE = "h2vault"
 
 
 def _user_dir() -> Path:
-    """<ComfyUI user dir>/h2vault - created if missing."""
-    try:
-        import folder_paths  # type: ignore
-        base = Path(folder_paths.get_user_directory())
-    except Exception:  # noqa: BLE001 - outside ComfyUI (tests set H2VAULT_USER_DIR)
-        base = Path(os.environ.get("H2VAULT_USER_DIR") or (Path(__file__).resolve().parents[1] / "_user"))
+    """<ComfyUI user dir>/h2vault - created if missing. H2VAULT_USER_DIR overrides the base (tests, and installs that
+    keep secrets apart from the ComfyUI user folder)."""
+    override = os.environ.get("H2VAULT_USER_DIR")
+    if override:
+        base = Path(override)
+    else:
+        try:
+            import folder_paths  # type: ignore
+            base = Path(folder_paths.get_user_directory())
+        except Exception:  # noqa: BLE001 - outside ComfyUI
+            base = Path(__file__).resolve().parents[1] / "_user"
     out = base / "h2vault"
     out.mkdir(parents=True, exist_ok=True)
     return out
