@@ -13,7 +13,7 @@ import { api } from "../../scripts/api.js";
 import { BUSY_MESSAGE, ProtectError, absSource, captureBoundary, ensureReroutes, execIdOf, outerWires, relSource,
   rerouteChain, runTransaction, verifyConversion, verifyVaultWiring } from "./_h2v_protect_tx.js";
 // V1 (owner 2026-11-20): one-step "Lock selection as H2Vault" + the Vault UI overhaul (docs/h2vault/V1_cnp_vault_ux_spec.md)
-import { protectFailureText, resolveLockSelection, stageLabel, summarizeSelection } from "./_h2v_selection.js";
+import { isVaultType, protectFailureText, resolveLockSelection, stageLabel, summarizeSelection } from "./_h2v_selection.js";
 import { block, capsule, choiceCards, codeField, copyRow, disclosure, el as vel, factList, noticeEl, passwordField,
   statusCard, stepSection, switchRow, textArea, textField, vaultDialog, vbutton } from "./_h2v_ui.js";
 import { tagDomWidget } from "./_h2v_rebind.js";
@@ -230,9 +230,15 @@ function applyInterface(node) {
   node.title = info.title || node.title || "H2Vault";
   node.color = legacy ? "#5a4a22" : "#2b2552";
   node.bgcolor = legacy ? "#2e2716" : "#191632";
-  node.__h2vBadge = `🔒 ${legacy ? "legacy - obfuscation only" : (prof?.id === "locked" ? "locked" : "sealed")}` +
+  node.__h2vBadge = `🔒 ${legacy ? "portable - obfuscation only" : (prof?.id === "locked" ? "locked" : "sealed")}` +
     (info.node_count ? ` · ${info.node_count} nodes` : "");
   ensureStatusCard(node);
+  if (!node.__h2vMinWidth && typeof node.computeSize === "function") {
+    // a DOM widget's computeSize gives a height only: the status card's minimum width comes from the node
+    const cs = node.computeSize;
+    node.computeSize = function (...a) { const r = cs.apply(this, a); if (Array.isArray(r)) r[0] = Math.max(r[0], 340); return r; };
+    node.__h2vMinWidth = true;
+  }
   node.setSize?.(node.computeSize?.() ?? node.size);
   node.setDirtyCanvas?.(true, true);
 }
@@ -1534,7 +1540,7 @@ function isOutputNodeType(type) {
 function protectWholeWorkflow() {
   const g = app.canvas?.graph ?? app.graph;
   const items = (g?.nodes || g?._nodes || []).filter((n) => n && n.id != null && Number(n.id) >= 0
-    && !VAULT_TYPES.has(n.type) && !isOutputNodeType(n.type));
+    && !isVaultType(n.type) && !isOutputNodeType(n.type));
   if (!items.length) {
     toast("Nothing to protect: this graph has no nodes besides its outputs.", true);
     return null;

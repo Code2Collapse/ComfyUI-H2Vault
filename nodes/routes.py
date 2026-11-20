@@ -10,7 +10,7 @@
   POST /h2vault/vault/commit      leaving the subgraph: re-encrypt the edited graph (auto-lock)
   POST /h2vault/vault/cancel      leave without changes
   GET  /h2vault/vault/install_code  this installation's code (public key) to send to a vault author
-  POST /h2vault/vault/info        public facts of a payload (profile, legacy, node count) - never the inside
+  POST /h2vault/vault/info        public facts of a payload (profile, this installation) - never the inside
   POST /h2vault/vault/access/open   L9.48: the same checks as open -> the access lists only (never the graph)
   POST /h2vault/vault/access/apply  re-encrypt with new recipients / editors / labels / password (atomic)
   POST /h2vault/vault/access/cancel drop the access session
@@ -281,6 +281,11 @@ def _authorize(body: dict) -> tuple:
             "ok": False, "needs_enrolment": True,
             "error": "Opening a vault needs a second factor on this installation. Set up an authenticator app first "
                      "(H2Vault menu > Two-factor setup)."}
+    try:                                                       # a damaged / foreign payload is a bad request, never a
+        v2.parse(payload)                                      # counted password guess (it would lock the vault id)
+    except VaultError as err:
+        err.status = 400
+        raise
     plain, kek, parsed = _password_attempt(vault_id, lambda: v2.open_with_password(payload, password,
                                                                                     vault_id=vault_id))
     k = {"kek": kek, "salt": parsed["salt"], "kdf": parsed["kdf"]}
@@ -299,8 +304,6 @@ def _authorize(body: dict) -> tuple:
 
 def open_for_edit(body: dict) -> dict:
     """Password -> second factor -> editor list. Returns the inner graph for native editing + an edit token."""
-    from . import protected_subgraph as SS
-
     payload, vault_id = str(body.get("payload") or ""), str(body.get("vault_id") or "")
     plain, k, factor, refused = _authorize(body)
     if refused:
@@ -320,11 +323,13 @@ def open_for_edit(body: dict) -> dict:
            "second_factor": detail["reason"]}
     if isinstance(plain.get("conceal"), dict):
         out["conceal"] = plain["conceal"]                      # the author may change what the recipient sees
-    if isinstance(plain.get("ui"), dict):
-        out["ui"] = plain["ui"]
-    else:                                                      # an old vault: the editor rebuilds it from the nodes
-        out["legacy_exec"] = plain.get("exec") if isinstance(plain.get("exec"), dict) else plain
-        out["api"] = SS.api_of(plain)
+    if not isinstance(plain.get("ui"), dict):
+        # H2Vault always stores the editable layout; without it there is nothing the editor can show, so the inner
+        # graph is never sent (the CNP first-format rebuild path is not part of H2Vault)
+        with _lock:
+            _EDITS.pop(token, None)
+        raise VaultError("This vault has no editable layout. Ask its author for a fresh copy.")
+    out["ui"] = plain["ui"]
     return out
 
 
@@ -642,7 +647,19 @@ def register_routes(server) -> None:
     routes.post("/h2vault/vault/access/open")(wrap(access_open, offload=True))
     routes.post("/h2vault/vault/access/apply")(wrap(access_apply, 409))
     routes.post("/h2vault/vault/access/cancel")(wrap(access_cancel))
-    routes.get("/h2vault/vault/install_code")(wrap(lambda b: {"code": _this_install_code()}, 500))
+    async def install_code(request):
+        # the first call creates this installation's key pair: only the local page may cause that write
+        from . import keys as vault_keys
+        if vault_keys.install_private_key(create=False) is None:
+            refused = refuse_remote(request, "Creating this installation's key")
+            if refused is not None:
+                return refused
+        try:
+            return web.json_response({"ok": True, "code": _this_install_code()})
+        except VaultError as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    routes.get("/h2vault/vault/install_code")(install_code)
     routes.get("/h2vault/2fa/status")(wrap(tfa_status))
     routes.post("/h2vault/2fa/enrol/begin")(wrap(tfa_begin, 409, local_only="Setting up the authenticator"))
     routes.post("/h2vault/2fa/enrol/confirm")(wrap(tfa_confirm, 403, local_only="Setting up the authenticator"))

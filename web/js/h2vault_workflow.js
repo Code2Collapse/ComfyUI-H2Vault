@@ -198,12 +198,22 @@ function installLoadHook() {
   if (app.__h2vLoadHook || typeof app.loadGraphData !== "function") return;
   ORIG_LOAD = app.loadGraphData.bind(app);
   app.__h2vLoadHook = true;
+  // loadGraphData(graphData, clean, restore_view, workflow, options) on frontend 1.53.10. `workflow` is a file name
+  // (drag-and-drop / Open) or a saved workflow object (opened from the Workflows sidebar). The decrypted graph never
+  // loads into that saved .h2vault.json workflow - a save there would overwrite the encrypted file with plaintext: it
+  // opens as a new, unsaved workflow instead. A cancelled dialog answers false, which openWorkflow treats as "aborted"
+  // and so restores the previous tab.
   app.loadGraphData = async function (graphData, ...rest) {
     if (graphData && typeof graphData === "object" && graphData[MARKER] === 1) {
-      const name = typeof rest[2] === "string" ? rest[2] : "";
+      const target = rest[2];
+      const fromFile = typeof target === "string" ? target
+        : String(target?.filename || target?.path?.split(/[\\/]/).pop() || "encrypted workflow");
+      const name = fromFile.replace(/\.(h2vault\.json|json)$/i, "").replace(/\.h2vault$/i, "");
       const workflow = await decryptFile(graphData, name);
-      if (!workflow) return undefined;
-      return ORIG_LOAD(workflow, ...rest);
+      if (!workflow) return false;
+      const args = [...rest];
+      args[2] = `${name} (decrypted)`;
+      return ORIG_LOAD(workflow, ...args);
     }
     return ORIG_LOAD(graphData, ...rest);
   };

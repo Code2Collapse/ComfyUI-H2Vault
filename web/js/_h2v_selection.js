@@ -13,6 +13,11 @@
 const VAULT_TYPES = new Set(["H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput", "C2C_SecureSubgraph",
   "C2C_SecureSubgraphOutput", "C2C_VaultLocked", "C2C_VaultSealed"]);
 
+/** Is `type` a vault node of H2Vault or of ComfyUI-CustomNodePacks? (Those are never protected again.) */
+export function isVaultType(type) {
+  return VAULT_TYPES.has(type);
+}
+
 export const PROBLEM_EMPTY = "Select the nodes (or a group) to lock first.";
 export const PROBLEM_VAULT = "The selection contains a vault. Lock the nodes around it separately.";
 export const PROBLEM_GRAPHS = "Select nodes from one graph (the one you are looking at).";
