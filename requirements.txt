@@ -1,0 +1,4 @@
+# torch, numpy and aiohttp come with ComfyUI. Argon2id (vault passwords) needs cryptography 44 or newer.
+cryptography>=44
+# Optional: keep H2Vault's local secrets in the OS credential store instead of the encrypted file in the user folder.
+# keyring>=24.0

@@ -1,0 +1,25 @@
+[project]
+# Comfy Registry node id = the install folder for registry / ComfyUI-Manager installs. It matches the GitHub repo
+# name, so a git clone and a registry install create the same folder. Fixed for ever once first published
+# (workstream V4, docs/h2vault/V4_registry_naming.md section 5).
+name = "ComfyUI-H2Vault"
+version = "0.1.0"
+description = "H2Vault for ComfyUI: turn a selection or a subgraph into one encrypted node that ComfyUI's own scheduler runs, and save whole workflows encrypted."
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+readme = "README.md"
+authors = [{ name = "Code2Collapse" }]
+# torch / numpy come with ComfyUI. Argon2id needs cryptography >= 44 (checked at import with a plain message).
+dependencies = ["cryptography>=44"]
+
+[project.optional-dependencies]
+keyring = ["keyring>=24.0"]
+
+[project.urls]
+Repository = "https://github.com/Code2Collapse/ComfyUI-H2Vault"
+Documentation = "https://github.com/Code2Collapse/ComfyUI-H2Vault#readme"
+Issues = "https://github.com/Code2Collapse/ComfyUI-H2Vault/issues"
+
+[tool.comfy]
+PublisherId = "code2collapse"
+DisplayName = "ComfyUI-H2Vault"

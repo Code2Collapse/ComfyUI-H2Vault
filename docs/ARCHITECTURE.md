@@ -179,6 +179,8 @@ edit the crypto or the transaction.
 
 ## 10. Registry naming
 
-`pyproject.toml` `[project] name = "comfyui-h2vault"` until workstream V4 (`docs/h2vault/V4_registry_naming.md`)
-decides; `[tool.comfy] PublisherId = "code2collapse"`, `DisplayName = "ComfyUI-H2Vault"`. TODO(V4): confirm the
-`name` field (tracked here only, not in code).
+Settled by workstream V4 (`docs/h2vault/V4_registry_naming.md` section 5): `[project] name = "ComfyUI-H2Vault"` (the
+registry id is the install folder, case included, and permanent after the first publish; it matches the GitHub repo so
+git clone, ComfyUI-Manager and comfy-cli installs give the same folder), `[tool.comfy] PublisherId = "code2collapse"`,
+`DisplayName = "ComfyUI-H2Vault"`. JS never hard-codes `/extensions/ComfyUI-H2Vault/` (relative imports only).
+Publishing is the lead's / owner's decision.
