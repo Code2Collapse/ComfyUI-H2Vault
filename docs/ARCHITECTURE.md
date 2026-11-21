@@ -166,6 +166,19 @@ in the clear today, and where V3 changes it:
 V3 owns new files (`nodes/concealment.py`, `web/js/_h2v_conceal.js`) and calls in at those two functions; it does not
 edit the crypto or the transaction.
 
+As built (V3, 2026-11-21): concealment is a MODE of a vault - a plaintext with a `conceal` section (title, alias
+tables, declared previews) runs on the same node classes. `routes.protect` / `commit` / `snapshot` refuse a public half
+that would name the inside and answer `public_interface` (a whitelist); `publicInterface(built)` returns it
+(`built.public`), so the node, the saved workflow and the open-vault snapshot never carry real file names;
+`applyInterface` builds concealed controls with `_h2v_conceal.js::ensureControl` and hides the node count.
+`protected_subgraph.execute` resolves aliases server-side (`concealment.resolve_params`) and registers the expansion
+(`concealment.after_expansion`); `__init__` installs `concealment.install(server)` after the vault message filter:
+for a concealed vault no inner class, title, id, model file or author output prefix leaves the server (messages,
+history, jobs, errors, the log buffer and console while an inner node runs). Hosted profile: env `H2VAULT_HOSTED=1`
+(+ `H2VAULT_HOSTED_ALLOW`). Not built: the author's "expose / preview as recipient" dialog (a concealed vault is sealed
+today through `POST /h2vault/vault/protect` with a `conceal` section). Design, threat model and residual risks:
+workspace `docs/h2vault/V3_concealment_design.md`.
+
 ## 8. Plug-and-play
 
 - Install = clone or registry; `requirements.txt` = `cryptography>=42` (Argon2id needs >=44 - checked at import with
