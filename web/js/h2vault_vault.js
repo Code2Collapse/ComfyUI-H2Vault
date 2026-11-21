@@ -17,6 +17,8 @@ import { isVaultType, protectFailureText, resolveLockSelection, stageLabel, summ
 import { block, capsule, choiceCards, codeField, copyRow, disclosure, el as vel, factList, noticeEl, passwordField,
   statusCard, stepSection, switchRow, textArea, textField, vaultDialog, vbutton } from "./_h2v_ui.js";
 import { tagDomWidget } from "./_h2v_rebind.js";
+// V3 identity concealment, recipient side (docs/h2vault/V3_concealment_design.md)
+import { ensureControl, serverPublic } from "./_h2v_conceal.js";
 
 const VAULT_TYPES = new Set(["H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput"]);
 const PACK_AUX_ID = "Code2Collapse/ComfyUI-H2Vault";
@@ -164,10 +166,12 @@ function subgraphSlotOf(v, inputMap, slot) {
 /**
  * The interface written onto the vault node (its properties, the locked form a save writes, the open-vault snapshot):
  * socket names / types and the promoted controls with their values - everything about the inside that is public.
- * Identity concealment (workstream V3) changes what this returns; today it is the extracted interface unchanged.
+ * For a CONCEALED vault (V3) it is the whitelisted interface the server answered (`built.public`, set from every
+ * protect / commit / snapshot answer): Author-chosen labels and alias choices, never the real file names that the
+ * extracted interface carries in its COMBO options and values.
  */
 export function publicInterface(built) {
-  return built.interface;
+  return built.public ?? built.interface;
 }
 
 // ── vault node appearance and sockets ───────────────────────────────────────────────────────────────────────
@@ -202,7 +206,7 @@ function applyInterface(node) {
   const iface = info.interface || {};
   hideWidget(node.widgets?.find((w) => w.name === "vault_id"));
   hideWidget(node.widgets?.find((w) => w.name === "vault_payload"));
-  for (const p of iface.params || []) promotedWidget(node, p);
+  for (const p of iface.params || []) (iface.concealed ? ensureControl : promotedWidget)(node, p);
   const nIn = (iface.in || []).length, nOut = (iface.out || []).length;
   // the node def declares 256 outputs; a vault shows the ones its inside has
   while ((node.outputs || []).length > nOut) node.removeOutput(node.outputs.length - 1);
@@ -227,11 +231,11 @@ function applyInterface(node) {
   node.properties.aux_id = PACK_AUX_ID;                   // a machine without the pack offers to install it
   const prof = PROFILES.find((p) => p.id === info.profile);
   const legacy = info.profile === "sealed_portable";
-  node.title = info.title || node.title || "H2Vault";
+  node.title = info.title || (iface.concealed && iface.title) || node.title || "H2Vault";
   node.color = legacy ? "#5a4a22" : "#2b2552";
   node.bgcolor = legacy ? "#2e2716" : "#191632";
   node.__h2vBadge = `🔒 ${legacy ? "portable - obfuscation only" : (prof?.id === "locked" ? "locked" : "sealed")}` +
-    (info.node_count ? ` · ${info.node_count} nodes` : "");
+    (info.node_count && !iface.concealed ? ` · ${info.node_count} nodes` : "");      // V3: no inner count
   ensureStatusCard(node);
   if (!node.__h2vMinWidth && typeof node.computeSize === "function") {
     // a DOM widget's computeSize gives a height only: the status card's minimum width comes from the node
@@ -274,7 +278,7 @@ function updateStatusCard(node) {
   if (!card) return;
   const info = vaultInfo(node);
   const vid = node.widgets?.find((x) => x.name === "vault_id")?.value;
-  const n = Number(info.node_count) || 0;
+  const n = info.interface?.concealed ? 0 : (Number(info.node_count) || 0);     // V3: a concealed vault hides it
   const detail = n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph";
   if (!vid) {
     card.update({ tone: "warn", title: "Empty vault", detail: "Lock a selection to fill it",
@@ -522,6 +526,7 @@ async function protectTransaction(nodes, opts) {
           outputs_node: built.outputsNode, client_id: api.clientId });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
+        built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
       }],
       ["VAULT_NODE_INSERTION", () => {
         before = outerWires(graph, sg);
@@ -601,6 +606,7 @@ async function protectSubgraphNode(sg, opts) {
 function makeVaultNode(graph, res, built, replace) {
   const type = built.outputsNode ? "H2Vault_ProtectedSubgraphOutput" : "H2Vault_ProtectedSubgraph";
   const v = LiteGraph.createNode(type);
+  built.public = serverPublic(res);                        // V3: a concealed vault publishes the server's whitelist
   v.properties = { ...(v.properties || {}), h2vault: { interface: publicInterface(built), profile: res.profile,
     node_count: res.node_count, title: replace?.title, vault_id: res.vault_id, outputs_node: !!built.outputsNode,
     input_map: built.inputMap || null } };
@@ -1114,6 +1120,7 @@ async function snapshotOpen() {
         interface: built.interface, payload_hash: sess.payloadHash });
       if (!r.ok) throw new Error(r.data.error || "Could not encrypt the open vault for this run.");
       sess.payload = r.data.payload;
+      built.public = serverPublic(r.data);                 // V3 (see publicInterface)
       sess.built = built;
       sess.payloadHash = undefined;
       sess.info = { ...sess.info, interface: publicInterface(built), outputs_node: built.outputsNode,
@@ -1586,6 +1593,15 @@ app.registerExtension({
       nodeType.prototype.onConfigure = function (...a) {
         const r = configured?.apply(this, a);
         applyInterface(this);
+        // frontend 1.53 restores widgets_values by POSITION before onConfigure, when the p_ controls do not exist
+        // yet: put the saved values back (saved order: vault_id, vault_payload, then the controls in interface order)
+        const vals = a[0]?.widgets_values;
+        if (Array.isArray(vals)) {
+          (vaultInfo(this).interface?.params || []).forEach((p, i) => {
+            const w = this.widgets?.find((x) => x.name === `p_${p.key}`);
+            if (w && vals[2 + i] !== undefined && vals[2 + i] !== null) w.value = vals[2 + i];
+          });
+        }
         return r;
       };
       nodeType.prototype.onDblClick = function () { openVault(this); return true; };
