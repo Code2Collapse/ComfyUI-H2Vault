@@ -171,6 +171,25 @@ def _with_conceal(plain: dict, conceal) -> Optional[dict]:
     return concealment.public_interface(plain)
 
 
+def _expose(api, interface, conceal):
+    from . import concealment
+    return concealment.merge_exposure(api, interface, conceal) if isinstance(conceal, dict) else (api, interface)
+
+
+def conceal_check(body: dict) -> dict:
+    """V3 author step: the refusals sealing would give for this exposure, and the public interface the recipient
+    would see - computed by the same code as sealing, without sealing (no key, no payload)."""
+    from . import concealment
+    conceal = body.get("conceal")
+    if not isinstance(conceal, dict):
+        raise VaultError("Nothing to check: no concealment settings were sent.")
+    api, interface = _expose(body.get("api") or {}, body.get("interface") or {}, conceal)
+    plain = {"api": api, "interface": interface, "ui": body.get("ui"), "conceal": conceal}
+    problems = concealment.check_public(plain)
+    return {"ok": True, "problems": problems,
+            "public_interface": None if problems else concealment.public_interface(plain)}
+
+
 def protect(body: dict) -> dict:
     from . import protected_subgraph as SS
     from . import crypto as v2
@@ -183,6 +202,7 @@ def protect(body: dict) -> dict:
         raise VaultError("Choose a vault password of at least 8 characters (it is needed to open the vault).")
     interface = body.get("interface") or {}
     api = body.get("api") or {}
+    api, interface = _expose(api, interface, body.get("conceal"))       # V3: the author's exposed controls
     _validate_api(api, interface)
     me = _this_install_code()
     editors = [me] + [c for c in (body.get("editors") or []) if str(c) != me]
@@ -510,13 +530,16 @@ def commit(body: dict) -> dict:
                          "again.")
     interface = body.get("interface") or {}
     api = body.get("api") or {}
+    # V3: an edit that does not resend the conceal section keeps the vault concealed (never silently published);
+    # an explicit `conceal: null` removes it (the front end asks the editor to confirm first)
+    conceal = body["conceal"] if "conceal" in body else s.get("conceal")
+    api, interface = _expose(api, interface, conceal)
     _validate_api(api, interface)
     plain = {"exec": boundary_exec(interface), "api": api, "ui": body.get("ui"), "interface": interface,
              "editors": s["editors"], "profile": s["profile"],
              "packs": vault_packs.record_safely(api, s["packs"]),                                    # L9.50
              "updated": int(time.time())}
-    # an edit that does not resend the conceal section keeps the vault concealed (never silently published)
-    public = _with_conceal(plain, body["conceal"] if "conceal" in body else s.get("conceal"))
+    public = _with_conceal(plain, conceal)
     recipients = None
     if s["profile"] == "sealed_installs":
         recipients = [base64.b64decode(r) for r in s["recipients"]] or _codes_to_keys([_this_install_code()])
@@ -619,6 +642,7 @@ def register_routes(server) -> None:
         return handler
 
     routes.post("/h2vault/vault/protect")(wrap(protect, 400))
+    routes.post("/h2vault/vault/conceal/check")(wrap(conceal_check, 400))
     routes.post("/h2vault/vault/protect/abort")(wrap(protect_abort))
     routes.post("/h2vault/vault/unlock_run")(wrap(unlock_run, offload=True))
     routes.post("/h2vault/vault/forget_run")(wrap(forget_run))

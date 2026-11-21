@@ -80,11 +80,21 @@ encrypted payload:
 Checked live (ComfyUI 0.39, frontend 1.53.10, both renderers, at the top level and inside a subgraph): nothing about
 the inside reached the recipient, and a concealed run gives the same pixels as the same graph unconcealed.
 
-**Today** a concealed vault is sealed through H2Vault's protect route with the concealment settings; the author's
-"choose what to expose / preview as recipient" dialog is the next release. What concealment cannot hide on the recipient's own
-machine: code running in the same Python process (another custom node, a debugger) can read the decrypted inside; the
-model files must be on their disk, and a file hash identifies a public model; run time, step counts and comparing many
-outputs hint at the model. For real secrecy run the vault in Hosted mode on a server you operate, behind your own login.
+**Conceal a vault**: in the protect dialog switch on **Conceal models and nodes**. The **Choose what to expose** list
+shows every setting inside, grouped as sampler, scheduler, steps, cfg, seed, denoise, sizes, prompts, model choices and
+other settings; the usual ones are ticked already. Rename what the recipient sees, tick a model choice to offer it as
+named choices ("Model A", "Model B", or names you pick, each mapped to one of your files), and name the sockets.
+**Preview as recipient** beside the list shows the vault exactly as the recipient will get it, checked by the same rules
+as sealing; a name that would give the inside away is marked and must be changed before **Lock** works. Everything is
+reachable with the keyboard. An editor who opens a concealed vault can remove the concealment (right-click inside it ›
+**Remove concealment from this vault…**, after a confirmation); copies already sent stay concealed.
+
+![Choose what to expose, with the recipient preview](docs/media/conceal_expose_dialog.png)
+
+What concealment cannot hide on the recipient's own machine: code running in the same Python process (another custom
+node, a debugger) can read the decrypted inside; the model files must be on their disk, and a file hash identifies a
+public model; run time, step counts and comparing many outputs hint at the model. For real secrecy run the vault in
+Hosted mode on a server you operate, behind your own login.
 
 ## Encrypted workflow files
 

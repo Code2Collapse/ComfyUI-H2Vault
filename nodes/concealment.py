@@ -234,10 +234,71 @@ def check_public(plain, interface=None) -> list:
         elif p.get("value") not in table:
             problems.append(f"Control {label!r}: its value is not one of its alias choices.")
     inner = set(_nodes(plain))
+    for c in _conceal(plain).get("controls") or []:
+        if isinstance(c, dict) and str(c.get("node")) not in inner:
+            problems.append(f"Control {c.get('name') or c.get('key')!r} drives a node that is not inside the vault.")
     for pv in _conceal(plain).get("previews") or []:
         if str(pv) not in inner:
             problems.append("A preview is declared for a node that is not inside the vault.")
     return problems
+
+
+PUBLIC_PARAM_FIELDS = ("name", "type", "value", "options", "min", "max", "step", "multiline")
+
+
+def merge_exposure(api, interface, conceal):
+    """The author's "Choose what to expose" step -> the vault's controls and socket labels.
+
+    `conceal.controls` = [{key, node, input, name, type, value, options?, min?, max?, step?, multiline?}] become
+    promoted controls (the secret half: key -> inner node + input, in `api.promoted`) and interface params (the public
+    half). `conceal.sockets` = {"in": {"<inner node>:<input>": label}, "out": {"<inner node>#<slot>": label}} rename the
+    vault's sockets. They live INSIDE `conceal`, so an edit that re-extracts the inner graph (which knows nothing of
+    them) gets them back on the next seal. -> (api, interface), both copies; non-concealed input is returned as is."""
+    if not isinstance(conceal, dict):
+        return api, interface
+    api = copy.deepcopy(api) if isinstance(api, dict) else {}
+    iface = copy.deepcopy(interface) if isinstance(interface, dict) else {}
+    controls = [c for c in conceal.get("controls") or [] if isinstance(c, dict) and str(c.get("key") or "").strip()]
+    keys = {str(c["key"]) for c in controls}
+    if isinstance(conceal.get("controls"), list):
+        # the author's choice is the WHOLE exposure: controls promoted any other way (frontend 1.53 auto-promotes
+        # filename_prefix / seed / text when nodes become a subgraph) are not exposed; their inner inputs keep the
+        # value they had, which the extracted graph carries as a literal
+        promoted, params = [], []
+    else:
+        promoted = [p for p in api.get("promoted") or [] if isinstance(p, dict) and str(p.get("key")) not in keys]
+        params = [p for p in iface.get("params") or [] if isinstance(p, dict) and str(p.get("key")) not in keys]
+    for c in controls:
+        promoted.append({"key": str(c["key"]), "node": str(c.get("node")), "input": str(c.get("input"))})
+        q = {"key": str(c["key"])}
+        q.update({k: c[k] for k in PUBLIC_PARAM_FIELDS if k in c})
+        params.append(q)
+    api["promoted"] = promoted
+    iface["params"] = params
+    sockets = conceal.get("sockets") if isinstance(conceal.get("sockets"), dict) else {}
+    outs = sockets.get("out") if isinstance(sockets.get("out"), dict) else {}
+    iface_out = iface.get("out") if isinstance(iface.get("out"), list) else []
+    for j, o in enumerate(api.get("outputs") or []):
+        if not isinstance(o, dict) or "node" not in o:
+            continue
+        label = outs.get(f"{o.get('node')}#{o.get('slot')}")
+        if isinstance(label, str) and label.strip():
+            o["name"] = label.strip()
+            if j < len(iface_out) and isinstance(iface_out[j], dict):
+                iface_out[j]["name"] = label.strip()
+    ins = sockets.get("in") if isinstance(sockets.get("in"), dict) else {}
+    iface_in = iface.get("in") if isinstance(iface.get("in"), list) else []
+    api_in = api.get("inputs") if isinstance(api.get("inputs"), list) else []
+    for nid, n in (api.get("nodes") or {}).items():
+        for name, v in ((n or {}).get("inputs") or {}).items() if isinstance(n, dict) else []:
+            if isinstance(v, dict) and isinstance(v.get("vault_in"), int):
+                label = ins.get(f"{nid}:{name}")
+                i = v["vault_in"]
+                if isinstance(label, str) and label.strip():
+                    for side in (iface_in, api_in):
+                        if 0 <= i < len(side) and isinstance(side[i], dict):
+                            side[i]["name"] = label.strip()
+    return api, iface
 
 
 def public_interface(plain, interface=None) -> dict:

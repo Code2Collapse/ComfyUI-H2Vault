@@ -19,6 +19,8 @@ import { block, capsule, choiceCards, codeField, copyRow, disclosure, el as vel,
 import { tagDomWidget } from "./_h2v_rebind.js";
 // V3 identity concealment, recipient side (docs/h2vault/V3_concealment_design.md)
 import { ensureControl, serverPublic } from "./_h2v_conceal.js";
+import { candidate, inventory, previewsOf, promotedValues, socketsOf } from "./_h2v_expose.js";
+import { exposeStep } from "./_h2v_expose_ui.js";
 
 const VAULT_TYPES = new Set(["H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput"]);
 const PACK_AUX_ID = "Code2Collapse/ComfyUI-H2Vault";
@@ -523,7 +525,7 @@ async function protectTransaction(nodes, opts) {
       ["ENCRYPTION_AND_SEALING", async () => {
         const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
           recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui: exportUi(sg),
-          outputs_node: built.outputsNode, client_id: api.clientId });
+          outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}) });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
         built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
@@ -594,7 +596,7 @@ async function protectSubgraphNode(sg, opts) {
   const ui = exportUi(sg);
   const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
     recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui,
-    outputs_node: built.outputsNode, client_id: api.clientId });
+    outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}) });
   if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
   const v = makeVaultNode(sg.graph, r.data, built, sg);
   removeDefinitionIfUnused(sg);
@@ -663,7 +665,7 @@ const splitCodes = (text) => String(text || "").split(/\s+/).map((s) => s.trim()
  * the lock (protectTransaction) while the dialog shows its stages; a failure is shown inside the dialog, which stays
  * open. Resolves with the vault node, or null when cancelled.
  */
-function protectDialog({ count, kind, summary, title, defaultProfile, run }) {
+function protectDialog({ count, kind, summary, title, defaultProfile, run, exposure = null }) {
   const many = count === 1 ? "" : "s";
   const d = vaultDialog({
     title: kind === "subgraph" ? `Lock "${title || "subgraph"}" as a vault` : `Lock ${count} node${many} as a vault`,
@@ -707,6 +709,25 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run }) {
       "server and never receive the graph) are planned." }));
   }
   d.body.append(vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), others.el);
+  // V3: "Conceal models and nodes" -> the "Choose what to expose" step (docs/h2vault/V3_concealment_design.md)
+  let step = null;
+  const stepHost = vel("div");
+  if (exposure) {
+    const concealSw = switchRow("Conceal models and nodes", { checked: false, onChange: (on) => {
+      if (on && !step) {
+        step = exposeStep({ controls: exposure.controls, sockets: exposure.sockets, previews: exposure.previews,
+          title: () => name.input.value, check: exposure.check });
+        name.input.addEventListener("input", () => step?.refresh());
+      }
+      stepHost.replaceChildren(...(on && step ? [vel("p", { class: "h2v-dim", text: "Tick what the person who runs " +
+        "this vault may set, and how each is called. Model files become choices with names you pick." }), step.el] : []));
+      d.panel.style.setProperty("--h2v-w", on ? "1040px" : "600px");
+      if (on) step?.refresh();
+    } });
+    d.body.append(vel("div", { class: "h2v-block" }, [concealSw.el, vel("p", { class: "h2v-block__hint",
+      text: "The recipient sees only the controls you choose - never model, node or custom-node names." })]), stepHost);
+    exposure.on = () => concealSw.checked();
+  }
   render();
   d.status(PROTECT_FOOT);
   d.addAction("Cancel", { onClick: () => d.close(null) });
@@ -715,11 +736,22 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run }) {
     d.notice(null);
     if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the vault password."); pw.input.focus(); return; }
     if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); pw2.input.focus(); return; }
+    let conceal = null;
+    if (exposure?.on?.() && step) {
+      const r = await step.ready();
+      if (!r.ok) {
+        d.notice("danger", "Fix what is listed under \"Choose what to expose\" before locking.");
+        step.focusProblem();
+        return;
+      }
+      conceal = r.conceal;
+    }
     d.setBusy(true, "Locking…");
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
+        title: name.input.value, conceal,
+        onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
       LOG("protect failed", e?.stage, e?.message);
@@ -928,7 +960,8 @@ async function enterOpened(v, res, payload) {
     throw new Error("This vault has no editable layout. Ask its author for a fresh copy.");
   }
   OPEN.set(sg, { token: res.edit_token, vaultId: v.widgets.find((w) => w.name === "vault_id").value, payload,
-    profile: res.profile, info: { ...vaultInfo(v) }, title: v.title, graph, extraParams });
+    profile: res.profile, info: { ...vaultInfo(v) }, title: v.title, graph, extraParams,
+    conceal: res.conceal ?? null, removeConceal: false });
   app.canvas.openSubgraph?.(sg.subgraph, sg);
   LOG("opened", sg.id);
 }
@@ -940,7 +973,7 @@ async function lockOpened(sg, sess) {
   try {
     const built = await buildApi(sg, sess.extraParams);
     const r = await post("/h2vault/vault/commit", { edit_token: sess.token, api: built.api, ui: exportUi(sg),
-      interface: built.interface, payload_hash: sess.payloadHash });
+      interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}) });
     if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
     OPEN.delete(sg);
     makeVaultNode(sg.graph, { ...r.data, node_count: r.data.node_count }, built, sg);
@@ -1117,7 +1150,7 @@ async function snapshotOpen() {
     for (const [sg, sess] of OPEN) {
       const built = await buildApi(sg, sess.extraParams);
       const r = await post("/h2vault/vault/snapshot", { edit_token: sess.token, api: built.api, ui: exportUi(sg),
-        interface: built.interface, payload_hash: sess.payloadHash });
+        interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}) });
       if (!r.ok) throw new Error(r.data.error || "Could not encrypt the open vault for this run.");
       sess.payload = r.data.payload;
       built.public = serverPublic(r.data);                 // V3 (see publicInterface)
@@ -1225,13 +1258,55 @@ async function lockSelection(canvas, profileHint, items = null) {
     return again;
   };
   const vault = await protectDialog({ count: r.nodes.length, kind: r.kind, summary, title: r.title,
-    defaultProfile: profileHint || "sealed_installs", run: async (opts) => protectTransaction(live(), opts) });
+    defaultProfile: profileHint || "sealed_installs", run: async (opts) => protectTransaction(live(), opts),
+    exposure: exposureOf(r, boundary) });
   if (!vault) return null;
   try { canvas?.deselectAll?.(); canvas?.select?.(vault); } catch (_) { /* selection is a nicety */ }
   const what = r.kind === "subgraph" ? "the subgraph" : `${r.nodes.length} node${r.nodes.length === 1 ? "" : "s"}`;
   toast(`Locked ${what} into "${vault.title}". Double-click it to open (password + authenticator).`, "success",
     "Vault locked");
   return vault;
+}
+
+/** V3 (lead decision 3): an editor of an open concealed vault may remove the concealment - after confirming. The
+ *  removal happens when the vault is locked again (commit / snapshot send `conceal: null`). */
+function concealMenuItems(sess) {
+  if (!sess?.conceal || sess.removeConceal) return [];
+  return [null, { content: "Remove concealment from this vault…", callback: () => confirmRemoveConceal(sess) }];
+}
+
+async function confirmRemoveConceal(sess) {
+  const d = vaultDialog({ title: "Remove the concealment?", tone: "warn", width: 480,
+    subtitle: "The vault stays encrypted; only what it shows changes." });
+  d.body.append(noticeEl("warn", "When you leave this vault it is locked without concealment. Anyone who runs it then " +
+    "sees inner node types in error messages and the real file names in its controls. Copies already sent keep " +
+    "their concealment."));
+  d.addAction("Keep it concealed", { onClick: () => d.close(false) });
+  d.addAction("Remove concealment", { danger: true, onClick: () => d.close(true) });
+  if (await d.result) {
+    sess.removeConceal = true;
+    toast("Concealment will be removed when you leave this vault.", "info", "Concealment");
+  }
+}
+
+/** V3: what the "Choose what to expose" step offers for this selection (the nodes about to be locked, or the inside
+ *  of the subgraph), and how it asks the server to check a choice (same rules as sealing). */
+function exposureOf(r, boundary) {
+  const defOf = (type) => globalThis.LiteGraph?.registered_node_types?.[type]?.nodeData ?? null;
+  const sg = r.kind === "subgraph" ? r.nodes[0] : null;
+  const nodes = sg ? [...(sg.subgraph?.nodes || sg.subgraph?._nodes || [])] : r.nodes;
+  const sockets = socketsOf({ kind: r.kind, nodes, boundary, sg });
+  const cand = () => candidate(nodes, sockets);
+  return {
+    controls: inventory(nodes, { defOf, promoted: sg ? promotedValues(sg) : null }), sockets,
+    previews: previewsOf(nodes, { defOf }),
+    check: async (conceal) => {
+      const c = cand();
+      const res = await post("/h2vault/vault/conceal/check", { api: c.api, interface: c.interface, ui: c.ui, conceal });
+      if (!res.ok) throw new Error(res.data?.error || `The check failed (${res.status}).`);
+      return res.data;
+    },
+  };
 }
 
 /** Protect without a dialog (browser tests, A26 L9.203). True / false; the outcome is told in a toast. */
@@ -1608,7 +1683,11 @@ app.registerExtension({
     }
   },
   getCanvasMenuItems(canvas) {
-    return lockMenuItems(selectedItemsOf(canvas));
+    const items = lockMenuItems(selectedItemsOf(canvas));
+    for (const [sg, sess] of OPEN) {                    // V3: inside an open concealed vault
+      if (sg.subgraph === canvas?.graph) items.push(...concealMenuItems(sess));
+    }
+    return items;
   },
   getNodeMenuItems(node) {
     const type = node?.comfyClass ?? node?.type;
@@ -1621,7 +1700,8 @@ app.registerExtension({
         { content: "🔑 My installation code", callback: showInstallCode },
         { content: "📱 Two-factor setup…", callback: () => twoFactorSetup() }];
     }
-    if (OPEN.has(node) || node?.id == null || Number(node.id) < 0) return [];
+    if (OPEN.has(node)) return concealMenuItems(OPEN.get(node));
+    if (node?.id == null || Number(node.id) < 0) return [];
     // right-clicking a node is where people look: it acts on the selection when the node is part of it, otherwise
     // on that node alone; one subgraph node gets "Protect this subgraph"
     const sel = selectedItemsOf(app.canvas);

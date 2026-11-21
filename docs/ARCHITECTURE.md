@@ -175,8 +175,13 @@ that would name the inside and answer `public_interface` (a whitelist); `publicI
 (`concealment.after_expansion`); `__init__` installs `concealment.install(server)` after the vault message filter:
 for a concealed vault no inner class, title, id, model file or author output prefix leaves the server (messages,
 history, jobs, errors, the log buffer and console while an inner node runs). Hosted profile: env `H2VAULT_HOSTED=1`
-(+ `H2VAULT_HOSTED_ALLOW`). Not built: the author's "expose / preview as recipient" dialog (a concealed vault is sealed
-today through `POST /h2vault/vault/protect` with a `conceal` section). Design, threat model and residual risks:
+(+ `H2VAULT_HOSTED_ALLOW`). Author side: the protect dialog's "Conceal models and nodes" step
+(`web/js/_h2v_expose.js` pure inventory / roles / aliases / candidate, `_h2v_expose_ui.js` the step, preview drawn by
+`_h2v_conceal.js::renderPreview` from `POST /h2vault/vault/conceal/check`, the same `check_public` as sealing; the
+browser whitelist is `_h2v_public.js`). The author's exposure is stored in `conceal.controls` / `conceal.sockets` and
+merged by `concealment.merge_exposure` on every seal, so an edit keeps it; with it present ONLY the author's controls
+are exposed (frontend-auto-promoted widgets keep their value inside). `commit` with `conceal: null` removes
+concealment; the front end asks the editor to confirm first. Design, threat model and residual risks:
 workspace `docs/h2vault/V3_concealment_design.md`.
 
 ## 8. Plug-and-play

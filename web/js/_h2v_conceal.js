@@ -5,37 +5,14 @@
 // This module renders exactly that on the vault node - nothing else - and keeps the values in widgets named
 // `p_<key>`, which the server maps onto the inside (Aliases resolve there, never here).
 //
-// Imported module ("_" prefix): it registers no extension. Used by the vault front end and the live demo fixture.
+// Imported module ("_" prefix): it registers no extension. Used by the vault front end, the author's "Preview as
+// recipient" pane (renderPreview) and the live demo fixture. The whitelist itself lives in _h2v_public.js.
 import { app } from "../../scripts/app.js";
 import { ComfyWidgets } from "../../scripts/widgets.js";
+import { previewModel, whitelistPublic } from "./_h2v_public.js";
+import { el } from "./_h2v_ui.js";
 
-const PARAM_FIELDS = ["key", "name", "type", "value", "options", "min", "max", "step", "multiline"];
-const SCALAR = (v) => ["string", "number", "boolean"].includes(typeof v);
-
-/** The public half, re-whitelisted in the browser: a malformed or tampered workflow cannot make this module render
- *  (or re-save) a field the server would never publish. */
-export function whitelistPublic(pub) {
-  const p = pub && typeof pub === "object" ? pub : {};
-  const sock = (s) => ({ name: String(s?.name ?? ""), type: String(s?.type ?? "*") });
-  const params = (Array.isArray(p.params) ? p.params : []).filter((x) => x && typeof x === "object").map((x) => {
-    const q = {};
-    for (const f of PARAM_FIELDS) {
-      if (!(f in x)) continue;
-      if (f === "options") { if (Array.isArray(x.options)) q.options = x.options.filter(SCALAR); }
-      else if (f === "value" ? (x.value == null || SCALAR(x.value)) : SCALAR(x[f])) q[f] = x[f];
-    }
-    q.key = String(q.key ?? "");
-    q.name = String(q.name ?? q.key);
-    return q;
-  }).filter((q) => q.key);
-  return {
-    title: String(p.title ?? "H2Vault"),
-    in: (Array.isArray(p.in) ? p.in : []).map(sock),
-    out: (Array.isArray(p.out) ? p.out : []).map(sock),
-    params,
-    concealed: true,
-  };
-}
+export { whitelistPublic };
 
 function hide(w) {
   if (!w) return;
@@ -125,4 +102,29 @@ export function restoreValues(node, values, order) {
 /** The widget order to store with the node, so restoreValues can map values by name. */
 export function widgetOrder(node) {
   return (node.widgets || []).map((w) => w.name);
+}
+
+/** The author's "Preview as recipient": the same public half, the same whitelist, drawn as the vault node the
+ *  recipient will get (title, sockets, one row per exposed control). DOM only, text only (never HTML). */
+export function renderPreview(container, pub) {
+  const m = previewModel(pub);
+  const rows = m.controls.map((c) => {
+    let value;
+    if (c.kind === "choice") value = el("span", { class: "h2v-pv__val h2v-pv__val--choice", text: String(c.value) });
+    else if (c.kind === "switch") value = el("span", { class: "h2v-pv__val", text: c.value ? "on" : "off" });
+    else if (c.kind === "textarea") value = el("span", { class: "h2v-pv__val h2v-pv__val--text", text: String(c.value) });
+    else value = el("span", { class: "h2v-pv__val", text: String(c.value) });
+    const kids = [el("span", { class: "h2v-pv__label", text: c.label }), value];
+    if (c.kind === "choice") kids.push(el("span", { class: "h2v-pv__more", text: `${c.choices} choice${c.choices === 1 ? "" : "s"}` }));
+    return el("li", { class: `h2v-pv__row${c.kind === "textarea" ? " h2v-pv__row--wide" : ""}` }, kids);
+  });
+  const sockets = el("div", { class: "h2v-pv__sockets" }, [
+    el("span", { class: "h2v-pv__in", text: m.inputs.length ? m.inputs.join(", ") : "" }),
+    el("span", { class: "h2v-pv__out", text: m.outputs.join(", ") })]);
+  const card = el("div", { class: "h2v-pv", role: "group", "aria-label": `Recipient view of ${m.title}` }, [
+    el("div", { class: "h2v-pv__title", text: m.title }), sockets,
+    rows.length ? el("ul", { class: "h2v-pv__rows" }, rows)
+      : el("p", { class: "h2v-pv__empty", text: "No controls: the recipient can only run it." })]);
+  container.replaceChildren(card);
+  return m;
 }
