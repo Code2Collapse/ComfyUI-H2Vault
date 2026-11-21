@@ -7,13 +7,17 @@ Protect the parts of a ComfyUI workflow you do not want copied, and still share 
   Opening it needs the vault password and a code from your authenticator app.
 - **Encrypted workflow files**: save the whole workflow as one encrypted file, opened with a key or a password.
   Files are compatible with [ComfyUI-Workflow-Encrypt](https://github.com/jtydhr88/ComfyUI-Workflow-Encrypt).
+- **Concealed vaults (model and node identity)**: the person who runs a concealed vault sees only its title, its socket
+  labels and the controls its author exposed - sampler, scheduler, steps, cfg, seed, denoise, sizes, prompts and
+  "Model A / Model B". No model file name, node type or inner node name reaches their screen, saved workflow, history,
+  job list, console or error messages while it runs.
 
 ![A protected vault next to ordinary nodes](docs/media/vault_node_classic.png)
 
 ## Install
 
-- **ComfyUI Manager**: search for "H2Vault" and install, then restart ComfyUI.
-- **comfy-cli**: `comfy node install ComfyUI-H2Vault`
+- **ComfyUI Manager / comfy-cli** (once H2Vault is published on the Comfy Registry): search for "H2Vault", or
+  `comfy node install ComfyUI-H2Vault`, then restart ComfyUI.
 - **git**: in `ComfyUI/custom_nodes`, run `git clone https://github.com/Code2Collapse/ComfyUI-H2Vault`, then
   `<ComfyUI python> -m pip install -r ComfyUI-H2Vault/requirements.txt` and restart ComfyUI.
 
@@ -57,6 +61,30 @@ under "Other installations" when you protect, or later in **Manage installations
 When a vault needs custom nodes a machine lacks, the run says how many packs are missing and from which hosts (never
 their names), and offers **Install missing custom nodes** - only after a click, from github.com / gitlab.com /
 codeberg.org / bitbucket.org, at the commit the author used. Install their Python requirements with ComfyUI Manager.
+
+## Concealed vaults: share a pipeline without revealing its models or nodes
+
+A vault can be sealed as **concealed**. Its author chooses the controls to expose; everything else stays inside the
+encrypted payload:
+
+- The recipient's vault node shows the title, the socket labels and the exposed controls only. Model choices appear as
+  aliases ("Model A", "Model B"); the real file names are resolved on the server, inside the vault.
+- Sealing refuses what would give the inside away: labels that name it, outputs that hand out a model / CLIP / VAE,
+  and choice lists that show file names.
+- While a concealed vault runs, the server rewrites progress, results, history, job list and errors so they name only
+  the vault (errors become a plain sentence without a traceback), and console lines printed by its inner nodes become
+  `[H2Vault] concealed output`.
+- **Hosted mode** (`H2VAULT_HOSTED=1`, for a render server you operate): model lists are emptied, the log and model-list
+  routes are refused and only vault prompts are accepted.
+
+Checked live (ComfyUI 0.39, frontend 1.53.10, both renderers, at the top level and inside a subgraph): nothing about
+the inside reached the recipient, and a concealed run gives the same pixels as the same graph unconcealed.
+
+**Today** a concealed vault is sealed through H2Vault's protect route with the concealment settings; the author's
+"choose what to expose / preview as recipient" dialog is the next release. What concealment cannot hide on the recipient's own
+machine: code running in the same Python process (another custom node, a debugger) can read the decrypted inside; the
+model files must be on their disk, and a file hash identifies a public model; run time, step counts and comparing many
+outputs hint at the model. For real secrecy run the vault in Hosted mode on a server you operate, behind your own login.
 
 ## Encrypted workflow files
 
