@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 - 2026-11-23
+
+- Concealed vaults show the current step in simple functional words ("Sampling", "Decoding", ...) and a step count on the vault node while they run; node names stay hidden (live-checked in both renderers and inside a subgraph).
+
 ## 0.1.0 - unreleased
 
 First version of H2Vault as its own package.

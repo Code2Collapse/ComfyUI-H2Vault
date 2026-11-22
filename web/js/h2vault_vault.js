@@ -275,11 +275,40 @@ function ensureStatusCard(node) {
   updateStatusCard(node);
 }
 
+// Concealed vaults report WHAT the current step does in simple words ("Sampling", "Decoding" ...) and a step count -
+// never a node name or type (server: concealment.functional_label). Keyed by the vault node's id in the prompt.
+const PHASES = new Map();
+
+function phaseText(node) {
+  const p = PHASES.get(String(node?.id));
+  return p ? `${p.label} · step ${p.step} of ${p.total}` : "";
+}
+
+function onPhase(e) {
+  const d = e?.detail || {};
+  if (!d.vault || typeof d.label !== "string") return;
+  PHASES.set(String(d.vault).split(":").pop(), { label: d.label.slice(0, 40), step: Number(d.step) || 1,
+    total: Number(d.total) || 1 });
+  refreshCards();
+}
+
+function clearPhases() {
+  if (!PHASES.size) return;
+  PHASES.clear();
+  refreshCards();
+}
+
 function updateStatusCard(node) {
   const card = node?.widgets?.find((x) => x.name === STATUS_WIDGET)?.__vaultCard;
   if (!card) return;
   const info = vaultInfo(node);
   const vid = node.widgets?.find((x) => x.name === "vault_id")?.value;
+  const running = phaseText(node);
+  if (running && vid) {
+    card.update({ tone: "ok", title: running, detail: "Running", meta: "Inside steps stay private",
+      action: null });
+    return;
+  }
   const n = info.interface?.concealed ? 0 : (Number(info.node_count) || 0);     // V3: a concealed vault hides it
   const detail = n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph";
   if (!vid) {
@@ -1655,6 +1684,8 @@ app.registerExtension({
     installGuards();
     app.canvas?.canvas?.addEventListener("litegraph:set-graph", onSetGraph);
     api.addEventListener("execution_error", onExecutionError);      // offer the install on every failed attempt
+    api.addEventListener("h2vault.phase", onPhase);
+    for (const ev of ["execution_success", "execution_error", "execution_interrupted"]) api.addEventListener(ev, clearPhases);
   },
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (VAULT_TYPES.has(nodeData.name)) {

@@ -74,6 +74,7 @@ encrypted payload:
 - While a concealed vault runs, the server rewrites progress, results, history, job list and errors so they name only
   the vault (errors become a plain sentence without a traceback), and console lines printed by its inner nodes become
   `[H2Vault] concealed output`.
+- While it runs, the vault node shows **what the current step does in simple words** - "Loading models", "Preparing prompts", "Sampling", "Decoding", "Upscaling", "Saving results" - and "step 3 of 7". The words come from the kind of data a step takes and makes, never from its name, so they cannot reveal a node pack or a model.
 - **Hosted mode** (`H2VAULT_HOSTED=1`, for a render server you operate): model lists are emptied, the log and model-list
   routes are refused and only vault prompts are accepted.
 

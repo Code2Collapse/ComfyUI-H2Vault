@@ -356,6 +356,95 @@ def resolve_params(plain, params: dict) -> dict:
     return out
 
 
+# ── functional phase names (owner 2026-11-23): what a step DOES, in simple words, never what it is ─────────────
+# Derived from a node's declared types (RETURN_TYPES / INPUT_TYPES / OUTPUT_NODE), never from its name, so the label
+# set stays coarse and generic: it cannot single out a node pack or a model.
+_MODEL_TYPES = {"MODEL", "CLIP", "VAE", "CONTROL_NET", "UPSCALE_MODEL", "CLIP_VISION", "STYLE_MODEL", "GLIGEN",
+                "PHOTOMAKER", "SAM_MODEL", "BBOX_DETECTOR", "SEGM_DETECTOR"}
+
+
+def _type_name(r) -> str:
+    return str(getattr(r, "value", r)).upper()
+
+
+def _declared(cls):
+    """(output types, input types, output node?) from a V1 class or a V3 schema node (GET_NODE_INFO_V1)."""
+    ret, req, out_node = set(), set(), bool(getattr(cls, "OUTPUT_NODE", False))
+    info = None
+    if cls is not None and hasattr(cls, "GET_NODE_INFO_V1"):
+        try:
+            info = cls.GET_NODE_INFO_V1()
+        except Exception:  # noqa: BLE001
+            info = None
+    if isinstance(info, dict):
+        ret = {_type_name(r) for r in (info.get("output") or []) if isinstance(r, (str,)) or hasattr(r, "value")}
+        spec = info.get("input") or {}
+        out_node = out_node or bool(info.get("output_node"))
+    else:
+        try:
+            ret = {_type_name(r) for r in (getattr(cls, "RETURN_TYPES", ()) or ())
+                   if isinstance(r, str) or hasattr(r, "value")}
+        except Exception:  # noqa: BLE001
+            ret = set()
+        try:
+            spec = cls.INPUT_TYPES() if cls is not None else {}
+        except Exception:  # noqa: BLE001 - a broken INPUT_TYPES says nothing
+            spec = {}
+    for section in ("required", "optional"):
+        for v in ((spec or {}).get(section) or {}).values():
+            if isinstance(v, (tuple, list)) and v and (isinstance(v[0], str) or hasattr(v[0], "value")):
+                req.add(_type_name(v[0]))
+    return ret, req, out_node
+
+
+def functional_label(cls) -> str:
+    if cls is None:
+        return "Processing"
+    ret, req, out_node = _declared(cls)
+    if out_node:
+        return "Saving results"
+    if ret & _MODEL_TYPES and not ret & {"IMAGE", "LATENT", "MASK"}:
+        return "Loading models"
+    if "LATENT" in ret and "MODEL" in req:
+        return "Sampling"
+    if "IMAGE" in ret and "LATENT" in req:
+        return "Decoding"
+    if "LATENT" in ret and "IMAGE" in req:
+        return "Encoding"
+    if "CONDITIONING" in ret:
+        return "Preparing prompts"
+    if "IMAGE" in ret and "UPSCALE_MODEL" in req:
+        return "Upscaling"
+    if "MASK" in ret:
+        return "Masking"
+    if "IMAGE" in ret:
+        return "Processing image" if "IMAGE" in req else "Creating image"
+    if "VIDEO" in ret:
+        return "Processing video"
+    if "AUDIO" in ret:
+        return "Processing audio"
+    if "LATENT" in ret:
+        return "Preparing latents"
+    return "Processing"
+
+
+def _class_of(class_type):
+    try:
+        import nodes as core_nodes
+        return core_nodes.NODE_CLASS_MAPPINGS.get(class_type)
+    except Exception:  # noqa: BLE001 - outside ComfyUI
+        return None
+
+
+def _send_phase(data: dict) -> None:
+    try:
+        from server import PromptServer
+        srv = PromptServer.instance
+        srv.send_sync("h2vault.phase", data, getattr(srv, "client_id", None))
+    except Exception:  # noqa: BLE001 - display only
+        pass
+
+
 def after_expansion(vault_id, plain, graph: dict, prefix: str, *, concealer: "Optional[Concealer]" = None) -> dict:
     """Post-process the expansion of a concealed vault and register it, so the filters can attribute its ids."""
     if not is_concealed(plain):
@@ -372,7 +461,9 @@ def after_expansion(vault_id, plain, graph: dict, prefix: str, *, concealer: "Op
             if isinstance(inputs, dict) and isinstance(inputs.get("filename_prefix"), str):
                 inputs["filename_prefix"] = CONCEALED_PREFIX
     previews = {f"{prefix}{p}" for p in (_conceal(plain).get("previews") or [])}
-    c.register(str(vault_id), set(g), previews & set(g), secret_terms(plain))
+    phases = {nid: functional_label(_class_of(node.get("class_type"))) for nid, node in g.items()
+              if isinstance(node, dict)}
+    c.register(str(vault_id), set(g), previews & set(g), secret_terms(plain), phases=phases)
     return g
 
 
@@ -396,11 +487,15 @@ class Concealer:
         self._marker_open = False
 
     # registration / state
-    def register(self, vault_id: str, inner_ids: Iterable[str], preview_ids: Iterable[str], terms: Iterable[str]):
+    def register(self, vault_id: str, inner_ids: Iterable[str], preview_ids: Iterable[str], terms: Iterable[str],
+                 phases: Optional[dict] = None):
         with self._lock:
             self._vaults.pop(vault_id, None)
-            self._vaults[vault_id] = {"inner": set(map(str, inner_ids)), "previews": set(map(str, preview_ids)),
-                                      "low_terms": sorted({t.lower() for t in terms}, key=len, reverse=True)}
+            inner = set(map(str, inner_ids))
+            self._vaults[vault_id] = {"inner": inner, "previews": set(map(str, preview_ids)),
+                                      "low_terms": sorted({t.lower() for t in terms}, key=len, reverse=True),
+                                      "phases": {str(k): str(v) for k, v in (phases or {}).items()},
+                                      "started": [], "total": len(inner)}
             while len(self._vaults) > MAX_VAULTS:
                 self._vaults.popitem(last=False)
             self._active.add(vault_id)
@@ -426,8 +521,19 @@ class Concealer:
         return best
 
     def on_node_start(self, node_id) -> None:
+        event = None
         with self._lock:
             self._window = self.vault_of(str(node_id)) if node_id is not None else None
+            info = self._vaults.get(self._window) if self._window else None
+            if info is not None:
+                nid = str(node_id)
+                key = next((i for i in info["inner"] if nid == i or nid.startswith(i + ".")), nid)
+                if key not in info["started"]:
+                    info["started"].append(key)
+                    event = {"vault": self._window, "label": info["phases"].get(key, "Processing"),
+                             "step": len(info["started"]), "total": max(info["total"], len(info["started"]))}
+        if event is not None:
+            _send_phase(event)
 
     def end_prompt(self) -> None:
         with self._lock:
