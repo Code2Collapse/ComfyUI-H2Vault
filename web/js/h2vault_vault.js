@@ -204,6 +204,7 @@ function promotedWidget(node, p) {
 }
 
 function applyInterface(node) {
+  setTimeout(() => { try { autoProvision(node); } catch (_) { /* best effort */ } }, 800);
   const info = vaultInfo(node);
   const iface = info.interface || {};
   hideWidget(node.widgets?.find((w) => w.name === "vault_id"));
@@ -303,6 +304,13 @@ function updateStatusCard(node) {
   if (!card) return;
   const info = vaultInfo(node);
   const vid = node.widgets?.find((x) => x.name === "vault_id")?.value;
+  const prep = PREPARING.get(vid);
+  if (prep && vid) {
+    card.update({ tone: prep.failed ? "warn" : "accent", title: prep.failed ? "Could not prepare this vault"
+      : `Preparing this vault · ${prep.pct} %`, detail: prep.failed ? prep.failed : "Downloading what it needs",
+      meta: "What it downloads stays private", action: null });
+    return;
+  }
   const running = phaseText(node);
   if (running && vid) {
     card.update({ tone: "ok", title: running, detail: "Running", meta: "Inside steps stay private",
@@ -1500,6 +1508,74 @@ function accessDialog(v, res, focus, apply) {
   return d.result;
 }
 
+// ── V7 concealed provisioning: what a vault needs arrives by itself, names never shown (owner 2026-11-23) ──────
+const PROVISION_SETTING = "h2vault.provision.mode";
+const PREPARING = new Map();           // vault id -> {pct, failed}
+const PROVISIONED = new Set();         // vault ids handled in this tab
+
+function provisionMode() {
+  try {
+    const v = app.extensionManager?.setting?.get?.(PROVISION_SETTING);
+    return v === "ask" || v === "never" ? v : "auto";
+  } catch (_) { return "auto"; }
+}
+
+async function autoProvision(v) {
+  const W = (name) => v.widgets?.find((w) => w.name === name);
+  const vid = W("vault_id")?.value, payload = W("vault_payload")?.value;
+  const mode = provisionMode();
+  if (!vid || !payload || mode === "never" || PROVISIONED.has(vid)) return;
+  PROVISIONED.add(vid);
+  const body = { payload, vault_id: vid, client_id: api.clientId };
+  const plan = await post("/h2vault/vault/provision/plan", body);
+  if (!plan.ok) return;                               // e.g. a Locked vault before its password: the run asks
+  const s = plan.data;
+  if (s.nodes_missing) {
+    if (mode === "auto") {
+      const r = await post("/h2vault/vault/install_missing", { ...body, consent: true });
+      if (r.ok && r.data?.installed) toast(`Installed what this workflow needs (${r.data.installed} extension` +
+        `${r.data.installed !== 1 ? "s" : ""}). Restart ComfyUI to load ${r.data.installed !== 1 ? "them" : "it"}.`);
+    } else installMissing(v, { auto: true });
+  }
+  if (!s.models_missing) return;
+  if (!s.downloadable) {
+    toast("This workflow needs model files its vault cannot download. Ask the vault's author.", true);
+    return;
+  }
+  const gb = (s.bytes / 1e9).toFixed(s.bytes > 1e10 ? 0 : 1);
+  if (mode === "ask") {
+    const ask = vaultDialog({ title: "Prepare this workflow", width: 460 });
+    ask.body.append(vel("p", { style: { margin: "0" }, text: `It needs ${s.models_missing} model file` +
+      `${s.models_missing !== 1 ? "s" : ""} (${gb} GB) that this ComfyUI does not have. They download in the background ` +
+      "and are checked before use; what they are stays private." }));
+    ask.addAction("Not now", { onClick: () => ask.close(false) });
+    ask.addAction("Download", { primary: true, onClick: () => ask.close(true) });
+    if (!(await ask.result)) return;
+  }
+  const st = await post("/h2vault/vault/provision/start", { ...body, consent: true });
+  if (!st.ok) { toast(st.data?.error || "Could not prepare this vault.", true); return; }
+  const token = st.data.token;
+  PREPARING.set(vid, { pct: 0 });
+  refreshCards(vid);
+  const tick = async () => {
+    const r = await post("/h2vault/vault/provision/status", { token });
+    const d = r.data || {};
+    const pct = d.total_bytes ? Math.min(100, Math.floor((100 * d.done_bytes) / d.total_bytes)) : 0;
+    if (d.state === "running") {
+      PREPARING.set(vid, { pct });
+      refreshCards(vid);
+      setTimeout(tick, 2000);
+      return;
+    }
+    if (d.state === "done") {
+      PREPARING.delete(vid);
+      toast("This workflow is ready: everything it needs is downloaded and checked.");
+    } else PREPARING.set(vid, { pct, failed: d.error || "A download failed; try again later." });
+    refreshCards(vid);
+  };
+  setTimeout(tick, 1500);
+}
+
 // ── missing custom nodes (L9.50): one click, names never shown (owner A18) ─────────────────────────────────
 let INSTALL_OFFER_OPEN = false;
 const MISSING_PREFIX = "This workflow needs custom nodes that are not installed";
@@ -1679,7 +1755,14 @@ app.registerExtension({
   settings: [{ id: DEFAULT_PROFILE_SETTING, category: ["H2Vault", "Protect", "Default profile"],
     name: "Profile chosen first when protecting a subgraph", type: "combo", defaultValue: "sealed_installs",
     options: [{ text: "Sealed - authorized installations", value: "sealed_installs" },
-      { text: "Locked - password to run", value: "locked" }] }],
+      { text: "Locked - password to run", value: "locked" }] },
+    { id: PROVISION_SETTING, category: ["H2Vault", "Run", "Install what a vault needs"],
+      name: "When a workflow's vault needs model files or extensions this ComfyUI lacks", type: "combo",
+      defaultValue: "auto",
+      tooltip: "Automatically: download them in the background (checked before use; what they are stays private). "
+        + "Extensions are code and need a ComfyUI restart.",
+      options: [{ text: "Install automatically", value: "auto" }, { text: "Ask first", value: "ask" },
+        { text: "Never", value: "never" }] }],
   setup() {
     installGuards();
     app.canvas?.canvas?.addEventListener("litegraph:set-graph", onSetGraph);
