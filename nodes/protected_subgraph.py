@@ -112,10 +112,43 @@ def needs_tab_key(payload: str) -> bool:
 def open_for_run(payload: str, vault_id: str, client_id: Optional[str] = None) -> dict:
     """Decrypt for execution with whatever this install / tab is allowed to use. Raises VaultError with what is
     missing, never with anything from inside the vault."""
-    from . import crypto as v2, keys as vault_keys
+    return _open_for_run(payload, vault_id, client_id)[0]
+
+
+def _open_licensed(payload: str, vault_id: str) -> tuple:
+    """V5 Licensed vault: the newest licence stored on this installation that verifies and may run now. -> (plain,
+    licence id). Every refusal is the plain-English text of nodes/licence.py."""
+    from . import crypto as v2, keys as vault_keys, licence
+
+    priv = vault_keys.install_private_key(create=False)
+    if priv is None:
+        raise VaultError(licence.NEEDS_LICENCE)
+    pub = vault_keys.install_public_key()
+    author_pub = v2.parse(payload)["author_pub"]
+    lic, problem = licence.best_for_run(vault_id, author_pub=author_pub, install_pub=pub)
+    if problem:
+        raise VaultError(problem)
+    try:
+        lk = licence.unwrap(lic, priv)
+    except licence.LicenceError as exc:
+        raise VaultError(str(exc)) from None
+    return v2.open_with_licence_key(payload, lk, vault_id=vault_id), lic["lid"]
+
+
+def _open_for_run(payload: str, vault_id: str, client_id: Optional[str] = None) -> tuple:
+    """-> (plain, licence id or None). The licence id lets the node count a real run (V5)."""
+    from . import crypto as v2
 
     client_id = client_id if client_id is not None else _current_client_id()
     mode = v2.parse(payload)["mode"]
+    if mode == v2.MODE_SEALED_LICENSED:
+        return _open_licensed(payload, vault_id)
+    return _open_unlicensed(payload, vault_id, client_id, mode), None
+
+
+def _open_unlicensed(payload: str, vault_id: str, client_id: Optional[str], mode: int) -> dict:
+    from . import crypto as v2, keys as vault_keys
+
     if mode == v2.MODE_SEALED_PORTABLE:
         return v2.open_portable(payload, vault_id=vault_id)
     if mode == v2.MODE_SEALED_INSTALLS:
@@ -383,7 +416,7 @@ class H2Vault_ProtectedSubgraph:
         if not (vault_payload or "").strip():
             raise RuntimeError("This H2Vault is empty: lock a selection or a subgraph first.")
         try:
-            plain = open_for_run(vault_payload, vault_id)
+            plain, licence_id = _open_for_run(vault_payload, vault_id)
         except VaultError as exc:
             raise RuntimeError(str(exc)) from None
         api = api_of(plain)
@@ -408,6 +441,10 @@ class H2Vault_ProtectedSubgraph:
         graph = concealment.after_expansion(str(unique_id), plain, graph, prefix)   # V3: registers a concealed run
         _ACTIVE_VAULTS.add(str(unique_id))
         _INNER_TYPES[str(unique_id)] = {k: str(n["class_type"]) for k, n in graph.items()}
+        register_redaction(str(unique_id), plain)               # V5: a Locked node's values never reach a message
+        if licence_id:                                         # V5: a real run of a Licensed vault (never a cache hit)
+            from . import licence
+            licence.record_run(licence_id)
         result += [None] * (len(self.RETURN_TYPES) - len(result))
         return {"result": tuple(result), "expand": graph}
 
@@ -441,6 +478,115 @@ def missing_message(s: dict) -> str:
     if s["unknown_classes"] or s["installable"] < s["packs"]:
         msg += " Some of them cannot be installed from here - ask the vault's author which ones to install."
     return msg
+
+
+# ── V5: redaction of a Locked node's values ─────────────────────────────────────────────────────────────────
+# A vault whose plaintext has a `lock` section (Lock parameters, design 5.3) registers its locked values when it
+# expands. While such a vault's prompt runs, every message the filter rewrites (error text, progress text, executed
+# text outputs, history) and every log record has those values replaced by REDACTED. The window opens at the
+# expansion and closes when the prompt ends (task_done) or the next one starts, so ordinary log lines outside a run
+# are never touched. Numbers match only as whole tokens ("20" never matches "20.5" or "v20").
+REDACTED = "\u2022\u2022\u2022"
+MAX_REDACT = 64
+_REDACT: dict = {}                  # vault id -> compiled pattern of its locked values (insertion order = age)
+_REDACT_WINDOW: set = set()         # vault ids whose prompt is running now
+
+
+def _redact_terms(plain: dict) -> list:
+    lock = plain.get("lock") if isinstance(plain, dict) else None
+    if not isinstance(lock, dict):
+        return []
+    node = (api_of(plain).get("nodes") or {}).get(str(lock.get("node")))
+    inputs = (node or {}).get("inputs") or {}
+    terms = []
+    for row in lock.get("rows") or []:
+        v = inputs.get(str(row))
+        if isinstance(v, bool) or v is None or _is_link(v) or isinstance(v, (dict, list)):
+            continue
+        if isinstance(v, (int, float)):
+            forms = {repr(v), str(v)}
+            if isinstance(v, float) and v.is_integer():
+                forms.add(str(int(v)))
+            terms += [("num", f) for f in forms]
+        elif isinstance(v, str) and len(v.strip()) >= 3:
+            terms.append(("str", v))
+    return terms
+
+
+def register_redaction(vault_id: str, plain: dict) -> None:
+    terms = _redact_terms(plain)
+    if not terms:
+        return
+    alts = []
+    for kind, t in sorted(set(terms), key=lambda x: len(x[1]), reverse=True):
+        esc = re.escape(t)
+        alts.append(rf"(?<![\w.]){esc}(?![\w.])" if kind == "num" else esc)
+    _REDACT.pop(vault_id, None)
+    _REDACT[vault_id] = re.compile("|".join(alts))
+    while len(_REDACT) > MAX_REDACT:
+        _REDACT.pop(next(iter(_REDACT)))
+    _REDACT_WINDOW.add(vault_id)
+
+
+def redact(vault_id: Optional[str], obj: Any) -> Any:
+    """`obj` with the locked values of `vault_id` replaced (strings inside dicts / lists too)."""
+    pat = _REDACT.get(vault_id) if vault_id else None
+    if pat is None:
+        return obj
+    if isinstance(obj, str):
+        return pat.sub(REDACTED, obj)
+    if isinstance(obj, dict):
+        return {k: redact(vault_id, v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        vals = [redact(vault_id, x) for x in obj]
+        return tuple(vals) if isinstance(obj, tuple) else vals
+    return obj
+
+
+def _redact_window_text(text: str) -> str:
+    for v in list(_REDACT_WINDOW):
+        text = redact(v, text)
+    return text
+
+
+def end_redaction_window() -> None:
+    _REDACT_WINDOW.clear()
+
+
+class _RedactLogFilter(logging.Filter):
+    """Log records written while a Locked node's prompt runs lose its values (message and exception text)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not _REDACT_WINDOW:
+            return True
+        try:
+            msg = record.getMessage()
+            red = _redact_window_text(msg)
+            if red != msg:
+                record.msg, record.args = red, ()
+            if record.exc_info:
+                text = logging.Formatter().formatException(record.exc_info)
+                red = _redact_window_text(text)
+                if red != text:
+                    record.exc_text, record.exc_info = red, None
+            elif record.exc_text:
+                record.exc_text = _redact_window_text(record.exc_text)
+        except Exception:  # noqa: BLE001 - never break logging
+            pass
+        return True
+
+
+_LOG_FILTER = _RedactLogFilter()
+
+
+def install_log_redaction() -> None:
+    """On the root logger (records logged there) and on every root handler (records propagated from children)."""
+    root = logging.getLogger()
+    if _LOG_FILTER not in root.filters:
+        root.addFilter(_LOG_FILTER)
+    for h in root.handlers:
+        if _LOG_FILTER not in h.filters:
+            h.addFilter(_LOG_FILTER)
 
 
 # ── leak control on the server's messages ───────────────────────────────────────────────────────────────────
@@ -522,7 +668,7 @@ def _sanitize_error(d: dict) -> dict:
         d["node_type"] = _inner_type(v, inner) or d.get("node_type")
         msg = d.get("exception_message")
         if isinstance(msg, str) and v is not None:             # core names nodes by id in its own messages
-            d["exception_message"] = _INNER_ID_RE.sub(lambda m: _vault_of(m.group(0)) or m.group(0), msg)
+            d["exception_message"] = redact(v, _INNER_ID_RE.sub(lambda m: _vault_of(m.group(0)) or m.group(0), msg))
         for k in _DETAIL_KEYS:
             if k in d:
                 d[k] = type(d[k])() if isinstance(d[k], (list, dict)) else None
@@ -544,7 +690,10 @@ def _sanitize_binary(event: int, data: Any) -> Any:
         v = _vault_of(node)
         if v is not None:
             vb = v.encode("utf-8")
-            return struct.pack(">I", len(vb)) + vb + bytes(data[4 + n:])
+            text = bytes(data[4 + n:])
+            if v in _REDACT:                                   # V5: a Locked node's progress text
+                text = redact(v, text.decode("utf-8", "replace")).encode("utf-8")
+            return struct.pack(">I", len(vb)) + vb + text
     return data
 
 
@@ -561,6 +710,7 @@ def sanitize_message(event: str, data: Any, track: bool = True) -> Any:
     d = dict(data)
     if event == "execution_start" and track:
         _LAST_INNER.clear()
+        end_redaction_window()
     if event in ("executing", "executed", "progress"):
         node = d.get("node")
         v = _vault_of(node)
@@ -573,6 +723,8 @@ def sanitize_message(event: str, data: Any, track: bool = True) -> Any:
             d["node"] = v
             if "display_node" in d:
                 d["display_node"] = v
+            if event == "executed" and v in _REDACT and "output" in d:
+                d["output"] = redact(v, d["output"])
     elif event == "execution_cached":
         d["nodes"] = [x for x in (d.get("nodes") or []) if _vault_of(x) is None]
     elif event == "progress_state":
@@ -605,6 +757,7 @@ def sanitize_history(result: dict) -> dict:
             outputs[k] = v
             continue
         merged = outputs.setdefault(vault, {})
+        v = redact(vault, v)
         for key, val in (v or {}).items():
             merged.setdefault(key, [])
             merged[key] = list(merged[key]) + (list(val) if isinstance(val, (list, tuple)) else [val])
@@ -636,6 +789,7 @@ def install_message_filter(server=None) -> bool:
             return _orig(event, data, sid)
 
         server.send_sync = send_sync
+        install_log_redaction()
         q = getattr(server, "prompt_queue", None)
         if q is not None and hasattr(q, "task_done"):
             orig_done = q.task_done
@@ -648,7 +802,10 @@ def install_message_filter(server=None) -> bool:
                         status = status._replace(messages=msgs) if hasattr(status, "_replace") else status
                 except Exception:  # noqa: BLE001
                     log.exception("H2Vault: history filter failed")
-                return _orig(item_id, history_result, status, *a, **k)
+                try:
+                    return _orig(item_id, history_result, status, *a, **k)
+                finally:
+                    end_redaction_window()                    # V5: the prompt ended
 
             q.task_done = task_done
         _installed = True

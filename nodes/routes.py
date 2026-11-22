@@ -20,6 +20,13 @@
   POST /h2vault/2fa/enrol/begin  a new TOTP secret + recovery codes, shown once        (this machine's page only)
   POST /h2vault/2fa/enrol/confirm  the first code activates it                        (this machine's page only)
   POST /h2vault/2fa/reset        remove it, with a current code or a recovery code     (this machine's page only)
+  POST /h2vault/licence/status   V5: may this installation run a Licensed vault now (this machine's page only)
+  POST /h2vault/licence/add      V5: keep a licence the author sent (verified first)    (this machine's page only)
+  POST /h2vault/licence/remove   V5: forget a stored licence                              (this machine's page only)
+  POST /h2vault/licence/issue    V5: the author signs a licence (password + second factor + editor)
+  POST /h2vault/licence/rotate   V5: new licence key = revoke every licence; re-issue chosen ones (same checks)
+  GET  /h2vault/licence/ledger   V5: the licences this author issued (no keys)          (this machine's page only)
+  POST /h2vault/licence/author/export|import  V5: password-protected author key backup  (this machine's page only)
 
 The password travels only over these routes; it is never a widget, never in a prompt or a workflow, never stored. The
 server keeps derived keys in memory only.
@@ -28,6 +35,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import os
+import re
 import secrets
 import struct
 import threading
@@ -37,7 +47,7 @@ from typing import Any, Optional
 from . import packs as vault_packs
 from .crypto import VaultError
 
-PROFILES = {"locked": 0, "sealed_installs": 1, "sealed_portable": 2}
+PROFILES = {"locked": 0, "sealed_installs": 1, "sealed_portable": 2, "sealed_licensed": 3}
 PROFILE_NAMES = {v: k for k, v in PROFILES.items()}
 EDIT_IDLE_SECONDS = 6 * 3600           # an edit session also ends when the user leaves the subgraph (owner A18)
 ACCESS_IDLE_SECONDS = 15 * 60          # an access session (L9.48) only lives while its dialog is open
@@ -176,6 +186,59 @@ def _expose(api, interface, conceal):
     return concealment.merge_exposure(api, interface, conceal) if isinstance(conceal, dict) else (api, interface)
 
 
+# ── V5: Lock parameters (a one-node vault drawn like its node; design 5) ─────────────────────────────────────────
+LOCK_TITLE_MAX = 80
+_COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _with_lock(plain: dict, lock, *, strict: bool = True) -> Optional[dict]:
+    """Validate a Lock-parameters request against the vault's inside; store it in the plaintext. -> the whitelisted
+    public part for the node, or None (no lock). `strict=False` (an edit that no longer fits) drops the lock instead
+    of refusing."""
+    plain.pop("lock", None)
+    if lock is None:
+        return None
+    try:
+        if not isinstance(lock, dict):
+            raise VaultError("The Lock parameters settings are malformed.")
+        nodes_ = (plain.get("api") or {}).get("nodes") or {}
+        node_id = str(lock.get("node"))
+        if len(nodes_) != 1 or node_id not in nodes_:
+            raise VaultError("Lock parameters works on one node at a time.")
+        inputs = nodes_[node_id].get("inputs") or {}
+        promoted = {str(x.get("input")) for x in ((plain.get("api") or {}).get("promoted") or [])
+                    if isinstance(x, dict) and str(x.get("node")) == node_id}
+        rows = []
+        for r in lock.get("rows") or []:
+            r = str(r)
+            if r not in inputs:
+                raise VaultError(f"{r!r} is not a setting of this node.")
+            if r in promoted:
+                raise VaultError(f"{r!r} is both locked and offered as a control; choose one.")
+            if r not in rows:
+                rows.append(r)
+        if not rows:
+            raise VaultError("Choose at least one value to lock.")
+        look_in = lock.get("look") if isinstance(lock.get("look"), dict) else {}
+        look = {"title": str(look_in.get("title") or "")[:LOCK_TITLE_MAX],
+                "node_label": str(look_in.get("node_label") or "")[:LOCK_TITLE_MAX] or None}
+        for key in ("color", "bgcolor"):
+            c = look_in.get(key)
+            look[key] = c if isinstance(c, str) and _COLOR.match(c) else None
+        public = {"rows": list(rows), "look": look}
+        leaks = [inputs[r] for r in rows if isinstance(inputs[r], str) and len(inputs[r].strip()) >= 3]
+        shown = json.dumps([plain.get("interface"), public], ensure_ascii=False)
+        if any(v in shown for v in leaks):
+            raise VaultError("A locked value appears in the public part of this node; it would be readable by "
+                             "anyone. Rename the node or change what is offered.")
+    except VaultError:
+        if strict:
+            raise
+        return None
+    plain["lock"] = {"version": 1, "node": node_id, "rows": rows, "look": look}
+    return public
+
+
 def conceal_check(body: dict) -> dict:
     """V3 author step: the refusals sealing would give for this exposure, and the public interface the recipient
     would see - computed by the same code as sealing, without sealing (no key, no payload)."""
@@ -215,8 +278,15 @@ def protect(body: dict) -> dict:
              "editors": editors, "profile": profile, "packs": vault_packs.record_safely(api),          # L9.50
              "created": int(time.time())}
     public = _with_conceal(plain, body.get("conceal"))
+    public_lock = _with_lock(plain, body.get("lock"))
+    licensing = None
+    if profile == "sealed_licensed":                           # V5: a fresh licence key; this author's signing key
+        from . import licence as L
+        licensing = {"lk": os.urandom(32), "author_pub": L.author_public_key(create=True)}
     payload, kek = v2.lock(plain, password, vault_id=vault_id, mode=PROFILES[profile], iface=_iface(interface),
-                           recipients=recipients)
+                           recipients=recipients, licensing=licensing)
+    if licensing:
+        _license_this_installation(vault_id, licensing)       # the author runs it at once
     if profile == "locked" and body.get("client_id"):
         SS.RUN_SESSIONS.put(str(body["client_id"]), vault_id, kek)   # the creator can run it right away
         _note_pending(vault_id, str(body["client_id"]))
@@ -224,7 +294,19 @@ def protect(body: dict) -> dict:
            "outputs_node": bool(body.get("outputs_node")), "node_count": len(api["nodes"])}
     if public is not None:
         out["public_interface"] = public
+    if public_lock is not None:
+        out["public_lock"] = public_lock
     return out
+
+
+def _license_this_installation(vault_id: str, licensing: dict) -> str:
+    """V5: the author's own installation gets an open licence (no end, no run limit) - not listed in the Ledger."""
+    from . import keys as vault_keys, licence as L
+    pub = vault_keys.install_public_key()
+    text = L.issue(author_priv=L.author_private_key(), vault_id=vault_id, lk=licensing["lk"], install_pub=pub,
+                   label=L.AUTHOR_LABEL)
+    L.add(text, author_pub=licensing["author_pub"], vault_id=vault_id, install_pub=pub)
+    return text
 
 
 def _note_pending(vault_id: str, client_id: str) -> None:
@@ -338,6 +420,8 @@ def open_for_edit(body: dict) -> dict:
                          "editors": editors or [me], "recipients": plain.get("recipients") or [],
                          "packs": plain.get("packs") or [], "at": time.time(),
                          "conceal": plain.get("conceal"),
+                         "lock": plain.get("lock"),                        # V5
+                         "licensing": v2_licensing(plain),                 # V5: an edit keeps the licence key
                          "client_id": str(body.get("client_id") or "")}
     out = {"ok": True, "edit_token": token, "interface": plain.get("interface"), "profile": _EDITS[token]["profile"],
            "second_factor": detail["reason"]}
@@ -351,6 +435,11 @@ def open_for_edit(body: dict) -> dict:
         raise VaultError("This vault has no editable layout. Ask its author for a fresh copy.")
     out["ui"] = plain["ui"]
     return out
+
+
+def v2_licensing(plain: dict):
+    from . import crypto as v2
+    return v2.licensing_of(plain)
 
 
 def _mode_of(payload: str) -> int:
@@ -540,11 +629,17 @@ def commit(body: dict) -> dict:
              "packs": vault_packs.record_safely(api, s["packs"]),                                    # L9.50
              "updated": int(time.time())}
     public = _with_conceal(plain, conceal)
+    # V5: an explicit `lock` is checked strictly; the session's lock is kept only while it still fits the inside
+    public_lock = (_with_lock(plain, body["lock"]) if "lock" in body
+                   else _with_lock(plain, s.get("lock"), strict=False))
     recipients = None
     if s["profile"] == "sealed_installs":
         recipients = [base64.b64decode(r) for r in s["recipients"]] or _codes_to_keys([_this_install_code()])
     payload = v2.lock_with(plain, s["k"], vault_id=s["vault_id"], mode=PROFILES[s["profile"]],
-                           iface=_iface(interface), recipients=recipients)
+                           iface=_iface(interface), recipients=recipients,
+                           licensing=s.get("licensing") if s["profile"] == "sealed_licensed" else None)
+    with _lock:
+        s["lock"] = plain.get("lock")
     if s["profile"] == "locked" and s.get("client_id"):
         from . import protected_subgraph as SS
         SS.RUN_SESSIONS.put(s["client_id"], s["vault_id"], s["k"]["kek"])
@@ -552,7 +647,7 @@ def commit(body: dict) -> dict:
         with _lock:
             _EDITS.pop(str(body.get("edit_token")), None)
     out = {"ok": True, "payload": payload, "vault_id": s["vault_id"], "profile": s["profile"],
-           "node_count": len(api["nodes"])}
+           "node_count": len(api["nodes"]), "public_lock": public_lock}
     if public is not None:
         out["public_interface"] = public
     return out
@@ -573,6 +668,194 @@ def info(body: dict) -> dict:
     return {"ok": True, "profile": PROFILE_NAMES.get(mode, "locked"),
             "obfuscation_only": mode == 2,
             "this_install": _this_install_code()}
+
+
+# ── V5 licences (nodes/licence.py, design section 6) ───────────────────────────────────────────────────────────
+NOT_LICENSED = "Licences are for vaults protected as Licensed installations."
+NOT_AUTHOR_HERE = ("This installation does not hold the author key of this workflow. Restore your author key backup "
+                   "first (H2Vault menu > Restore author key).")
+MAX_LICENCE_DAYS = 3650
+
+
+class _BadRequest(VaultError):
+    status = 400
+
+
+def _licensed(body: dict) -> tuple:
+    from . import crypto as v2
+    payload, vault_id = str(body.get("payload") or ""), str(body.get("vault_id") or "")
+    try:
+        p = v2.parse(payload)
+    except VaultError as err:
+        raise _BadRequest(str(err)) from None
+    if vault_id and p["vault_id"] != vault_id:
+        raise _BadRequest("Vault payload does not belong to this vault.")
+    return payload, p["vault_id"], p
+
+
+def _lic_error(fn):
+    """LicenceError (plain text) -> a 400 answer with that text."""
+    def run(body):
+        from . import licence as L
+        try:
+            return fn(body)
+        except L.LicenceError as exc:
+            raise _BadRequest(str(exc)) from None
+    run.__name__ = fn.__name__
+    return run
+
+
+def _public_licence(lic: dict) -> dict:
+    from . import licence as L
+    return {"lid": lic["lid"], "label": lic["label"], "issued": lic["issued"], "nbf": lic["nbf"], "exp": lic["exp"],
+            "runs": lic["runs"], "runs_left": L.runs_left(lic),
+            "exp_text": L.fmt_date(lic["exp"]) if lic["exp"] is not None else None}
+
+
+@_lic_error
+def licence_status(body: dict) -> dict:
+    """May this installation run this Licensed vault now? (never counts a run)"""
+    from . import crypto as v2, keys as vault_keys, licence as L
+    payload, vault_id, p = _licensed(body)
+    if p["mode"] != v2.MODE_SEALED_LICENSED:
+        return {"ok": True, "licensed_vault": False}
+    if vault_keys.install_private_key(create=False) is None:
+        return {"ok": True, "licensed_vault": True, "licensed": False, "problem": L.NEEDS_LICENCE}
+    pub = vault_keys.install_public_key()
+    lic, problem = L.best_for_run(vault_id, author_pub=p["author_pub"], install_pub=pub)
+    out = {"ok": True, "licensed_vault": True, "licensed": lic is not None, "problem": problem,
+           "install_code": vault_keys.public_text(pub)}
+    if lic is not None:
+        out["licence"] = _public_licence(lic)
+    return out
+
+
+@_lic_error
+def licence_add(body: dict) -> dict:
+    from . import crypto as v2, keys as vault_keys, licence as L
+    payload, vault_id, p = _licensed(body)
+    if p["mode"] != v2.MODE_SEALED_LICENSED:
+        raise _BadRequest(NOT_LICENSED)
+    lic = L.add(str(body.get("licence") or ""), author_pub=p["author_pub"], vault_id=vault_id,
+                install_pub=vault_keys.install_public_key())
+    return {"ok": True, "licence": _public_licence(lic)}
+
+
+@_lic_error
+def licence_remove(body: dict) -> dict:
+    from . import licence as L
+    return {"ok": True, "removed": L.remove(str(body.get("lid") or ""))}
+
+
+def _author_for(p: dict) -> bytes:
+    from . import licence as L
+    priv = L.author_private_key(create=False)
+    if priv is None or L.ed25519_public(priv) != p["author_pub"]:
+        raise VaultError(NOT_AUTHOR_HERE)
+    return priv
+
+
+def _licence_terms(body: dict, now: int) -> dict:
+    exp = body.get("exp")
+    days = body.get("exp_days")
+    if exp is not None:
+        if not isinstance(exp, int) or isinstance(exp, bool):
+            raise _BadRequest("The end date is not a valid date.")
+    elif days is not None:
+        if not isinstance(days, int) or isinstance(days, bool) or not 1 <= days <= MAX_LICENCE_DAYS:
+            raise _BadRequest(f"Choose between 1 and {MAX_LICENCE_DAYS} days.")
+        exp = now + days * 86400
+    runs = body.get("runs")
+    if runs is not None and (not isinstance(runs, int) or isinstance(runs, bool) or not 1 <= runs <= 10_000_000):
+        raise _BadRequest("The run limit must be a whole number of at least 1.")
+    return {"exp": exp, "runs": runs, "label": str(body.get("label") or "").strip()[:60]}
+
+
+@_lic_error
+def licence_issue(body: dict) -> dict:
+    """The author signs a licence for one installation (password + second factor + editor, as opening)."""
+    from . import crypto as v2, keys as vault_keys, licence as L
+    payload, vault_id, p = _licensed(body)
+    if p["mode"] != v2.MODE_SEALED_LICENSED:
+        raise _BadRequest(NOT_LICENSED)
+    install_pub = vault_keys.parse_public_text(str(body.get("install_code") or ""))
+    now = int(time.time())
+    terms = _licence_terms(body, now)
+    plain, _k, _factor, refused = _authorize(body)
+    if refused:
+        return refused
+    author_priv = _author_for(p)
+    lk = v2.licensing_of(plain)["lk"]
+    text = L.issue(author_priv=author_priv, vault_id=vault_id, lk=lk, install_pub=install_pub, now=now, **terms)
+    lic = L.parse(text)
+    L.ledger_add({**lic, "lid": lic["lid"], "vault_id": vault_id, "vault_title": str(body.get("title") or "")[:80],
+                  "install_code": vault_keys.public_text(install_pub)})
+    return {"ok": True, "licence_text": text, "licence": _public_licence(lic)}
+
+
+@_lic_error
+def licence_rotate(body: dict) -> dict:
+    """Revoke every licence of this vault: a new licence key, the vault re-sealed (same id and password), then fresh
+    licences for the Ledger rows the author ticked. Old copies of the workflow keep running for old holders."""
+    from . import crypto as v2, keys as vault_keys, licence as L
+    payload, vault_id, p = _licensed(body)
+    if p["mode"] != v2.MODE_SEALED_LICENSED:
+        raise _BadRequest(NOT_LICENSED)
+    plain, k, _factor, refused = _authorize(body)
+    if refused:
+        return refused
+    author_priv = _author_for(p)
+    licensing = {"lk": os.urandom(32), "author_pub": p["author_pub"]}
+    inner = {key: v for key, v in plain.items() if key not in ("recipients", "format")}
+    inner["updated"] = int(time.time())
+    new_payload = v2.lock_with(inner, k, vault_id=vault_id, mode=v2.MODE_SEALED_LICENSED,
+                               iface=_iface(plain.get("interface") or {}), licensing=licensing)
+    v2.open_with_licence_key(new_payload, licensing["lk"], vault_id=vault_id)      # it opens, or nothing changes
+    reissued = []
+    now = int(time.time())
+    for lid in body.get("reissue") or []:
+        row = L.ledger_row(str(lid))
+        if not row or row.get("vault_id") != vault_id:
+            continue
+        exp = row.get("exp")
+        if exp is not None and exp <= now:                     # an ended licence is not renewed by a rotation
+            continue
+        pub = vault_keys.parse_public_text(row["install_code"])
+        text = L.issue(author_priv=author_priv, vault_id=vault_id, lk=licensing["lk"], install_pub=pub,
+                       label=row.get("label") or "", exp=exp, runs=row.get("runs"), now=now)
+        lic = L.parse(text)
+        L.ledger_add({**lic, "vault_id": vault_id, "vault_title": row.get("vault_title") or "",
+                      "install_code": row["install_code"]})
+        reissued.append({"licence_text": text, "licence": _public_licence(lic), "replaces": str(lid)})
+    _license_this_installation(vault_id, licensing)
+    with _lock:
+        for t in [t for t, x in _EDITS.items() if x.get("vault_id") == vault_id]:
+            _EDITS.pop(t, None)                                # every open session holds the old licence key
+    return {"ok": True, "payload": new_payload, "vault_id": vault_id, "reissued": reissued}
+
+
+def licence_ledger(_body: dict) -> dict:
+    from . import licence as L
+    now = time.time()
+    rows = []
+    for r in L.ledger_rows():
+        exp = r.get("exp")
+        state = "active" if exp is None or exp > now + 7 * 86400 else ("expiring" if exp > now else "ended")
+        rows.append({**r, "state": state, "exp_text": L.fmt_date(exp) if exp else None})
+    return {"ok": True, "rows": rows}
+
+
+@_lic_error
+def author_export(body: dict) -> dict:
+    from . import licence as L
+    return {"ok": True, "file": L.export_author(str(body.get("password") or ""))}
+
+
+@_lic_error
+def author_import(body: dict) -> dict:
+    from . import licence as L
+    kid = L.import_author(body.get("file"), str(body.get("password") or ""), replace=bool(body.get("replace")))
+    return {"ok": True, "author": kid}
 
 
 # ── second factor (CNP vault_node /c2c_vault/2fa/*) ──────────────────────────────────────────────────────────────
@@ -688,3 +971,15 @@ def register_routes(server) -> None:
     routes.post("/h2vault/2fa/enrol/begin")(wrap(tfa_begin, 409, local_only="Setting up the authenticator"))
     routes.post("/h2vault/2fa/enrol/confirm")(wrap(tfa_confirm, 403, local_only="Setting up the authenticator"))
     routes.post("/h2vault/2fa/reset")(wrap(tfa_reset, 403, local_only="Resetting the authenticator"))
+    # V5 licences
+    routes.post("/h2vault/licence/status")(wrap(licence_status, 400, local_only="Licence status"))
+    routes.post("/h2vault/licence/add")(wrap(licence_add, 400, local_only="Adding a licence"))
+    routes.post("/h2vault/licence/remove")(wrap(licence_remove, 400, local_only="Removing a licence"))
+    routes.post("/h2vault/licence/issue")(wrap(licence_issue, 403, offload=True, local_only="Issuing a licence"))
+    routes.post("/h2vault/licence/rotate")(wrap(licence_rotate, 403, offload=True,
+                                                local_only="Revoking licences"))
+    routes.get("/h2vault/licence/ledger")(wrap(licence_ledger, 400, local_only="The licence ledger"))
+    routes.post("/h2vault/licence/author/export")(wrap(author_export, 400, offload=True,
+                                                       local_only="Backing up the author key"))
+    routes.post("/h2vault/licence/author/import")(wrap(author_import, 400, offload=True,
+                                                       local_only="Restoring the author key"))

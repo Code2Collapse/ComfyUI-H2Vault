@@ -7,6 +7,9 @@ A fresh random data key (DEK) encrypts the graph; the DEK is wrapped for whoever
   password wrap  - KEK = Argon2id(password, salt): opening for editing (both modes) and running a Locked vault
   install wraps  - X25519 to each chosen install's public key: passwordless runs of a Sealed vault on those installs
   portable wrap  - a public pack constant: "Sealed - portable (obfuscation only)", runs anywhere, protects nothing
+  licence slot   - envelope VERSION 2 only (mode 3, "Licensed installations", V5): the DEK wrapped under a per-vault
+                   licence key (LK); licences (nodes/licence.py) carry LK wrapped to one installation, signed by the
+                   author whose Ed25519 public key ends the header
 The header (version, mode, vault id, KDF parameters, salt, interface hashes) is the associated data of every AES-GCM
 operation, so changing any of it fails authentication. Decryption is all or nothing: GCM checks the tag before it
 returns a byte. Wrong password and tampering produce the same message.
@@ -41,7 +44,9 @@ def boundary_hash(boundary_in: list, boundary_out: list) -> str:
 
 
 MAGIC2 = b"H2VAULT"
-VERSION = 1
+VERSION = 1                 # every vault of modes 0-2 is written as version 1, byte for byte as before V5
+VERSION_LICENSED = 2        # V5: mode 3 only (author key in the header + licence slot)
+MAX_VERSION = 2             # the newest envelope this build reads; newer -> "made by a newer H2Vault"
 PLAIN_FORMAT = 1            # the plaintext's "format" field
 CONTENT_SCHEMA = 1          # the plaintext's "schema" field: 1 = A18 {api, ui, interface, editors, profile, packs}
 FORMAT = {"magic": "H2VAULT", "version": VERSION, "aead": "AES-256-GCM (96-bit nonce, 128-bit tag)",
@@ -54,7 +59,9 @@ FORMAT = {"magic": "H2VAULT", "version": VERSION, "aead": "AES-256-GCM (96-bit n
 MODE_LOCKED = 0
 MODE_SEALED_INSTALLS = 1
 MODE_SEALED_PORTABLE = 2
-MODES = (MODE_LOCKED, MODE_SEALED_INSTALLS, MODE_SEALED_PORTABLE)
+MODE_SEALED_LICENSED = 3
+MODES = (MODE_LOCKED, MODE_SEALED_INSTALLS, MODE_SEALED_PORTABLE)          # the modes of envelope version 1
+ALL_MODES = MODES + (MODE_SEALED_LICENSED,)
 KDF_ARGON2ID = 1
 ARGON2_V1 = {"memory_kib": 131072, "iterations": 3, "lanes": 4}      # measured 0.11 s on the build machine
 MEMORY_KIB_BOUNDS = (65536, 1048576)
@@ -126,13 +133,22 @@ def key_id(public_raw: bytes) -> bytes:
 
 # ── the header ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def _header(mode: int, vault_id: str, kdf: dict, salt: bytes, bhash: bytes, ihash: bytes) -> bytes:
+def _version_of(mode: int) -> int:
+    return VERSION_LICENSED if mode == MODE_SEALED_LICENSED else VERSION
+
+
+def _header(mode: int, vault_id: str, kdf: dict, salt: bytes, bhash: bytes, ihash: bytes,
+            author_pub: Optional[bytes] = None) -> bytes:
     vid = vault_id.encode("utf-8")
-    if mode not in MODES or not vid or len(vid) > 255 or len(salt) != SALT_LEN or len(bhash) != 32 or len(ihash) != 32:
+    if mode not in ALL_MODES or not vid or len(vid) > 255 or len(salt) != SALT_LEN or len(bhash) != 32 \
+            or len(ihash) != 32:
         raise VaultError("Malformed vault header fields.")
-    return b"".join([MAGIC2, struct.pack("!BB", VERSION, mode), struct.pack("!B", len(vid)), vid,
+    licensed = mode == MODE_SEALED_LICENSED
+    if licensed != (author_pub is not None) or (licensed and len(author_pub) != 32):
+        raise VaultError("Malformed vault header fields.")
+    return b"".join([MAGIC2, struct.pack("!BB", _version_of(mode), mode), struct.pack("!B", len(vid)), vid,
                      struct.pack("!BIIB", KDF_ARGON2ID, int(kdf["memory_kib"]), int(kdf["iterations"]),
-                                 int(kdf["lanes"])), salt, bhash, ihash])
+                                 int(kdf["lanes"])), salt, bhash, ihash, author_pub or b""])
 
 
 def is_v2(payload: str) -> bool:
@@ -157,13 +173,15 @@ def parse(payload: str) -> dict:
     try:
         i = len(MAGIC2)
         version, mode = struct.unpack_from("!BB", blob, i); i += 2
-        if version > VERSION:
+        if version > MAX_VERSION:
             raise VaultError(f"This vault was made by a newer H2Vault (vault format {version}); update "
                              "ComfyUI-H2Vault to open it.")
-        if version != VERSION:
+        if version not in (VERSION, VERSION_LICENSED):
             raise VaultError(f"Unsupported vault format version {version}.")
-        if mode not in MODES:
+        if mode not in ALL_MODES:
             raise VaultError("Malformed vault: unknown mode.")
+        if version != _version_of(mode):
+            raise VaultError("Malformed vault: mode and version disagree.")
         (vlen,) = struct.unpack_from("!B", blob, i); i += 1
         vault_id = blob[i:i + vlen].decode("utf-8"); i += vlen
         kdf_id, mem, it, lanes = struct.unpack_from("!BIIB", blob, i); i += 10
@@ -176,9 +194,24 @@ def parse(payload: str) -> dict:
         ihash = blob[i:i + 32]; i += 32
         if len(ihash) != 32:
             raise VaultError("Truncated vault header.")
+        author_pub = None
+        if version == VERSION_LICENSED:
+            author_pub = blob[i:i + 32]; i += 32
+            if len(author_pub) != 32:
+                raise VaultError("Truncated vault header.")
         header = blob[:i]
         pw = (blob[i:i + NONCE_LEN], blob[i + NONCE_LEN:i + NONCE_LEN + KEY_LEN + TAG_LEN])
         i += NONCE_LEN + KEY_LEN + TAG_LEN
+        if version == VERSION_LICENSED:
+            slot = (blob[i:i + NONCE_LEN], blob[i + NONCE_LEN:i + NONCE_LEN + KEY_LEN + TAG_LEN])
+            i += NONCE_LEN + KEY_LEN + TAG_LEN
+            body = (blob[i:i + NONCE_LEN], blob[i + NONCE_LEN:])
+            if len(slot[1]) != KEY_LEN + TAG_LEN or len(pw[1]) != KEY_LEN + TAG_LEN or len(body[0]) != NONCE_LEN \
+                    or len(body[1]) <= TAG_LEN:
+                raise VaultError("Truncated vault payload.")
+            return {"header": header, "version": version, "mode": mode, "vault_id": vault_id, "kdf": kdf,
+                    "salt": salt, "bhash": bhash, "ihash": ihash, "pw": pw, "installs": [], "portable": None,
+                    "body": body, "author_pub": author_pub, "licence_slot": slot}
         (count,) = struct.unpack_from("!H", blob, i); i += 2
         if count > MAX_RECIPIENTS:
             raise VaultError("Malformed vault: too many recipients.")
@@ -205,29 +238,60 @@ def parse(payload: str) -> dict:
         raise VaultError("Truncated vault payload.")
     if (mode == MODE_SEALED_PORTABLE) != (portable is not None):
         raise VaultError("Malformed vault: mode and wraps disagree.")
-    return {"header": header, "mode": mode, "vault_id": vault_id, "kdf": kdf, "salt": salt, "bhash": bhash,
-            "ihash": ihash, "pw": pw, "installs": installs, "portable": portable, "body": body}
+    return {"header": header, "version": VERSION, "mode": mode, "vault_id": vault_id, "kdf": kdf, "salt": salt,
+            "bhash": bhash, "ihash": ihash, "pw": pw, "installs": installs, "portable": portable, "body": body,
+            "author_pub": None, "licence_slot": None}
 
 
 def info(payload: str) -> dict:
     """What anyone may read without a key: mode, vault id, KDF, the installs it was sealed for."""
     p = parse(payload)
-    return {"version": VERSION, "mode": p["mode"], "vault_id": p["vault_id"], "kdf": p["kdf"],
-            "installs": [kid.hex() for kid, *_ in p["installs"]], "format": FORMAT}
+    out = {"version": p["version"], "mode": p["mode"], "vault_id": p["vault_id"], "kdf": p["kdf"],
+           "installs": [kid.hex() for kid, *_ in p["installs"]], "format": FORMAT}
+    if p["author_pub"] is not None:
+        out["author"] = author_key_id(p["author_pub"])
+    return out
+
+
+def author_key_id(public_raw: bytes) -> str:
+    """The public id of an Ed25519 author key (also written into every licence it signs)."""
+    return hashlib.sha256(public_raw).digest()[:8].hex()
+
+
+def licensing_of(plain: dict) -> Optional[dict]:
+    """{"lk", "author_pub"} (raw bytes) of a decrypted Licensed vault, else None."""
+    lic = plain.get("licensing") if isinstance(plain, dict) else None
+    if not isinstance(lic, dict):
+        return None
+    try:
+        lk, pub = base64.b64decode(lic["lk"]), base64.b64decode(lic["author_pub"])
+    except Exception:  # noqa: BLE001
+        return None
+    return {"lk": lk, "author_pub": pub} if len(lk) == KEY_LEN and len(pub) == 32 else None
 
 
 # ── encrypting ─────────────────────────────────────────────────────────────────────────────────────────────────────
 
 def _encrypt(plain: dict, *, mode: int, vault_id: str, kdf: dict, salt: bytes, kek: bytes, recipients: list,
-             bhash: bytes, ihash: bytes) -> str:
+             bhash: bytes, ihash: bytes, licensing: Optional[dict] = None) -> str:
     from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 
     aes = _aes()
-    header = _header(mode, vault_id, kdf, salt, bhash, ihash)
+    header = _header(mode, vault_id, kdf, salt, bhash, ihash,
+                     author_pub=licensing["author_pub"] if mode == MODE_SEALED_LICENSED else None)
     dek = os.urandom(KEY_LEN)                                   # fresh for every lock: nonces never repeat under it
     parts = []
     n = os.urandom(NONCE_LEN)
     parts.append(n + aes(kek).encrypt(n, dek, header))
+    if mode == MODE_SEALED_LICENSED:                            # V5: password wrap | licence slot | body
+        n = os.urandom(NONCE_LEN)
+        parts.append(n + aes(licensing["lk"]).encrypt(n, dek, header))
+        n = os.urandom(NONCE_LEN)
+        parts.append(n + aes(dek).encrypt(n, json.dumps(plain, separators=(",", ":")).encode("utf-8"), header))
+        blob = header + b"".join(parts)
+        if len(blob) > MAX_PAYLOAD_BYTES:
+            raise VaultError("This graph is too large for a vault (64 MB).")
+        return base64.b64encode(blob).decode("ascii")
     installs = list(recipients or []) if mode == MODE_SEALED_INSTALLS else []
     if mode == MODE_SEALED_INSTALLS and not installs:
         raise VaultError("A vault sealed for installs needs at least one install key.")
@@ -275,24 +339,47 @@ def new_kek(password: str, kdf: Optional[dict] = None) -> dict:
 
 
 def lock(plain: dict, password: str, *, vault_id: str, mode: int, iface: dict, recipients: Optional[list] = None,
-         kdf: Optional[dict] = None) -> tuple:
+         kdf: Optional[dict] = None, licensing: Optional[dict] = None) -> tuple:
     """New payload + the KEK (for the creator's session). Fresh salt, DEK and nonces."""
+    if mode == MODE_SEALED_LICENSED:
+        _licensing_for(plain, licensing)                        # refuse before the (slow) KDF
     k = new_kek(password, kdf)
-    return lock_with(plain, k, vault_id=vault_id, mode=mode, iface=iface, recipients=recipients), k["kek"]
+    return lock_with(plain, k, vault_id=vault_id, mode=mode, iface=iface, recipients=recipients,
+                     licensing=licensing), k["kek"]
 
 
-def lock_with(plain: dict, k: dict, *, vault_id: str, mode: int, iface: dict, recipients: Optional[list] = None) -> str:
-    """Encrypt with an existing {kek, salt, kdf} (fresh DEK and nonces)."""
-    ex = _check_plain(plain)
-    kdf, salt, kek = k["kdf"], k["salt"], k["kek"]
-    bhash = bytes.fromhex(boundary_hash(ex["boundary_in"], ex["boundary_out"]))
+def _licensing_for(plain: dict, licensing: Optional[dict]) -> dict:
+    """A Licensed vault's {lk, author_pub}: given, or kept from its decrypted plaintext (an edit keeps LK)."""
+    lic = licensing if licensing is not None else licensing_of(plain)
+    if not isinstance(lic, dict) or len(lic.get("lk") or b"") != KEY_LEN or len(lic.get("author_pub") or b"") != 32:
+        raise VaultError("A licensed vault needs its licence key and author key.")
+    return lic
+
+
+def _inner_plain(plain: dict, mode: int, recipients: Optional[list], licensing: Optional[dict]) -> dict:
     # the installs' PUBLIC keys ride inside the ciphertext: a re-seal after an edit wraps for the same installs,
     # and the list of who may run it is not readable from the file
     inner = dict(plain, format=PLAIN_FORMAT, schema=_schema_of(plain),
                  recipients=[base64.b64encode(k).decode("ascii") for k in (recipients or [])]
                  if mode == MODE_SEALED_INSTALLS else [])
-    return _encrypt(inner, mode=mode, vault_id=vault_id, kdf=kdf, salt=salt, kek=kek,
-                    recipients=recipients, bhash=bhash, ihash=canonical_hash(interface_struct(iface)))
+    if mode == MODE_SEALED_LICENSED:
+        inner["licensing"] = {"lk": base64.b64encode(licensing["lk"]).decode("ascii"),
+                              "author_pub": base64.b64encode(licensing["author_pub"]).decode("ascii")}
+    else:
+        inner.pop("licensing", None)
+    return inner
+
+
+def lock_with(plain: dict, k: dict, *, vault_id: str, mode: int, iface: dict, recipients: Optional[list] = None,
+              licensing: Optional[dict] = None) -> str:
+    """Encrypt with an existing {kek, salt, kdf} (fresh DEK and nonces)."""
+    ex = _check_plain(plain)
+    kdf, salt, kek = k["kdf"], k["salt"], k["kek"]
+    bhash = bytes.fromhex(boundary_hash(ex["boundary_in"], ex["boundary_out"]))
+    lic = _licensing_for(plain, licensing) if mode == MODE_SEALED_LICENSED else None
+    return _encrypt(_inner_plain(plain, mode, recipients, lic), mode=mode, vault_id=vault_id, kdf=kdf, salt=salt,
+                    kek=kek, recipients=recipients, bhash=bhash, ihash=canonical_hash(interface_struct(iface)),
+                    licensing=lic)
 
 
 def recipients_of(plain: dict) -> list:
@@ -301,18 +388,17 @@ def recipients_of(plain: dict) -> list:
 
 
 def relock(old_payload: str, kek: bytes, plain: dict, *, iface: dict, recipients: Optional[list] = None,
-           mode: Optional[int] = None) -> str:
+           mode: Optional[int] = None, licensing: Optional[dict] = None) -> str:
     """Re-encrypt after an edit with the session's KEK: same vault id / salt / KDF, fresh DEK and nonces."""
     old = parse(old_payload)
     _unwrap_password(old, kek)                                  # the KEK must belong to this vault
     ex = _check_plain(plain)
     mode = old["mode"] if mode is None else mode
     bhash = bytes.fromhex(boundary_hash(ex["boundary_in"], ex["boundary_out"]))
-    inner = dict(plain, format=PLAIN_FORMAT, schema=_schema_of(plain),
-                 recipients=[base64.b64encode(k).decode("ascii") for k in (recipients or [])]
-                 if mode == MODE_SEALED_INSTALLS else [])
-    return _encrypt(inner, mode=mode, vault_id=old["vault_id"], kdf=old["kdf"], salt=old["salt"],
-                    kek=kek, recipients=recipients, bhash=bhash, ihash=canonical_hash(interface_struct(iface)))
+    lic = _licensing_for(plain, licensing) if mode == MODE_SEALED_LICENSED else None
+    return _encrypt(_inner_plain(plain, mode, recipients, lic), mode=mode, vault_id=old["vault_id"], kdf=old["kdf"],
+                    salt=old["salt"], kek=kek, recipients=recipients, bhash=bhash,
+                    ihash=canonical_hash(interface_struct(iface)), licensing=lic)
 
 
 # ── decrypting ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -404,6 +490,19 @@ def open_with_install_key(payload: str, private_raw: bytes, *, vault_id: Optiona
     raise VaultError("This vault was not sealed for this install, so it cannot run here without the password. Ask "
                      "its author to seal it for this install's public key (H2Vault menu), or open it with the "
                      "password.")
+
+
+def open_with_licence_key(payload: str, lk: bytes, *, vault_id: Optional[str] = None) -> dict:
+    """A Licensed vault's run: its licence key (from a licence this installation unwrapped) opens the licence slot."""
+    p = parse(payload)
+    _check_vault(p, vault_id)
+    if p["mode"] != MODE_SEALED_LICENSED or p["licence_slot"] is None:
+        raise VaultError("This vault is not a licensed vault.")
+    try:
+        dek = _aes()(lk).decrypt(p["licence_slot"][0], p["licence_slot"][1], p["header"])
+    except Exception as exc:
+        raise VaultError(_SAME_ERROR) from exc
+    return _decrypt_body(p, dek)
 
 
 def open_portable(payload: str, *, vault_id: Optional[str] = None) -> dict:
