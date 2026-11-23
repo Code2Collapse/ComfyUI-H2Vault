@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+**Preview viewer on the vault (owner 2026-11-24, PART 3)** - the vault's *Previews from inside* panel becomes one viewer for everything from inside: navigation across outputs (each video keeps its own state), images with fit / zoom / pan and a large view, a real video player (seek bar, time, frame stepping at the clip's own frame rate, reverse playback by controlled frame stepping, loop, speed, volume, fullscreen, inspect / save the current frame, unsupported formats said in words), audio, text with Copy, and the live sampler frames with "step N / M" (core samplers, KJNodes Model Preview Override, legacy previews). Core's own image and live previews are no longer drawn twice on the vault. Unsafe file references (paths, "..", drive letters, unknown folder types) are refused by the server and the viewer; a frame rate that is not a sane number is not passed on.
+
 **Previews from inside a vault (owner 2026-11-23)** - every preview an inner node produces shows on the vault node:
 images through ComfyUI's own preview (merged, all preview nodes together), videos / audio / text in a new *Previews from
 inside* panel, live sampler frames (also KJNodes Model Preview Override), the running step's progress, and the previews
