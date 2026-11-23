@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased - V8 zero information
+## 0.2.0 - 2026-11-23
+
+**Zero information (V8)** - a concealed vault tells nobody (and no AI reading the page, the logs, the history or the
+outputs) what is inside:
 
 - Files saved or previewed inside any vault (PNG text chunks) carry no workflow and no prompt; nodes outside a vault are unchanged.
 - The step count of a concealed vault counts kinds of work ("Sampling", "Decoding", ...), no longer inner nodes; a concealed error names only the kind of step that failed.
@@ -12,7 +15,7 @@
 - Per-node routes of a co-installed pack (the Tensor Inspector of ComfyUI-CustomNodePacks) no longer list or describe nodes inside a vault.
 - Lock parameters: without *Show what kind of node*, a node whose title is still its kind ("Load Checkpoint") is shown as *Locked node*.
 
-## 0.2.0 - 2026-11-23
+**Lock parameters and licences (V5)**
 
 - **Lock parameters**: right-click a node, a selection or a group > Lock parameters. Each node becomes a one-node vault
   drawn like itself (title, colours, sockets); ticked values are encrypted, the others stay editable controls. Every
@@ -28,6 +31,8 @@
   newest licence for a copy decides. End dates and run limits are honour-system and labelled so. No licence server,
   no network call. Protecting as Licensed is local-page only.
 - Locked nodes are envelope version 3: H2Vault 0.1.x refuses them instead of running them without the blanking.
+- The author key backup restores on the author's new computer (that installation is not an editor yet); issuing and
+  backing up again there work because it holds the author key.
 - Blanking: other number / string spellings; numbers only in the node's own messages; `print()` output through core's
   log interceptor; nothing carried over to the next prompt.
 - *Save again with the same password* checks the password against the file it was opened from (and asks twice).
