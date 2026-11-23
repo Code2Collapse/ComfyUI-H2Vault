@@ -21,25 +21,111 @@ export function summarize(items) {
   }).join(", ") }));
 }
 
-/** What the vault's panel shows for a merged output: {rows, media, notes, count}. `urlOf(file)` -> a /view URL. */
+// ── file references (L9.342: validated again here; the server checks them first, nodes/previews.py safe_file) ──
+const FILE_TYPES = new Set(["output", "temp", "input"]);
+
+/** A file reference the panel may turn into a /view URL: a bare file name, a relative sub folder, a known type. */
+export function safeFile(f) {
+  if (!f || typeof f !== "object") return false;
+  const name = f.filename, sub = f.subfolder ?? "", type = f.type;
+  if (typeof name !== "string" || !name || name.length > 255 || name === "." || name === "..") return false;
+  if (/[/\\:\u0000]/.test(name)) return false;
+  if (typeof sub !== "string" || sub.length > 512 || /[:\u0000]/.test(sub) || /^[/\\]/.test(sub)) return false;
+  if (sub.split(/[/\\]/).some((seg) => seg === "..")) return false;
+  return type === undefined || type === null || FILE_TYPES.has(type);
+}
+
+const EXT_MIME = { mp4: "video/mp4", m4v: "video/mp4", webm: "video/webm", mov: "video/quicktime",
+  mkv: "video/x-matroska", avi: "video/x-msvideo", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  webp: "image/webp", gif: "image/gif", bmp: "image/bmp", avif: "image/avif", tif: "image/tiff", tiff: "image/tiff",
+  mp3: "audio/mpeg", wav: "audio/wav", flac: "audio/flac", ogg: "audio/ogg", opus: "audio/ogg", m4a: "audio/mp4",
+  aac: "audio/mp4" };
+
+const extOf = (name) => {
+  const s = String(name || "").toLowerCase();
+  const i = s.lastIndexOf(".");
+  return i >= 0 ? s.slice(i + 1) : "";
+};
+
+/** A MIME type for the browser's canPlayType check: Video Helper Suite's `format` first, then the extension. */
+export function mimeOf(file) {
+  const fmt = String(file?.format || "").toLowerCase();
+  if (fmt) {
+    if (fmt.includes("h265") || fmt.includes("hevc")) return 'video/mp4; codecs="hvc1"';
+    if (fmt.includes("av1") && fmt.includes("webm")) return 'video/webm; codecs="av01.0.05M.08"';
+    if (fmt.includes("av1")) return 'video/mp4; codecs="av01.0.05M.08"';
+    if (fmt.includes("webm")) return "video/webm";
+    if (fmt.includes("mp4")) return "video/mp4";
+    if (fmt.includes("prores") || fmt.includes("mov")) return "video/quicktime";
+    if (fmt.includes("mkv") || fmt.includes("matroska")) return "video/x-matroska";
+    if (fmt === "image/gif" || fmt === "image/webp") return fmt;
+  }
+  return EXT_MIME[extOf(file?.filename)] || "";
+}
+
+/** The browser's own answer for a MIME type: "yes" (probably), "maybe", "no" (it says it cannot). */
+export function playability(mime, canPlay) {
+  if (!mime) return "maybe";
+  let a = "";
+  try { a = canPlay(mime) || ""; } catch (_) { a = ""; }
+  return a === "probably" ? "yes" : a === "maybe" ? "maybe" : "no";
+}
+
+/** FNV-1a of a string, base 36 (a key that changes with the text). */
+function textHash(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return `${s.length}.${h.toString(36)}`;
+}
+
+const fpsOf = (file) => {
+  const x = Number(file?.frame_rate);
+  return file?.frame_rate != null && Number.isFinite(x) && x > 0 && x <= 1000 ? x : null;
+};
+
+/** What the vault's panel shows for a merged output: {rows, entries, media (= entries), notes, count}.
+ *  entries: every image (core's included: core no longer draws them on the vault), video, audio and text, in the
+ *  server's order, each {key, label, kind, url | text, mime, fps, name, animated, n, of}. `urlOf(file)` -> /view URL. */
 export function plan(output, urlOf) {
   const items = Array.isArray(output?.h2v_previews) ? output.h2v_previews : [];
-  const media = [], notes = [];
+  const entries = [], notes = [];
+  let unsafe = 0;
   for (const it of items) {
-    if (it.kind === "video" || it.kind === "audio" || (it.kind === "image" && !it.core)) {
-      if (it.file?.filename) media.push({ label: it.label, kind: it.kind, url: urlOf(it.file), format: it.file.format });
-    } else if (it.kind === "text") {
-      media.push({ label: it.label, kind: "text", text: String(it.text ?? "") });
+    if (it?.kind === "image" || it?.kind === "video" || it?.kind === "audio") {
+      if (!it.file?.filename) continue;
+      if (!safeFile(it.file)) { unsafe += 1; continue; }
+      const url = urlOf(it.file);
+      const name = String(it.file.filename);
+      entries.push({ key: `${it.kind}:${url}`, label: String(it.label || "Preview"), kind: it.kind, url,
+        mime: mimeOf(it.file), fps: fpsOf(it.file), name, format: it.file.format || "",
+        animated: it.kind === "image" && (it.animated === true || extOf(name) === "gif") });
+    } else if (it?.kind === "text") {
+      entries.push({ label: String(it.label || "Preview"), kind: "text", text: String(it.text ?? "") });
     }
   }
-  const other = items.filter((x) => x.kind === "other" || x.kind === "file");
-  if (other.length) {
-    const labs = [...new Set(other.map((x) => x.label))].join(", ");
-    notes.push(`${labs}: ${other.length === 1 ? "a preview" : "previews"} of a kind the vault cannot show here ` +
+  const seen = new Map();
+  for (const e of entries) {
+    const k = `${e.label}\u0000${e.kind}`;
+    seen.set(k, (seen.get(k) || 0) + 1);
+    e.n = seen.get(k);
+  }
+  for (const e of entries) {
+    e.of = seen.get(`${e.label}\u0000${e.kind}`);
+    if (e.kind === "text") e.key = `text:${e.label}:${e.n}:${textHash(e.text)}`;   // a new text = a new entry
+  }
+  const other = items.filter((x) => x?.kind === "other" || x?.kind === "file");
+  unsafe += other.filter((x) => x.unsafe === true).length;
+  const shown = other.filter((x) => x.unsafe !== true);
+  if (shown.length) {
+    const labs = [...new Set(shown.map((x) => x.label))].join(", ");
+    notes.push(`${labs}: ${shown.length === 1 ? "a preview" : "previews"} of a kind the vault cannot show here ` +
       "(it shows images, videos, audio and text). Saved files, if any, are in your output folder.");
   }
-  if (items.some((x) => x.kind === "image" && x.core)) notes.push("Images are shown by ComfyUI's own image preview.");
-  return { rows: summarize(items), media, notes, count: items.length };
+  if (unsafe) {
+    notes.push(`${unsafe} preview file reference${unsafe === 1 ? " was" : "s were"} not safe to show and ` +
+      `${unsafe === 1 ? "was" : "were"} skipped.`);
+  }
+  return { rows: summarize(items), entries, media: entries, notes, count: items.length };
 }
 
 /** The /view URL of an output file (core server.py /view: filename, subfolder, type). */
