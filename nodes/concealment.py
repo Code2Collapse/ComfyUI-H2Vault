@@ -497,6 +497,7 @@ class Concealer:
                  phases: Optional[dict] = None):
         with self._lock:
             self._vaults.pop(vault_id, None)
+            self._plain.pop(vault_id, None)
             inner = set(map(str, inner_ids))
             phase_map = {str(k): str(v) for k, v in (phases or {}).items()}
             # V8: steps count distinct functional labels, never inner nodes (a node count is graph structure)
@@ -512,6 +513,10 @@ class Concealer:
         """V8: a vault that is not concealed. Only the metadata guard uses this (its inner outputs embed no prompt /
         workflow); the message filters leave such a vault to the A18 rules of protected_subgraph."""
         with self._lock:
+            # the same outer node id may have been a CONCEALED vault in an earlier prompt (core's expansion ids are
+            # deterministic: "<vault>.0.0.<inner>"): that stale registration must not half-apply to this vault
+            self._vaults.pop(vault_id, None)
+            self._active.discard(vault_id)
             self._plain.pop(vault_id, None)
             self._plain[vault_id] = set(map(str, inner_ids))
             while len(self._plain) > MAX_VAULTS:
@@ -1060,6 +1065,32 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
         h.addFilter(flt)
     _INSTALL["log_filters"] = (flt, handlers)
 
+    # V8: core computes an inner node's cache key (IS_CHANGED / fingerprint_inputs) BEFORE that node starts, and logs
+    # its exception ("WARNING: [Errno 2] No such file ...: '<inner file>'", measured live): open the window for it
+    try:
+        import execution as core_execution
+        icc = getattr(core_execution, "IsChangedCache", None)
+        if icc is not None and not getattr(icc.get, "__h2vault_guard__", False):
+            orig_icc_get = icc.get
+
+            async def is_changed_get(self, node_id, _orig=orig_icc_get):
+                v = c.vault_of(None if node_id is None else str(node_id))
+                if v is None:
+                    return await _orig(self, node_id)
+                with c._lock:
+                    prev, c._window = c._window, v
+                try:
+                    return await _orig(self, node_id)
+                finally:
+                    with c._lock:
+                        c._window = prev
+
+            is_changed_get.__h2vault_guard__ = True
+            icc.get = is_changed_get
+            _INSTALL["is_changed"] = (icc, orig_icc_get)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("H2Vault: cache-key window not installed (an inner node's cache-key warning may name it): %s", exc)
+
     # V8: nodes inside a vault embed no prompt / workflow in the files they write
     try:
         import execution as core_execution
@@ -1110,6 +1141,9 @@ def uninstall() -> None:
     if "metadata" in _INSTALL:
         mod, orig = _INSTALL["metadata"]
         mod.get_input_data = orig
+    if "is_changed" in _INSTALL:
+        cls, orig = _INSTALL["is_changed"]
+        cls.get = orig
     _INSTALL.clear()
 
 
