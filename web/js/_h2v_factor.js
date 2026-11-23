@@ -115,6 +115,119 @@ export function initialTicks(status, current = null) {
   return Object.fromEntries(METHOD_ORDER.map((m) => [m, m === "recovery" || pick.includes(m)]));
 }
 
+// ── the one question: "How should this vault be opened for editing?" (owner 2026-11-23) ─────────────────────────
+// Each answer is a method list the server stores ([] = password only); nodes/twofactor.py CHOICES is the same table.
+export const PROTECTION_CHOICES = Object.freeze([
+  { label: "Password only", id: "password", tag: "no second factor", tone: "warn", methods: [],
+    summary: "Whoever knows the password can open it for editing on an editor's computer. Simplest, and weaker: a " +
+      "leaked password is enough." },
+  { label: "Password + authenticator app", id: "totp", methods: ["totp", "recovery"],
+    summary: "A 6-digit code from any authenticator app registered on the editor's computer (phone, backup phone…)." },
+  { label: "Password + passkey", id: "passkey", methods: ["passkey", "recovery"],
+    summary: "A security key, Windows Hello or a phone passkey. The page must be opened as http://localhost:<port>." },
+  { label: "Password + backup password", id: "backup_password", methods: ["backup_password", "recovery"],
+    summary: "A second secret, different from the vault password, set up on the editor's computer." },
+  { label: "Password + any second factor", id: "any", tag: "most flexible", tone: "ok",
+    methods: ["totp", "passkey", "backup_password", "recovery"],
+    summary: "Each editor uses whatever they set up on their own computer: authenticator app, passkey or backup " +
+      "password." },
+]);
+export const CUSTOM_CHOICE = Object.freeze({ label: "Advanced: pick methods", id: "custom",
+  summary: "Tick exactly which second factors may open it." });
+const SHORT_NAMES = Object.freeze({ totp: "authenticator app", passkey: "passkey", backup_password: "backup password" });
+export const RECOVERY_FALLBACK_TEXT = "Recovery codes are always accepted as a fallback whenever a second factor is " +
+  "required.";
+
+export function methodsOfChoice(id) {
+  const c = PROTECTION_CHOICES.find((x) => x.id === id);
+  return c ? [...c.methods] : null;
+}
+
+/** A vault's method list -> the answer to the one question ("custom" when none fits). */
+export function choiceOfMethods(methods) {
+  const have = new Set(methods || []);
+  if (have.size) have.add("recovery");                  // always part of a list that needs a second factor
+  const c = PROTECTION_CHOICES.find((x) => x.methods.length === have.size && x.methods.every((m) => have.has(m)));
+  return c ? c.id : "custom";
+}
+
+/** The answer to start from: the vault's current one, or (a new vault) the most flexible one that still asks for a
+ *  second factor. */
+export function initialChoice(current) {
+  return Array.isArray(current) ? choiceOfMethods(current) : "any";
+}
+
+/** The dialog's answer -> {ok, choice, methods} | {ok: false, error}. `ticks` only for "custom". */
+export function secondFactorFromChoice(id, ticks = null) {
+  if (id === "custom") {
+    const p = policyFromTicks(ticks);
+    return p.ok ? { ok: true, choice: "custom", methods: p.methods } : p;
+  }
+  const methods = methodsOfChoice(id);
+  return methods ? { ok: true, choice: id, methods } : { ok: false, error: "Choose how this vault is opened for editing." };
+}
+
+/** The notes shown under the choice: what "Password only" gives up; methods not set up on this computer yet. */
+export function choiceNotes(id, methods, status) {
+  const notes = [];
+  if (id === "password") {
+    notes.push({ tone: "warn", text: "Only the password protects editing: anyone who learns it can open the vault " +
+      "for editing on any editor installation, and the vault's licence and author-key actions need only the " +
+      "password too. Running the vault is not affected. Choose a second factor for anything you would not want " +
+      "changed by someone who saw the password." });
+    return notes;
+  }
+  const have = status?.methods || {};
+  const needed = (methods || []).filter((m) => m !== "recovery");
+  const missing = needed.filter((m) => !have[m]);
+  if (needed.length && missing.length === needed.length) {
+    const what = needed.length === 1
+      ? `No ${SHORT_NAMES[needed[0]]} is set up on this computer yet.`
+      : "None of them is set up on this computer yet.";
+    notes.push({ tone: "warn", text: `${what} Set one up (H2Vault menu › Second factor) before you open this vault ` +
+      "for editing here; other editors use their own. Running it is not affected." });
+  }
+  return notes;
+}
+
+/** The same page on http://localhost (passkeys refuse an IP address) - only for this computer's loopback address. */
+export function localhostUrl(loc) {
+  const host = String(loc?.hostname || "").replace(/^\[|\]$/g, "");
+  if (!(host === "::1" || /^127(\.\d{1,3}){3}$/.test(host))) return null;
+  return `${loc.protocol || "http:"}//localhost${loc.port ? `:${loc.port}` : ""}${loc.pathname || "/"}`;
+}
+
+/** Every method the Second factor page lists, with its state on this computer:
+ *  [{id, label, state: "set_up" | "not_set_up" | "unavailable", detail, reason?, canAdd}]. */
+export function methodCatalog(status, env) {
+  const m = status?.methods || {};
+  const pk = passkeySupport(env);
+  const apps = Number(m.totp || 0), keys = Number(m.passkey || 0), codes = Number(m.recovery || 0);
+  const local = localhostUrl({ protocol: "http:", hostname: env?.hostname, port: env?.port, pathname: "/" });
+  const rows = [
+    { label: "Authenticator apps", id: "totp", state: apps ? "set_up" : "not_set_up", canAdd: true,
+      detail: apps ? `${apps} authenticator app${apps === 1 ? "" : "s"}. A code of any of them works, once.`
+        : "Google / Microsoft Authenticator, 1Password, Aegis and others. Add one per phone or editor." },
+    { label: "Passkeys and security keys", id: "passkey", canAdd: pk.ok,
+      state: !pk.ok ? "unavailable" : keys ? "set_up" : "not_set_up",
+      detail: keys ? `${keys} registered. A passkey belongs to the address it was made on.`
+        : "Windows Hello, a security key (YubiKey…) or a phone passkey.",
+      ...(pk.ok ? {} : { reason: local ? `Browsers allow passkeys only on a name: open this page as ${local} ` +
+        "(save your workflow first - each address keeps its own browser storage)." : pk.reason }) },
+    { label: "Backup password", id: "backup_password", state: m.backup_password ? "set_up" : "not_set_up",
+      canAdd: true, detail: m.backup_password ? "Set. Stored as a hash; nobody can read it back."
+        : "A second secret, different from every vault password." },
+    { label: "Recovery codes", id: "recovery", state: codes ? "set_up" : "not_set_up", canAdd: true,
+      detail: codes ? `${codes} left. Each works once; accepted wherever a second factor is required.`
+        : "Single-use codes for when a phone or key is lost." },
+    { label: "Email code", id: "email", state: "unavailable", canAdd: false, detail: "",
+      reason: "Needs an email provider and a server that sends mail; H2Vault works offline, so it cannot send codes." },
+    { label: "Text message (SMS)", id: "sms", state: "unavailable", canAdd: false, detail: "",
+      reason: "Needs a paid, online SMS provider; H2Vault works offline, so it cannot send codes." },
+  ];
+  return rows;
+}
+
 /** The words shown when someone has lost every method (no secret, no path guessing). */
 export function lostAllText(status) {
   const left = status?.recovery_codes_left ?? 0;

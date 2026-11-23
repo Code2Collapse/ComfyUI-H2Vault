@@ -16,6 +16,28 @@
   vault*, *Lock without concealment*, *Show it as MASK* (for a traced `*` output). Locking with problems left scrolls
   to and highlights the row; the notice goes away once the problems are fixed. A `*` socket is no longer called "*".
 
+**One protection question, several authenticator apps (owner 2026-11-23)**
+
+- **One question instead of checkboxes**: "How should this vault be opened for editing?" - *Password only*,
+  *Password + authenticator app*, *Password + passkey*, *Password + backup password*, *Password + any second factor*
+  (the default for a new vault) or *Advanced: pick methods*. Recovery codes stay an automatic fallback whenever a second
+  factor is required. Old vaults show as the matching choice (no stored choice = authenticator app); a combination no
+  plain answer fits shows as Advanced.
+- **Password only** really opens with only the password: no second factor is asked, a factor sent anyway is neither
+  checked nor used up, and no setup is required. It is weaker, and the choice says so. The open / access / licence
+  dialogs now ask for the password first and for a second factor only when the vault needs one (`factor_required`, not
+  counted as a failure); "set up a second factor" is asked after the password and only for such a vault.
+- **Several authenticator apps**: up to 10 per installation, each named (add / rename / remove); a code of any of them
+  opens, once per app; one wrong code is one failure however many apps exist; clock drift is detected for each. Each
+  secret is its own secret-store entry (the Windows credential store keeps at most 2560 bytes per entry); the single
+  secret of the first release becomes "Authenticator app" automatically (downgrading after that needs a new setup).
+- **Second factor page**: every method with its state (set up / not set up / not possible here and why: passkeys on an
+  IP address with an "Open as localhost" button, email and SMS need an online provider) and one Add button each.
+- **Safe removal**: removing a method a vault needs is refused (409) while that vault would have no accepted method
+  left on this installation - the answer names the vault and the fix; with recovery codes left it is allowed after a
+  warning; removing the last authenticator app also asks for one more proof. The installation keeps a small note of
+  the vaults it locked or opened (`<user dir>/h2vault/second_factor_vaults.json`: ids, titles, method names - no secret).
+
 **Second-factor methods (owner 2026-11-23)**
 
 - **No more "save password?" prompts**: vault password boxes are masked text inputs with the opt-out attributes of the

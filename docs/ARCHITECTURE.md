@@ -153,6 +153,12 @@ files leaving the machine.
   factors are counted per vault and across vaults (exponential, persisted). Changing methods needs a 10-minute settings
   token from one proof (local page only). `H2VAULT_RESET_SECOND_FACTOR=remove-all` at start removes every method (the
   administrator's way back; whoever can set it can already read the secret store).
+- Protection choice (2026-11-23, later the same day): the author answers one question; `twofactor.CHOICES` maps it
+  onto the stored method list (`password` = [], `totp`, `passkey`, `backup_password`, `any`; Advanced = an explicit
+  list). `[]` is accepted only as the explicit `password` choice. `_authorize`: password -> policy -> (password only:
+  done) / (no method set up: needs_enrolment) / (no factor sent: factor_required, not counted) / verify. Several TOTP
+  apps: one store entry each (`totp_auth_<id>` + index `totp_authenticators`), per-app replay step. Removal routes
+  check `removal_impact` against `<user dir>/h2vault/second_factor_vaults.json` (vaults locked / opened here).
 - Routes that create or read local secrets without a vault password (2FA enrol begin / confirm / reset, the workflow
   key store) answer only the ComfyUI page on this machine (loopback peer + loopback Host + no cross-site
   Origin / Sec-Fetch-Site). Through an SSH tunnel the page still counts as local.
@@ -215,7 +221,8 @@ filter; the middleware also drops inner vault ids from per-node routes of co-ins
   a plain message), `keyring` optional. No torch pins.
 - Entry points without hunting: right-click a selection (Protect), right-click a subgraph, the top menu "H2Vault",
   the command palette, and drag-and-drop of an encrypted workflow file.
-- First vault: a fresh install has no second factor; opening a vault opens the Second factor dialog first.
+- First vault: a fresh install has no second factor; opening a vault that needs one asks for the password, then opens
+  the Second factor dialog (a Password-only vault opens without any setup).
 
 ## 9. Backlog (not in V2)
 

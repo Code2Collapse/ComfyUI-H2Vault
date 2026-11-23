@@ -4,8 +4,8 @@ Protect the parts of a ComfyUI workflow you do not want copied, and still share 
 
 - **Vaults**: select some nodes (or a group, or a subgraph) and protect them. They become one node whose inside is
   encrypted. It runs with ComfyUI's own scheduler like any subgraph, and its outputs feed the rest of the graph as before.
-  Opening it needs the vault password and a second factor: an authenticator app, a passkey / security key / Windows
-  Hello, a backup password or a recovery code - the vault's author chooses which.
+  Opening it for editing needs the vault password and - unless its author chose *Password only* - a second factor:
+  an authenticator app, a passkey / security key / Windows Hello, a backup password or a recovery code.
 - **Encrypted workflow files**: save the whole workflow as one encrypted file, opened with a key or a password.
   Files are compatible with [ComfyUI-Workflow-Encrypt](https://github.com/jtydhr88/ComfyUI-Workflow-Encrypt).
 - **Concealed vaults (model and node identity)**: the person who runs a concealed vault sees only its title, its socket
@@ -44,21 +44,47 @@ your nodes are put back exactly as they were and the dialog says what happened.
 **Run it**: a Sealed vault simply runs on your installation and on the installations you authorized. A Locked vault
 asks for its password once per browser tab.
 
-**Open it**: double-click the vault (or press **Open...** on its card), type the password and confirm with your second
-factor - the dialog offers the methods set up on this installation that the vault accepts, starting with the one you
-used last. The real nodes open as a subgraph; edit them. When you leave the subgraph, the vault is encrypted again at
-once. The first time on an installation, H2Vault asks you to set up a second factor.
+**Open it**: double-click the vault (or press **Open...** on its card) and type the password. If the vault needs a
+second factor, the same dialog then asks for one of the methods it accepts that are set up here, starting with the
+one you used last. The real nodes open as a subgraph; edit them. When you leave the subgraph, the vault is encrypted
+again at once. When a vault needs a second factor and none is set up on this installation, H2Vault asks you to set
+one up.
 
-**Second factor** (H2Vault menu › Second factor): set up any of
-- an **authenticator app** (TOTP; codes 30 s early or late are accepted, each code works once),
+**How should this vault be opened for editing?** One question in the lock dialog, *Lock parameters* and *Manage
+access*:
+
+| Choice | The vault accepts |
+|---|---|
+| Password only | the password alone (see the note below) |
+| Password + authenticator app | a code of any authenticator app registered on the editor's computer |
+| Password + passkey | a passkey, security key or Windows Hello |
+| Password + backup password | the editor's backup password |
+| Password + any second factor (most flexible, the default) | any of the three, whatever each editor set up |
+| Advanced: pick methods | exactly the ticked ones (e.g. authenticator app or passkey) |
+
+Recovery codes are always accepted whenever a second factor is required. Vaults locked before this question existed
+accept the authenticator app and recovery codes (they show as "Password + authenticator app"). **Password only is
+weaker**: whoever learns the password can open the vault for editing on any editor installation, and its licence and
+author-key actions need only the password too; running is not affected. Switching a vault to Password only (Manage
+access) needs its current password and second factor. An H2Vault older than this reads a Password-only vault as
+"authenticator + recovery codes" (stricter, never weaker).
+
+**Second factor** (H2Vault menu › Second factor) lists every method with its state on this computer (set up / not
+set up / not possible here and why) and one **Add** button each:
+- **authenticator apps** (TOTP) - several, each with a name (your phone, a backup phone, a second editor's app):
+  add, rename, remove; a code of any of them is accepted, once per app; codes 30 s early or late are accepted, and a
+  code from a clock further off is answered with how far the clocks differ. Each app's secret is shown once (QR code
+  and setup key) and kept in the secret store, one entry per app, never in a workflow or a log,
 - **passkeys / security keys / Windows Hello** (WebAuthn; browsers allow them only on a name, so open ComfyUI as
   `http://localhost:<port>`, not `http://127.0.0.1:<port>`; a passkey belongs to the address it was made on),
 - a **backup password** (a second secret, different from your vault passwords),
 - **recovery codes** (8 single-use codes, shown once with a .txt download; "Generate a new set" replaces them).
-Changing them needs one of your methods first. Each vault records which methods may open it (lock dialog and
-*Manage access*: "Second factor for editing"); recovery codes are always accepted. Vaults locked before this accept the
-authenticator app and recovery codes. Email and SMS codes are not offered: they need a mail / SMS provider and a
-server online, and H2Vault works offline. **Lost every method?** The administrator of the computer starts ComfyUI once
+Changing them needs one of your methods first. Removing the last authenticator app warns and asks for one more
+proof. Removing a method that a vault needs is refused while that vault would then have no accepted method left on
+this installation (not even a recovery code) - the answer names the vault and the fix; with recovery codes left it is
+allowed after a warning. (H2Vault knows the vaults this installation locked or opened since 2026-11-23.) Email and SMS
+codes are listed as not possible: they need a mail / SMS provider and a server online, and H2Vault works offline.
+**Lost every method?** The administrator of the computer starts ComfyUI once
 with `H2VAULT_RESET_SECOND_FACTOR=remove-all` (then removes it and restarts): every method is removed, nothing else.
 
 H2Vault's password boxes never make the browser offer to save a password (masked text inputs plus the opt-outs of
@@ -209,7 +235,7 @@ workflow is open, the ComfyUI front end keeps a draft of it in this browser's st
 | Asset | Protection |
 |---|---|
 | The inside of a vault (nodes, wiring, values, model names) | AES-256-GCM. Locked: key from Argon2id(password). Sealed: a per-vault key wrapped with X25519 for each authorized installation, and with the password for editing. The header (format, vault id, KDF parameters, interface hashes) is authenticated. |
-| Opening a vault for editing | Password + a second factor the vault accepts (TOTP RFC 6238 single-use codes, WebAuthn passkeys with signature-counter check, a backup password, single-use recovery codes; backup password and recovery codes stored as scrypt hashes) + the vault's editor list. 5 wrong passwords lock that vault for 5 minutes and each further one doubles the wait (max 1 h); wrong second factors likewise per vault and across vaults; one key derivation at a time. |
+| Opening a vault for editing | Password + (unless the author chose Password only) a second factor the vault accepts (TOTP RFC 6238 single-use codes, WebAuthn passkeys with signature-counter check, a backup password, single-use recovery codes; backup password and recovery codes stored as scrypt hashes) + the vault's editor list. 5 wrong passwords lock that vault for 5 minutes and each further one doubles the wait (max 1 h); wrong second factors likewise per vault and across vaults; one key derivation at a time. |
 | Workflow JSON, PNG metadata, history, logs, the queued prompt | The vault node carries only the encrypted payload and its public sockets / controls. Images and other files saved or previewed INSIDE a vault carry no workflow or prompt metadata. Server messages about inner nodes are rewritten to the vault; errors keep the inner node type and the message, never values or tracebacks (a concealed vault: only the kind of step). |
 | Local secrets (install key, TOTP secret, remembered keys) | OS credential store (keyring) or an encrypted file in `ComfyUI/user/h2vault/`. Never in a workflow, log or git. |
 | Routes that set up the second factor, manage remembered keys, licences or the author key, or install custom nodes | Answer only the ComfyUI page on the same machine (loopback peer + loopback Host + no cross-site request). |
@@ -266,6 +292,15 @@ A wildcard (*) output, for example from a switch node, no longer blocks locking 
 real model output (also custom ones like SeC) is caught and named. Every problem sits on its output row with a fix:
 remove the output, show it as its real type, or lock without concealment. The vault also checks output values when it
 runs and stops if one would hand out a model.
+
+## One protection question, several authenticator apps (2026-11-23)
+
+- The lock dialog, Lock parameters and Manage access ask one question: *How should this vault be opened for
+  editing?* - Password only, Password + authenticator app, Password + passkey, Password + backup password, or Password
+  + any second factor (default); *Advanced: pick methods* for other combinations. Password only says what it gives up.
+- Several authenticator apps per installation, each with a name; the Second factor page lists every method with its
+  state and an Add button, explains what is not possible here (passkeys on 127.0.0.1, email, SMS) and refuses to
+  remove a method a vault still needs.
 
 ## Second factor: your choice per vault, no save-password prompts (2026-11-23)
 

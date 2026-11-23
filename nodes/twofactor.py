@@ -3,14 +3,20 @@
 """Second factor for opening a vault to edit, per person per install (A17 s2.6, owner D0.25; methods 2026-11-23).
 
 Methods (set up on this installation; a vault chooses which of them may open it - `policy_of`):
-  totp             authenticator app, RFC 6238 via the `cryptography` package (SHA-1, 6 digits, 30 s - what apps
-                   use). Codes from one step before / after are accepted (clock drift); a code works once.
+  totp             authenticator apps, RFC 6238 via the `cryptography` package (SHA-1, 6 digits, 30 s - what apps
+                   use), up to MAX_AUTHENTICATORS per install, each with a name (phone, backup phone, a second
+                   editor's app ...); a code of any of them is accepted. Codes from one step before / after are
+                   accepted (clock drift); a code works once per app.
   passkey          passkey / security key / Windows Hello through WebAuthn (`webauthn_min`), several per install.
   backup_password  a second secret, different from any vault password; stored as an scrypt hash.
   recovery         single-use recovery codes (8 per set), stored as scrypt hashes; always allowed as a fallback.
 Email and SMS codes need a mail / SMS provider and a server that sends them: not possible offline (`NOT_OFFLINE`).
 
+A vault may also need no second factor at all ("Password only", owner 2026-11-23): its method list is empty.
+
 Everything lives only in the local secrets store (`store`), never in a workflow, never derived from a vault password.
+Each authenticator secret is its own store entry (`totp_auth_<id>`, index `totp_authenticators`): the Windows
+credential store keeps at most 2560 bytes per entry, so a growing list never shares one entry.
 Failed attempts are counted per scope (a vault id, or "manage" for settings) and across all scopes; the lockout grows
 exponentially (5 min, 10, 20 ... capped at 1 h) and is persisted, so a restart does not reset it. Comparisons are
 constant time.
@@ -43,6 +49,7 @@ MAX_FAILS, LOCKOUT_SECONDS = 5, 5 * 60
 MAX_FAILS_ALL, MAX_LOCKOUT_SECONDS = 10, 60 * 60
 _SECRET, _LAST, _RECOVERY, _FAILS = "totp_secret", "totp_last_step", "totp_recovery", "totp_fails"
 _BACKUP_PW, _PASSKEYS, _USER_HANDLE = "backup_password", "webauthn_credentials", "webauthn_user"
+_AUTH_INDEX, _AUTH_PREFIX = "totp_authenticators", "totp_auth_"     # several authenticator apps (2026-11-23)
 _lock = threading.RLock()
 _pending: dict = {}                    # enrolment waiting for its first code: {"secret": bytes, "codes": [...]}
 _challenges: dict = {}                 # passkey challenges: id -> {"challenge", "kind", "rp_id", "at", "label"}
@@ -50,6 +57,13 @@ _manage: dict = {}                     # settings tokens: token -> expiry (monot
 
 METHODS = ("totp", "passkey", "backup_password", "recovery")
 DEFAULT_POLICY = ("totp", "recovery")  # vaults locked before methods existed (no stored choice)
+# The one question the author answers ("How should this vault be opened for editing?") -> the vault's method list.
+# Anything else is "custom" (Advanced: pick methods). Recovery codes join every list that needs a second factor.
+CHOICES = {"password": (), "totp": ("totp", "recovery"), "passkey": ("passkey", "recovery"),
+           "backup_password": ("backup_password", "recovery"),
+           "any": ("totp", "passkey", "backup_password", "recovery")}
+MAX_AUTHENTICATORS = 10
+LABEL_MAX = 60
 METHOD_LABELS = {"totp": "Authenticator app", "passkey": "Passkey or security key",
                  "backup_password": "Backup password", "recovery": "Recovery code"}
 NOT_OFFLINE = {
@@ -79,8 +93,103 @@ def _scrypt(secret: str, salt: bytes, kdf: dict) -> bytes:
 
 # ── what is set up ──────────────────────────────────────────────────────────────────────────────────────────────
 def enrolled() -> bool:
-    """The authenticator app is set up (the historical meaning; see any_enrolled for 'some method')."""
-    return bool(vault_store.get(_SECRET))
+    """At least one authenticator app is set up (the historical meaning; see any_enrolled for 'some method')."""
+    return bool(_authenticators())
+
+
+# ── authenticator apps: one store entry each ────────────────────────────────────────────────────────────────────
+def _auth_ids() -> list:
+    try:
+        ids = json.loads(vault_store.get(_AUTH_INDEX) or "[]")
+    except ValueError:
+        ids = []
+    return [i for i in ids if isinstance(i, str) and i] if isinstance(ids, list) else []
+
+
+def _auth_save(rec: dict) -> None:
+    vault_store.put(_AUTH_PREFIX + rec["id"], json.dumps(rec))
+    ids = _auth_ids()
+    if rec["id"] not in ids:
+        vault_store.put(_AUTH_INDEX, json.dumps(ids + [rec["id"]]))
+
+
+def _auth_delete(aid: str) -> None:
+    vault_store.delete(_AUTH_PREFIX + aid)
+    ids = [i for i in _auth_ids() if i != aid]
+    if ids:
+        vault_store.put(_AUTH_INDEX, json.dumps(ids))
+    else:
+        vault_store.delete(_AUTH_INDEX)
+
+
+def _migrate_single_secret() -> None:
+    """The first release kept ONE secret (`totp_secret` + `totp_last_step`): it becomes the first named app. Written
+    before the old entries are removed, so an interruption never loses it."""
+    legacy = vault_store.get(_SECRET)
+    if not legacy:
+        return
+    try:
+        last = int(vault_store.get(_LAST) or "-1")
+    except ValueError:
+        last = -1
+    _auth_save({"id": secrets.token_hex(6), "label": "Authenticator app", "secret": legacy, "last_step": last,
+                "created": 0, "last_used": 0})
+    vault_store.delete(_SECRET)
+    vault_store.delete(_LAST)
+
+
+def _authenticators() -> list:
+    """Every authenticator app of this installation, oldest first: [{"id", "label", "secret" (base64), "last_step",
+    "created", "last_used"}]. Internal: the secret never leaves this module (see authenticators_public)."""
+    with _lock:
+        _migrate_single_secret()
+        out = []
+        for aid in _auth_ids():
+            try:
+                rec = json.loads(vault_store.get(_AUTH_PREFIX + aid) or "null")
+            except ValueError:
+                rec = None
+            if isinstance(rec, dict) and rec.get("secret"):
+                out.append({**rec, "id": aid})
+        return out
+
+
+def authenticators_public() -> list:
+    """Names and dates only - never a secret."""
+    return [{"id": a["id"], "label": a.get("label") or "Authenticator app", "created": a.get("created", 0),
+             "last_used": a.get("last_used", 0)} for a in _authenticators()]
+
+
+def _clean_label(label) -> str:
+    return " ".join(str(label or "").split())[:LABEL_MAX]
+
+
+def _label_taken(label: str, auths: list, except_id: str = "") -> bool:
+    return any(a["id"] != except_id and str(a.get("label", "")).casefold() == label.casefold() for a in auths)
+
+
+def _default_label(auths: list) -> str:
+    n, label = len(auths) + 1, "Authenticator app"
+    while _label_taken(label, auths):
+        label = f"Authenticator app {n}"
+        n += 1
+    return label
+
+
+def rename_totp(auth_id: str, label: str) -> None:
+    label = _clean_label(label)
+    if not label:
+        raise ValueError("Give the authenticator a name, e.g. 'My phone'.")
+    with _lock:
+        auths = _authenticators()
+        rec = next((a for a in auths if a["id"] == str(auth_id)), None)
+        if rec is None:
+            raise LookupError("That authenticator is not set up here any more (removed in another tab?). Reload this "
+                              "list.")
+        if _label_taken(label, auths, rec["id"]):
+            raise ValueError(f"Another authenticator is already called '{label}'. Choose another name.")
+        rec["label"] = label
+        _auth_save(rec)
 
 
 def _passkeys() -> list:
@@ -99,9 +208,9 @@ def _save_passkeys(creds: list) -> None:
 
 
 def methods_set_up() -> dict:
-    """{"totp": bool, "passkey": count, "backup_password": bool, "recovery": codes left} - never a secret."""
-    return {"totp": enrolled(), "passkey": len(_passkeys()), "backup_password": bool(vault_store.get(_BACKUP_PW)),
-            "recovery": recovery_codes_left()}
+    """{"totp": apps, "passkey": count, "backup_password": bool, "recovery": codes left} - never a secret."""
+    return {"totp": len(_authenticators()), "passkey": len(_passkeys()),
+            "backup_password": bool(vault_store.get(_BACKUP_PW)), "recovery": recovery_codes_left()}
 
 
 def usable_methods() -> list:
@@ -130,11 +239,38 @@ def normalise_policy(methods) -> list:
     return [m for m in METHODS if m in chosen]
 
 
+def normalise_choice(value) -> list:
+    """The author's answer -> canonical method list. {"choice": one of CHOICES} (the one question; "password" = []),
+    or {"choice": "custom" / absent, "methods": [...]} (Advanced: pick methods). An empty list is accepted ONLY as the
+    explicit "password" choice, so a buggy client never makes a vault password-only by accident."""
+    if isinstance(value, dict) and value.get("choice") not in (None, "custom"):
+        choice = str(value.get("choice"))
+        if choice not in CHOICES:
+            raise ValueError(f"Unknown protection choice: {choice[:40]}.")
+        return list(CHOICES[choice])
+    return normalise_policy(value.get("methods") if isinstance(value, dict) else value)
+
+
+def choice_of(methods) -> str:
+    """The method list -> the answer to the one question ("custom" when no simple answer fits)."""
+    have = set(methods or [])
+    if have:
+        have.add("recovery")                                   # always part of a list that needs a second factor
+    for choice, listed in CHOICES.items():
+        if have == set(listed):
+            return choice
+    return "custom"
+
+
 def policy_of(plain: dict) -> list:
-    """The methods a vault accepts. Vaults locked before methods existed accept the authenticator + recovery codes."""
+    """The methods a vault accepts ([] = password only). Vaults locked before methods existed accept the
+    authenticator + recovery codes. An H2Vault from before "Password only" reads [] as damaged and falls back to the
+    authenticator + recovery codes: stricter, never weaker."""
     sf = plain.get("second_factor") if isinstance(plain, dict) else None
     try:
         if isinstance(sf, dict):
+            if sf.get("methods") == []:
+                return []
             return normalise_policy(sf.get("methods"))
     except ValueError:
         pass
@@ -229,13 +365,21 @@ def _recovery_code() -> str:
     return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
 
 
-def begin_enrolment(account: str = "ComfyUI vault") -> dict:
+def begin_enrolment(account: str = "ComfyUI vault", label: str = "", add: bool = False) -> dict:
     """A new secret (+ a first set of recovery codes when this install has none), shown ONCE; active only after
-    confirm_enrolment(first code)."""
+    confirm_enrolment(first code). `add`: another app next to the ones set up (the caller checked a proof first)."""
     with _lock:
-        if enrolled():
-            raise PermissionError("An authenticator is already set up on this install. Replace it under H2Vault menu "
+        auths = _authenticators()
+        if auths and not add:
+            raise PermissionError("An authenticator is already set up on this install. Add another under H2Vault menu "
                                   "> Second factor (needs one of your methods).")
+        if len(auths) >= MAX_AUTHENTICATORS:
+            raise PermissionError(f"This installation has {len(auths)} authenticator apps, at most "
+                                  f"{MAX_AUTHENTICATORS} are allowed. Remove one you no longer use first.")
+        label = _clean_label(label)
+        if label and _label_taken(label, auths):
+            raise PermissionError(f"Another authenticator is already called '{label}'. Choose another name.")
+        label = label or _default_label(auths)
         if _pending and time.time() - _pending.get("at", 0) <= 15 * 60:
             secret, codes = _pending["secret"], _pending["codes"]   # same setup while it is pending (QR <-> key)
         else:
@@ -243,12 +387,14 @@ def begin_enrolment(account: str = "ComfyUI vault") -> dict:
             codes = [_recovery_code() for _ in range(RECOVERY_COUNT)] if recovery_codes_left() == 0 else []
             _pending.clear()
             _pending.update({"secret": secret, "codes": codes, "at": time.time()})
+        _pending["label"] = label
+    account = label if auths else account                    # the phone shows "H2Vault: <name>": two apps stay apart
     uri = _totp(secret).get_provisioning_uri(account, "H2Vault")
     b32 = base64.b32encode(secret).decode("ascii").rstrip("=")
     return {"secret_base32": b32, "secret_grouped": " ".join(b32[i:i + 4] for i in range(0, len(b32), 4)),
             "otpauth_uri": uri, "qr_svg": qr_svg(uri), "recovery_codes": codes,
             "recovery_kept": 0 if codes else recovery_codes_left(), "issuer": "H2Vault",
-            "account": account, "algorithm": "SHA1", "digits": DIGITS, "period": STEP}
+            "account": account, "label": label, "algorithm": "SHA1", "digits": DIGITS, "period": STEP}
 
 
 def qr_svg(text: str, border: int = 4) -> str:
@@ -288,10 +434,18 @@ def confirm_enrolment(code: str, now: Optional[float] = None) -> bool:
                 "That code is not right. Enter the current code of the new 'H2Vault' entry (scan the QR code or "
                 "type the setup key again if the app shows no entry).")
             return False
-        vault_store.put(_SECRET, base64.b64encode(_pending["secret"]).decode("ascii"))
+        auths = _authenticators()
+        if len(auths) >= MAX_AUTHENTICATORS:
+            _pending.clear()
+            raise PermissionError(f"At most {MAX_AUTHENTICATORS} authenticator apps per installation.")
+        label = _pending.get("label") or _default_label(auths)
+        if _label_taken(label, auths):                       # another tab took the name meanwhile
+            label = _default_label(auths)
+        _auth_save({"id": secrets.token_hex(6), "label": label,
+                    "secret": base64.b64encode(_pending["secret"]).decode("ascii"), "last_step": step,
+                    "created": int(time.time()), "last_used": 0})
         if _pending.get("codes"):
             _store_recovery(_pending["codes"])
-        vault_store.put(_LAST, str(step))
         _succeeded("manage")
         _pending.clear()
         return True
@@ -336,11 +490,15 @@ def _probe_clock(secret: bytes, code: str, now: Optional[float]) -> Optional[int
     return None
 
 
-def remove_totp() -> None:
+def remove_totp(auth_id: Optional[str] = None) -> int:
+    """Remove one authenticator app (`auth_id`) or, without one, every app (the first release's reset). -> removed."""
     with _lock:
-        for name in (_SECRET, _LAST):
-            vault_store.delete(name)
-        _pending.clear()
+        gone = [a for a in _authenticators() if auth_id is None or a["id"] == str(auth_id)]
+        for a in gone:
+            _auth_delete(a["id"])
+        if auth_id is None:
+            _pending.clear()
+        return len(gone)
 
 
 # ── recovery codes ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -626,21 +784,33 @@ def verify_factor(factor: dict, *, allowed=None, scope: Optional[str] = None, no
 
 
 def _verify_totp(code: str, now: Optional[float], scope: str) -> dict:
-    stored = vault_store.get(_SECRET)
-    secret = base64.b64decode(stored)
+    """Any registered app's code is accepted, once per app. Every app is checked (the time taken does not tell which
+    one matched); a wrong code is ONE failure however many apps there are."""
+    auths = _authenticators()
     t = time.time() if now is None else now
-    step = _match(secret, code, now)
-    if step is not None:
-        last = int(vault_store.get(_LAST) or "-1")
-        if step <= last:
-            nxt = int(STEP - (t % STEP)) + 1
-            return {"ok": False, "reason": "reused", "method": "totp", "next_in": nxt,
-                    "message": f"That code was already used (each code works once). Wait for the next code in "
-                               f"your app - about {nxt} s - and enter that one."}
-        vault_store.put(_LAST, str(step))
+    hits = []
+    for a in auths:
+        step = _match(base64.b64decode(a["secret"]), code, now)
+        if step is not None:
+            hits.append((a, step))
+    fresh = [(a, step) for a, step in hits if step > int(a.get("last_step", -1))]
+    if fresh:
+        a, step = fresh[0]
+        a["last_step"], a["last_used"] = step, int(t)
+        _auth_save(a)
         _succeeded(scope)
-        return {"ok": True, "reason": "ok", "method": "totp", "message": "Verified."}
-    skew = _probe_clock(secret, code, now)
+        return {"ok": True, "reason": "ok", "method": "totp", "authenticator": a.get("label", ""),
+                "message": "Verified."}
+    if hits:
+        nxt = int(STEP - (t % STEP)) + 1
+        return {"ok": False, "reason": "reused", "method": "totp", "next_in": nxt,
+                "message": f"That code was already used (each code works once). Wait for the next code in "
+                           f"your app - about {nxt} s - and enter that one."}
+    skew = None
+    for a in auths:
+        skew = _probe_clock(base64.b64decode(a["secret"]), code, now)
+        if skew is not None:
+            break
     if skew is not None:
         side = "ahead of" if skew > 0 else "behind"
         return {"ok": False, "reason": "clock", "method": "totp", "skew_seconds": skew,
@@ -701,6 +871,115 @@ def check_manage(token: str) -> None:
                               "10 minutes.")
 
 
+# ── which vaults need which method (for "removing this would lock you out of ...") ─────────────────────────────
+# A vault's method list is inside its encryption, so the installation keeps a small note of the vaults it locked or
+# opened: {vault id: {"title", "methods", "seen"}} in <user dir>/h2vault/second_factor_vaults.json. Not a secret (ids
+# and titles are on the vault nodes anyway, methods are names); it never holds a password, key or code.
+KNOWN_VAULTS_MAX = 1000
+KNOWN_VAULTS_FILE = "second_factor_vaults.json"
+
+
+def _known_path():
+    from . import secrets_store
+    return secrets_store._user_dir() / KNOWN_VAULTS_FILE
+
+
+def known_vaults() -> list:
+    try:
+        data = json.loads(_known_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    return [{"vault_id": str(k), "title": str(v.get("title") or ""), "methods": list(v.get("methods") or [])}
+            for k, v in data.items() if isinstance(v, dict)]
+
+
+def note_vault(vault_id: str, methods, title: str = "") -> None:
+    """Remember (or refresh) a vault's methods. Best effort: a failure here never stops a lock or an open."""
+    vault_id = str(vault_id or "")
+    if not vault_id:
+        return
+    try:
+        with _lock:
+            path = _known_path()
+            try:
+                data = json.loads(path.read_text("utf-8"))
+                data = data if isinstance(data, dict) else {}
+            except (OSError, ValueError):
+                data = {}
+            old = data.get(vault_id) if isinstance(data.get(vault_id), dict) else {}
+            data[vault_id] = {"title": _clean_label(title)[:80] or old.get("title", ""), "methods": list(methods),
+                              "seen": int(time.time())}
+            if len(data) > KNOWN_VAULTS_MAX:
+                keep = sorted(data.items(), key=lambda kv: kv[1].get("seen", 0), reverse=True)[:KNOWN_VAULTS_MAX]
+                data = dict(keep)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[H2Vault] could not note the vault's second-factor methods: %s", type(exc).__name__)
+
+
+def _vault_names(vaults: list) -> str:
+    names = [f"'{v['title']}'" if v["title"] else f"vault {v['vault_id']}" for v in vaults[:6]]
+    more = len(vaults) - len(names)
+    return ", ".join(names) + (f" and {more} more" if more > 0 else "")
+
+
+def removal_impact(method: str, item_id: Optional[str] = None) -> dict:
+    """What removing one item of `method` (an app / passkey by id, or the backup password) does to the vaults this
+    installation knows. {"last_of_kind", "unopenable": [vaults with no accepted method left here, not even a recovery
+    code], "recovery_only": [vaults then openable here only with a recovery code], "warning": words}. Vaults this
+    installation has not locked or opened since 2026-11-23 are not known; the warning says so."""
+    have = methods_set_up()
+    after = dict(have)
+    if method in ("totp", "passkey"):
+        after[method] = max(0, int(have[method]) - (1 if item_id else int(have[method])))
+    elif method == "backup_password":
+        after[method] = False
+    last = bool(have.get(method)) and not after.get(method)
+    unopenable, recovery_only = [], []
+    for v in known_vaults():
+        pol = v["methods"]
+        if not pol or method not in pol:
+            continue
+        if any(m != "recovery" and after.get(m) for m in pol):
+            continue
+        (recovery_only if "recovery" in pol and after["recovery"] else unopenable).append(v)
+    words = []
+    if last:
+        words.append({"totp": "This is your last authenticator app on this installation.",
+                      "passkey": "This is your last passkey on this installation.",
+                      "backup_password": "This removes your backup password."}.get(method, ""))
+    if recovery_only:
+        words.append(f"After this, {_vault_names(recovery_only)} can be opened for editing here only with a recovery "
+                     f"code ({after['recovery']} left).")
+    if last and not unopenable and not recovery_only:
+        words.append("Vaults that accept only this method cannot be opened for editing here until you set up another "
+                     "method (vaults this installation has not opened since the update are not listed).")
+    return {"last_of_kind": last, "unopenable": unopenable, "recovery_only": recovery_only,
+            "warning": " ".join(w for w in words if w)}
+
+
+def refusal_text(method: str, unopenable: list) -> str:
+    one = len(unopenable) == 1
+    return (f"Not removed: {_vault_names(unopenable)} would no longer open for editing on this installation - "
+            f"{'it accepts' if one else 'they accept'} no other method set up here and no recovery codes are left. "
+            f"Fix: first set up another method {'that vault' if one else 'those vaults'} accept"
+            f"{'s' if one else ''} (H2Vault menu > Second factor), generate recovery codes, or change "
+            f"{'its' if one else 'their'} protection (vault menu > Manage access).")
+
+
+def has_factor(factor) -> bool:
+    """Does a request carry a second factor at all? An empty one is not a guess (never counted)."""
+    if not isinstance(factor, dict):
+        return False
+    if factor.get("method") in METHODS:
+        return True
+    return bool(str(factor.get("code") or "").strip())
+
+
 # ── every method lost ───────────────────────────────────────────────────────────────────────────────────────────
 RESET_ENV, RESET_VALUE = "H2VAULT_RESET_SECOND_FACTOR", "remove-all"
 
@@ -708,7 +987,9 @@ RESET_ENV, RESET_VALUE = "H2VAULT_RESET_SECOND_FACTOR", "remove-all"
 def reset_all() -> None:
     """Remove every second-factor method of this installation (vaults, keys and licences are untouched)."""
     with _lock:
-        for name in (_SECRET, _LAST, _RECOVERY, _FAILS, _BACKUP_PW, _PASSKEYS, _USER_HANDLE):
+        for aid in _auth_ids():
+            vault_store.delete(_AUTH_PREFIX + aid)
+        for name in (_SECRET, _LAST, _AUTH_INDEX, _RECOVERY, _FAILS, _BACKUP_PW, _PASSKEYS, _USER_HANDLE):
             vault_store.delete(name)
         _pending.clear()
         _challenges.clear()

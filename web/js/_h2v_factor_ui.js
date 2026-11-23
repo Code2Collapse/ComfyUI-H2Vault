@@ -1,10 +1,12 @@
 // H2Vault (AGPL-3.0) - second-factor methods, the DOM part: the method picker shown wherever a second factor is asked,
 // the "Second factor" settings dialog (H2Vault menu) and the per-vault method choice (lock dialog, Manage access).
 // No ComfyUI import (the caller passes `post` and `getStatus`); never innerHTML; no secret is logged.
-import { block, copyRow, codeField, disclosure, el, noticeEl, passwordField, vaultDialog, vbutton } from "./_h2v_ui.js";
-import { METHOD_LABELS, METHOD_ORDER, NOT_OFFLINE_TEXT, TOTP_DRIFT_TEXT, createOptions, credentialJSON, defaultMethod,
-  factorErrorText, getOptions, hardenSecret, initialTicks, isRecoveryShape, lostAllText, offeredMethods,
-  passkeyErrorText, passkeySupport, policyFromTicks, recallMethod, rememberMethod } from "./_h2v_factor.js";
+import { block, choiceCards, copyRow, codeField, disclosure, el, noticeEl, passwordField, vaultDialog,
+  vbutton } from "./_h2v_ui.js";
+import { CUSTOM_CHOICE, METHOD_LABELS, METHOD_ORDER, PROTECTION_CHOICES, RECOVERY_FALLBACK_TEXT, TOTP_DRIFT_TEXT,
+  choiceNotes, createOptions, credentialJSON, defaultMethod, factorErrorText, getOptions, hardenSecret, initialChoice,
+  initialTicks, isRecoveryShape, localhostUrl, lostAllText, methodCatalog, offeredMethods, passkeyErrorText,
+  passkeySupport, recallMethod, rememberMethod, secondFactorFromChoice } from "./_h2v_factor.js";
 
 const STYLE_ID = "h2v-factor-style";
 const CSS = `
@@ -19,7 +21,8 @@ const CSS = `
 .h2v-factor__panel { display: flex; flex-direction: column; gap: 8px; }
 .h2v-mrow { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; padding: 10px 12px;
   border: 1px solid var(--h2v-edge); border-radius: var(--h2v-r-card); background: var(--h2v-sunken); }
-.h2v-mrow__title { font-weight: 600; }
+.h2v-mrow__title { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-weight: 600; }
+.h2v-pchoice .h2v-choices { grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
 .h2v-mrow__state { grid-column: 1; font-size: 12px; color: var(--h2v-ink-dim); }
 .h2v-mrow__acts { grid-column: 2; grid-row: 1 / span 2; display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
 .h2v-mrow__more { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 8px; }
@@ -132,7 +135,8 @@ export function factorPicker({ status, allowed = null, post, label = "Second fac
       const names = (allowedNow || []).map((m) => METHOD_LABELS[m]).join(", ");
       kids.push(noticeEl("warn", allowedNow
         ? `This vault accepts: ${names}. None of them is set up on this installation (or usable on this page). Set ` +
-          "one up under H2Vault menu › Second factor."
+          "one up under H2Vault menu › Second factor, or ask the vault's author to choose a method you have (Manage " +
+          "access › Opening for editing)."
         : "No second factor is set up on this installation. Set one up under H2Vault menu › Second factor."));
     } else {
       const first = defaultMethod(offer, cur || recallMethod(storage()));
@@ -189,6 +193,8 @@ export function factorPicker({ status, allowed = null, post, label = "Second fac
   return {
     el: root, collect, focus,
     method: () => cur,
+    /** Nothing typed yet (a passkey is never "empty": it is asked for on submit). */
+    isEmpty: () => !cur || (cur !== "passkey" && !String(inputs[cur]?.value?.() ?? "").trim()),
     restrict(list) { allowedNow = list?.length ? list : null; render(); focus(); },
     succeeded() { rememberMethod(storage(), cur); },
     failed() { inputs[cur]?.clear?.(); focus(); },
@@ -196,40 +202,48 @@ export function factorPicker({ status, allowed = null, post, label = "Second fac
   };
 }
 
-/** The per-vault choice: which methods may open this vault for editing. Recovery codes are always allowed. */
-export function policyEditor({ status, current = null, title = "Second factor for editing" }) {
+/**
+ * The per-vault protection, as ONE question (owner 2026-11-23): "How should this vault be opened for editing?" - five
+ * plain answers plus "Advanced: pick methods" for a combination none of them fits. `current` = the vault's method
+ * list (null for a new vault). value() -> {ok, choice, methods} | {ok: false, error}.
+ */
+export function protectionChoice({ status, current = null, title = "Opening for editing" }) {
   ensureStyles();
-  const ticks = initialTicks(status, current);
+  const start = initialChoice(current);
+  const options = [...PROTECTION_CHOICES, CUSTOM_CHOICE].map((c) => ({ id: c.id, title: c.label, tag: c.tag,
+    tone: c.tone, summary: c.summary }));
   const have = status?.methods || {};
-  const warn = el("div");
+  const ticks = initialTicks(status, start === "custom" ? current : null);
   const boxes = {};
-  const rows = METHOD_ORDER.map((m) => {
+  const rows = METHOD_ORDER.filter((m) => m !== "recovery").map((m) => {
     const box = el("input", { type: "checkbox" });
     box.checked = !!ticks[m];
-    if (m === "recovery") { box.checked = true; box.disabled = true; }
     box.addEventListener("change", paint);
     boxes[m] = box;
-    const state = m === "recovery" ? "always allowed, as the fallback"
-      : have[m] ? "set up on this installation" : "not set up on this installation yet";
-    return el("label", { class: "h2v-check" }, [box, el("span", {}, [m === "recovery" ? "Recovery codes"
-      : METHOD_LABELS[m], " ", el("small", { text: `(${state})` })])]);
+    return el("label", { class: "h2v-check" }, [box, el("span", {}, [METHOD_LABELS[m], " ",
+      el("small", { text: `(${have[m] ? "set up on this computer" : "not set up on this computer yet"})` })])]);
   });
+  const advanced = el("div", { class: "h2v-ticks h2v-pchoice__adv" }, rows);
+  const fallback = el("p", { class: "h2v-dim", text: RECOVERY_FALLBACK_TEXT });
+  const notes = el("div", { class: "h2v-factor__panel" });
+  const cards = choiceCards({ label: "How should this vault be opened for editing?", options, value: start,
+    onChange: paint });
   function value() {
-    return policyFromTicks(Object.fromEntries(METHOD_ORDER.map((m) => [m, boxes[m].checked])));
+    return secondFactorFromChoice(cards.value(), Object.fromEntries(METHOD_ORDER.map((m) => [m, !!boxes[m]?.checked])));
   }
   function paint() {
+    const id = cards.value();
+    advanced.style.display = id === "custom" ? "" : "none";
+    fallback.style.display = id === "password" ? "none" : "";
     const v = value();
-    warn.replaceChildren();
-    if (!v.ok) { warn.append(noticeEl("danger", v.error)); return; }
-    if (!v.methods.some((m) => m !== "recovery" && have[m]) && !(have.recovery > 0)) {
-      warn.append(noticeEl("warn", "None of the ticked methods is set up on this installation yet. Set one up " +
-        "(H2Vault menu › Second factor) before you open this vault for editing - running it is not affected."));
-    }
+    notes.replaceChildren();
+    if (!v.ok) { notes.append(noticeEl("danger", v.error)); return; }
+    for (const n of choiceNotes(v.choice, v.methods, status)) notes.append(noticeEl(n.tone, n.text));
   }
   paint();
-  const elRoot = block(title, "Opening this vault for editing needs its password plus one of these. Each editor " +
-    "uses the methods set up on their own installation.", el("div", { class: "h2v-ticks" }, rows), warn);
-  return { el: elRoot, value };
+  const root = block(title, null, cards.el, advanced, fallback, notes);
+  root.classList.add("h2v-pchoice");
+  return { el: root, value };
 }
 
 function codesPanel(codes, { onSaved } = {}) {
@@ -266,8 +280,9 @@ export async function secondFactorDialog({ post, getStatus, enrolTotp, firstRun 
   let status = await getStatus();
   let token = null, proof = null;
   const d = vaultDialog({ title: "Second factor on this installation", width: 620,
-    subtitle: firstRun ? "Opening a vault for editing needs its password plus a second factor. Set up at least one."
-      : "Opening a vault for editing needs its password plus one of these. Each vault's author chooses which it accepts." });
+    subtitle: firstRun ? "This vault needs its password plus a second factor. Add at least one method on this computer."
+      : "Every method this computer can use to open vaults that ask for a second factor. Each vault's author chooses " +
+        "which it accepts (or 'Password only')." });
   const host = el("div", { class: "h2v-block" });
   d.body.append(host);
   d.addAction("Done", { primary: true, onClick: () => d.close(true) });
@@ -313,9 +328,16 @@ export async function secondFactorDialog({ post, getStatus, enrolTotp, firstRun 
     proof.focus();
   }
 
-  function row(title, state, acts, more = []) {
-    return el("div", { class: "h2v-mrow" }, [el("div", { class: "h2v-mrow__title", text: title }),
-      el("div", { class: "h2v-mrow__acts" }, acts.filter(Boolean)), el("div", { class: "h2v-mrow__state", text: state }),
+  const STATE_TAG = { set_up: ["Set up", "ok"], not_set_up: ["Not set up", ""], unavailable: ["Not possible here", "warn"] };
+
+  /** One method: name + state tag, what it is / why not here, its actions, and its list (apps, passkeys ...). */
+  function row(info, acts, more = []) {
+    const [tagText, tone] = STATE_TAG[info.state] || STATE_TAG.not_set_up;
+    const title = el("div", { class: "h2v-mrow__title" }, [info.label,
+      el("span", { class: `h2v-tag${tone ? ` h2v-tag--${tone}` : ""}`, text: tagText })]);
+    const state = el("div", { class: "h2v-mrow__state", text: info.state === "unavailable" ? info.reason : info.detail });
+    return el("div", { class: "h2v-mrow", "data-method": info.id }, [title,
+      el("div", { class: "h2v-mrow__acts" }, acts.filter(Boolean)), state,
       el("div", { class: "h2v-mrow__more" }, more.filter(Boolean))]);
   }
 
@@ -336,62 +358,133 @@ export async function secondFactorDialog({ post, getStatus, enrolTotp, firstRun 
     return b;
   }
 
+  /**
+   * Remove an item through `route`. The server refuses (409, naming the vaults and the fix) when a vault it knows
+   * would have no accepted method left here; it asks to confirm when a warning is due (last of its kind, vaults left
+   * with recovery codes only) and, for the last authenticator app, a fresh proof. The confirm panel goes into `host`.
+   */
+  async function removeChecked(route, body, host, what) {
+    d.notice(null);
+    const r = await call(route, body);
+    if (r.ok) { await refresh(); d.notice("ok", `${what} removed.`); return; }
+    if (r.data?.reason !== "confirm") { d.notice("danger", r.data?.error || `Could not remove the ${what.toLowerCase()}.`); return; }
+    let picker = null;
+    const cancel = () => { picker?.destroy(); host.replaceChildren(); d.onSubmit(() => {}); };
+    const go = async () => {
+      if (d.busy) return;
+      d.notice(null);
+      let factor = null;
+      if (picker) {
+        const got = await picker.collect();
+        if (got.error) { d.notice("danger", got.error); if (got.focus) picker.focus(); return; }
+        factor = got.factor;
+      }
+      d.setBusy(true, "Removing…");
+      const again = await call(route, { ...body, confirm: true, ...(factor ? { factor } : {}) });
+      d.setBusy(false);
+      if (again.ok) { cancel(); await refresh(); d.notice("ok", `${what} removed.`); return; }
+      d.notice("danger", factorErrorText(again.data) || "Could not remove it.");
+      picker?.failed();
+    };
+    const kids = [noticeEl("warn", r.data.warning)];
+    if (r.data.needs_proof) {
+      picker = factorPicker({ status, post, label: "Confirm once more with" });
+      kids.push(picker.el);
+      d.onCleanup(() => picker?.destroy());
+    }
+    kids.push(el("div", { class: "h2v-row" }, [vbutton("Keep it", { small: true, onClick: cancel }),
+      vbutton(`Remove ${what.toLowerCase()} anyway`, { small: true, kind: "danger", onClick: go })]));
+    host.replaceChildren(el("div", { class: "h2v-factor__panel" }, kids));
+    d.onSubmit(go);
+    picker?.focus();
+  }
+
+  /** "Add" with a name first (the phone shows "H2Vault: <name>", the list here too). */
+  function nameThenAdd(host, { placeholder, button, onGo }) {
+    const name = hardenSecret(el("input", { type: "text", class: "h2v-input", maxLength: 60, placeholder,
+      "aria-label": placeholder }));
+    const go = async () => { if (d.busy) return; await onGo(name.value.trim()); };
+    name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); go(); } });
+    host.replaceChildren(el("div", { class: "h2v-row" }, [el("div", { style: { flex: "1", minWidth: "0" } }, [name]),
+      vbutton("Cancel", { small: true, onClick: () => host.replaceChildren() }),
+      vbutton(button, { small: true, kind: "primary", onClick: go })]));
+    setTimeout(() => name.focus(), 0);
+  }
+
+  const when = (s) => (s ? new Date(s * 1000).toLocaleDateString() : "");
+  const disabledAdd = () => { const b = vbutton("Add", { small: true }); b.disabled = true; return b; };
+
   function drawMethods() {
     d.onSubmit(() => {});
+    const env = passkeyEnv();
+    const cat = Object.fromEntries(methodCatalog(status, env).map((r) => [r.id, r]));
     const m = status.methods || {};
-    const env = passkeyEnv(), pkSup = passkeySupport(env);
     const out = [];
 
-    // authenticator app
-    out.push(row(METHOD_LABELS.totp, m.totp ? "Set up. A code works once; codes 30 s early or late are accepted."
-      : "Not set up. Google / Microsoft Authenticator, 1Password, Aegis and others work.", [
-      vbutton(m.totp ? "Replace" : "Set up", { small: true, onClick: async () => {
-        if (m.totp) {
-          const r = await call("/h2vault/2fa/reset", {});
-          if (!r.ok) { d.notice("danger", r.data?.error || "Could not remove the old authenticator."); return; }
-        }
-        await enrolTotp(token);
-        await refresh();
-      } }),
-      m.totp ? removeBtn("Remove", async () => {
-        const r = await call("/h2vault/2fa/totp/remove");
-        if (!r.ok) d.notice("danger", r.data?.error || "Could not remove it.");
-        await refresh();
-      }) : null]));
+    // authenticator apps: several, each with a name
+    const appAdd = el("div");
+    const apps = (status.authenticators || []).map((a) => {
+      const nameEl = el("span", { class: "h2v-pk__name", text: a.label,
+        title: `Added ${when(a.created) || "before names existed"}${a.last_used ? ` · last used ${when(a.last_used)}` : ""}` });
+      const line = el("div", { class: "h2v-pk" });
+      const confirmHost = el("div");
+      const rename = vbutton("Rename", { small: true, onClick: () => {
+        const input = hardenSecret(el("input", { type: "text", class: "h2v-input", maxLength: 60, value: a.label,
+          "aria-label": `New name for ${a.label}` }));
+        input.value = a.label;
+        const save = async () => {
+          const r = await call("/h2vault/2fa/totp/rename", { id: a.id, label: input.value.trim() });
+          if (!r.ok) { d.notice("danger", r.data?.error || "Could not rename it."); input.focus(); return; }
+          await refresh();
+        };
+        input.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); e.stopPropagation(); save(); }
+          if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); draw(); } });
+        line.replaceChildren(el("div", { style: { flex: "1", minWidth: "0" } }, [input]),
+          vbutton("Cancel", { small: true, onClick: () => draw() }), vbutton("Save", { small: true, kind: "primary", onClick: save }));
+        setTimeout(() => input.focus(), 0);
+      } });
+      line.append(nameEl, rename, removeBtn("Remove", () => removeChecked("/h2vault/2fa/totp/remove", { id: a.id },
+        confirmHost, "Authenticator app")));
+      return el("div", {}, [line, confirmHost]);
+    });
+    out.push(row(cat.totp, [vbutton(m.totp ? "Add another" : "Add", { small: true, onClick: () => nameThenAdd(appAdd, {
+      placeholder: m.totp ? "Name, e.g. Backup phone or Anna's phone" : "Name, e.g. My phone",
+      button: "Continue", onGo: async (label) => { appAdd.replaceChildren(); await enrolTotp(token, label); await refresh(); } }) })],
+    [...apps, appAdd, m.totp ? el("p", { class: "h2v-dim", text: TOTP_DRIFT_TEXT }) : null]));
 
     // passkeys
-    const pkList = (status.passkeys || []).map((p) => el("div", { class: "h2v-pk" }, [
-      el("span", { class: "h2v-pk__name", text: `${p.label} · ${p.rp_id}`, title: `Added ${new Date(p.created * 1000).toLocaleDateString()}` }),
-      removeBtn("Remove", async () => {
-        const r = await call("/h2vault/2fa/passkey/remove", { id: p.id });
-        if (!r.ok) d.notice("danger", r.data?.error || "Could not remove it.");
-        await refresh();
-      })]));
-    const pkName = el("input", { type: "text", class: "h2v-input", maxLength: 60, placeholder: "Name, e.g. YubiKey or Windows Hello",
-      "aria-label": "Name for the new passkey" });
-    hardenSecret(pkName);
-    out.push(row(METHOD_LABELS.passkey, pkSup.ok
-      ? `${m.passkey ? `${m.passkey} registered.` : "None registered."} A passkey belongs to the address it was made on (${env.hostname}).`
-      : `${m.passkey ? `${m.passkey} registered. ` : ""}Not available on this page: ${pkSup.reason}`, [
-      pkSup.ok ? vbutton("Add", { small: true, onClick: async () => {
-        d.notice(null);
-        const b = await call("/h2vault/2fa/passkey/register/begin", { label: pkName.value.trim() });
-        if (!b.ok) { d.notice("danger", b.data?.error || "Could not start the passkey setup."); return; }
-        let cred;
-        try { cred = await navigator.credentials.create({ publicKey: createOptions(b.data.publicKey) }); }
-        catch (e) { d.notice("danger", passkeyErrorText(e)); return; }
-        const f = await call("/h2vault/2fa/passkey/register/finish", { challenge_id: b.data.challenge_id,
-          credential: credentialJSON(cred) });
-        if (!f.ok) { d.notice("danger", f.data?.error || "The passkey could not be registered."); return; }
-        await refresh();
-        d.notice("ok", `Passkey "${f.data.passkey.label}" added.`);
-      } }) : null], [pkSup.ok ? pkName : null, ...pkList]));
+    const pkHost = el("div");
+    const pkList = (status.passkeys || []).map((p) => {
+      const confirmHost = el("div");
+      return el("div", {}, [el("div", { class: "h2v-pk" }, [
+        el("span", { class: "h2v-pk__name", text: `${p.label} · ${p.rp_id}`, title: `Added ${when(p.created)}` }),
+        removeBtn("Remove", () => removeChecked("/h2vault/2fa/passkey/remove", { id: p.id }, confirmHost, "Passkey"))]),
+      confirmHost]);
+    });
+    const local = localhostUrl(globalThis.location || {});
+    out.push(row(cat.passkey, [
+      cat.passkey.canAdd ? vbutton(m.passkey ? "Add another" : "Add", { small: true, onClick: () => nameThenAdd(pkHost, {
+        placeholder: "Name, e.g. YubiKey or Windows Hello", button: "Register", onGo: async (label) => {
+          d.notice(null);
+          const b = await call("/h2vault/2fa/passkey/register/begin", { label });
+          if (!b.ok) { d.notice("danger", b.data?.error || "Could not start the passkey setup."); return; }
+          let cred;
+          try { cred = await navigator.credentials.create({ publicKey: createOptions(b.data.publicKey) }); }
+          catch (e) { d.notice("danger", passkeyErrorText(e)); return; }
+          const f = await call("/h2vault/2fa/passkey/register/finish", { challenge_id: b.data.challenge_id,
+            credential: credentialJSON(cred) });
+          if (!f.ok) { d.notice("danger", f.data?.error || "The passkey could not be registered."); return; }
+          await refresh();
+          d.notice("ok", `Passkey "${f.data.passkey.label}" added.`);
+        } }) })
+        : local ? vbutton("Open as localhost", { small: true, onClick: () => globalThis.open?.(local, "_blank", "noopener") })
+          : disabledAdd()], [pkHost, ...pkList]));
 
     // backup password
     const bpHost = el("div");
-    out.push(row(METHOD_LABELS.backup_password, m.backup_password ? "Set. Stored as a hash; nobody can read it back."
-      : "Not set. A second secret, different from every vault password.", [
-      vbutton(m.backup_password ? "Change" : "Set", { small: true, onClick: () => {
+    const bpConfirm = el("div");
+    out.push(row(cat.backup_password, [
+      vbutton(m.backup_password ? "Change" : "Add", { small: true, onClick: () => {
         const a = passwordField({ label: "Backup password", strength: true });
         const b = passwordField({ label: "Repeat it" });
         const save = async () => {
@@ -410,16 +503,13 @@ export async function secondFactorDialog({ post, getStatus, enrolTotp, firstRun 
           el("div", { class: "h2v-row" }, [vbutton("Save backup password", { kind: "primary", small: true, onClick: save })]));
         a.input.focus();
       } }),
-      m.backup_password ? removeBtn("Remove", async () => {
-        await call("/h2vault/2fa/backup_password/remove");
-        await refresh();
-      }) : null], [bpHost]));
+      m.backup_password ? removeBtn("Remove", () => removeChecked("/h2vault/2fa/backup_password/remove", {}, bpConfirm,
+        "Backup password")) : null], [bpHost, bpConfirm]));
 
     // recovery codes
     const rcHost = el("div");
-    out.push(row("Recovery codes", m.recovery ? `${m.recovery} left. Each works once; always accepted as a fallback.`
-      : "None. Generate a set so a lost phone or key does not lock you out of editing.", [
-      vbutton(m.recovery ? "Generate a new set" : "Generate", { small: true, onClick: async () => {
+    out.push(row(cat.recovery, [
+      vbutton(m.recovery ? "New set" : "Add", { small: true, onClick: async () => {
         const r = await call("/h2vault/2fa/recovery/new");
         if (!r.ok) { d.notice("danger", r.data?.error || "Could not generate codes."); return; }
         status = await getStatus();
@@ -428,14 +518,17 @@ export async function secondFactorDialog({ post, getStatus, enrolTotp, firstRun 
         if (m.recovery) d.notice("info", "The previous recovery codes no longer work.");
       } })], [rcHost]));
 
+    // not possible offline: listed, so nobody wonders where they are
+    for (const id of ["email", "sms"]) out.push(row(cat[id], [disabledAdd()]));
+
     if (!m.totp && !m.passkey && !m.backup_password) {
       out.unshift(noticeEl(m.recovery ? "warn" : "info", m.recovery
-        ? "Only recovery codes are left: set up an authenticator app, a passkey or a backup password."
-        : "Set up at least one method to open vaults for editing."));
+        ? "Only recovery codes are left: add an authenticator app, a passkey or a backup password."
+        : "Add at least one method to open vaults that ask for a second factor (vaults set to 'Password only' never do)."));
     }
     const lost = disclosure("Lost every method?");
     lost.body.append(el("p", { class: "h2v-dim", text: lostAllText(status) }));
-    out.push(el("p", { class: "h2v-dim", text: NOT_OFFLINE_TEXT }), lost.el);
+    out.push(lost.el);
     host.replaceChildren(...out);
   }
 
