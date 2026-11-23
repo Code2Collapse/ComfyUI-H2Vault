@@ -236,3 +236,9 @@ installed together. A vault made by one is opened by that one; H2Vault refuses t
 
 AGPL-3.0 (see LICENSE). H2Vault ports ComfyUI-Workflow-Encrypt by jtydhr88 (AGPL-3.0) and derives from the C2C Vault of
 Code2Collapse ComfyUI-CustomNodePacks (Apache-2.0); see NOTICE.
+
+## Readable in light and dark themes (2026-11-23)
+
+Node panels from this pack were checked in both renderers, light and dark themes, two display scales and three zoom
+levels. Dim text, badges and chips now reach the WCAG contrast of 4.5:1, and the C2C colours apply wherever a panel is
+shown. Saved workflows are unchanged.
