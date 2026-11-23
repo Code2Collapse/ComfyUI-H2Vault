@@ -330,7 +330,8 @@ def protect(body: dict) -> dict:
     if licensing:
         _license_this_installation(vault_id, licensing)       # the author runs it at once
     from . import twofactor
-    twofactor.note_vault(vault_id, twofactor.policy_of(plain), body.get("vault_title") or "")
+    twofactor.note_vault(vault_id, twofactor.policy_of(plain), body.get("vault_title") or "",
+                         policy=twofactor.policy_detail(plain))
     if profile == "locked" and body.get("client_id"):
         SS.RUN_SESSIONS.put(str(body["client_id"]), vault_id, kek)   # the creator can run it right away
         _note_pending(vault_id, str(body["client_id"]))
@@ -443,10 +444,11 @@ def _previews_choice(plain: dict, raw) -> bool:
 
 def _second_factor_choice(value) -> dict:
     """The author's answer to "How should this vault be opened for editing?" ({"choice": ...}) or, under Advanced,
-    the methods ({"methods": [...]}) -> what the vault stores: {"methods": [...]}; [] = password only."""
+    the methods ({"methods": [...]}) or a policy ({"methods", "mode", "recovery", "authenticators"}, L9.343) -> what
+    the vault stores: {"methods": [...]} ([] = password only) or a `v: 2` policy record (docs/AUTH_POLICY.md)."""
     from . import twofactor
     try:
-        return {"methods": twofactor.normalise_choice(value)}
+        return twofactor.normalise_policy_choice(value)
     except ValueError as exc:
         raise VaultError(str(exc)) from None
 
@@ -457,10 +459,26 @@ def _factor_of(body: dict) -> dict:
     return dict(f) if isinstance(f, dict) else {"code": str(body.get("code") or "")}
 
 
-def _factor_required(allowed: list) -> dict:
+def _factors_of(body: dict) -> list:
+    """Every second factor a request carries: {"factors": [{...}, ...]} (L9.343: a vault may need ALL of several),
+    else the single factor of the previous releases."""
+    fs = body.get("factors")
+    if isinstance(fs, list) and fs:
+        return [dict(f) for f in fs[:8] if isinstance(f, dict)]
+    return [_factor_of(body)]
+
+
+def _factor_required(allowed: list, policy: Optional[dict] = None, missing=None) -> dict:
     from . import twofactor
-    return {"ok": False, "reason": "factor_required", "methods": allowed,
-            "error": "Password accepted. This vault also needs a second factor: " + twofactor.labels(allowed) + "."}
+    out = {"ok": False, "reason": "factor_required", "methods": allowed,
+           "error": "Password accepted. This vault also needs a second factor: " + twofactor.labels(allowed) + "."}
+    if policy is not None:
+        out["policy"] = twofactor.policy_public(policy)
+        out["missing"] = list(missing if missing is not None else policy["methods"])
+        if policy["mode"] == "all" and len(policy["methods"]) > 1:
+            out["error"] = ("Password accepted. This vault also needs ALL of: " +
+                            twofactor.labels(out["missing"]) + ".")
+    return out
 
 
 def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
@@ -480,23 +498,27 @@ def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
     plain, kek, parsed = _password_attempt(vault_id, lambda: v2.open_with_password(payload, password,
                                                                                     vault_id=vault_id))
     k = {"kek": kek, "salt": parsed["salt"], "kdf": parsed["kdf"]}
-    allowed = vault_2fa.policy_of(plain)                       # checked BEFORE the factor: a refused method is never
-    factor = _factor_of(body)                                  # consumed and never counted
+    policy = vault_2fa.policy_detail(plain)                    # L9.343: ANY / ALL of the chosen factors
+    allowed = vault_2fa.accepted_methods(policy)               # checked BEFORE the factor: a refused method is never
+    factors = _factors_of(body)                                # consumed and never counted
     if not allowed:                                            # "Password only" (owner 2026-11-23): a factor sent
         detail = {"ok": True, "reason": "password_only"}       # anyway is ignored - never checked, never used up
     elif not vault_2fa.any_enrolled():                         # asked only now: after the password, and only when
         return None, None, None, {                             # this vault needs a second factor
-            "ok": False, "needs_enrolment": True, "methods": allowed,
+            "ok": False, "needs_enrolment": True, "methods": allowed, "policy": vault_2fa.policy_public(policy),
             "error": "This vault also needs a second factor (" + vault_2fa.labels(allowed) + "), and none is set up "
                      "on this installation. Set one up first (H2Vault menu > Second factor)."}
-    elif not vault_2fa.has_factor(factor):
-        return None, None, None, _factor_required(allowed)
+    elif not any(vault_2fa.has_factor(f) for f in factors):
+        return None, None, None, _factor_required(allowed, policy)
     else:
-        detail = vault_2fa.verify_factor(factor, allowed=allowed, scope=f"v:{vault_id}",
+        detail = vault_2fa.verify_policy(factors, policy, scope=f"v:{vault_id}",
                                          origins=body.get("_req_origins") or ())
     if not detail["ok"]:
+        if detail["reason"] == "factor_required":
+            return None, None, None, _factor_required(allowed, policy, detail.get("missing"))
         return None, None, None, {
             "ok": False, "reason": detail["reason"], "error": detail["message"], "methods": allowed,
+            "policy": vault_2fa.policy_public(policy),
             **{key: detail[key] for key in ("next_in", "allowed", "method") if key in detail}}
     editors = plain.get("editors")
     if require_editor and editors and _this_install_code() not in editors:
@@ -504,8 +526,8 @@ def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
             "ok": False, "reason": "not_editor",
             "error": "This installation is not an editor of this vault. Ask its author to add your installation code "
                      "(H2Vault menu > My installation code)."}
-    vault_2fa.note_vault(vault_id, allowed, body.get("vault_title") or "")
-    return plain, k, {**detail, "methods": allowed}, None
+    vault_2fa.note_vault(vault_id, allowed, body.get("vault_title") or "", policy=policy)
+    return plain, k, {**detail, "methods": allowed, "policy": vault_2fa.policy_public(policy)}, None
 
 
 def _holds_author_key(p: dict) -> bool:
@@ -627,7 +649,10 @@ def access_open(body: dict) -> dict:
 def _factor_answer(detail: dict) -> dict:
     """What an open / access answer says about the second factor: the method used, the vault's methods and, after a
     recovery code, how many are left."""
-    out = {"second_factor": detail.get("reason"), "methods": detail.get("methods") or []}
+    out = {"second_factor": detail.get("reason"), "methods": detail.get("methods") or [],
+           "used": detail.get("used") or []}                  # L9.343: "used: <name>" - names, never secrets
+    if detail.get("policy"):
+        out["policy"] = detail["policy"]
     if "recovery_codes_left" in detail:
         out["recovery_codes_left"] = detail["recovery_codes_left"]
     return out
@@ -677,7 +702,8 @@ def access_apply(body: dict) -> dict:
     if check.get("editors") != editors or check.get("second_factor") != inner.get("second_factor"):
         raise VaultError("The re-encrypted vault did not read back correctly; nothing was changed.")
     from . import twofactor
-    twofactor.note_vault(s["vault_id"], twofactor.policy_of(inner), body.get("vault_title") or "")
+    twofactor.note_vault(s["vault_id"], twofactor.policy_of(inner), body.get("vault_title") or "",
+                         policy=twofactor.policy_detail(inner))
     with _lock:
         for t in [t for t, x in _EDITS.items() if x.get("vault_id") == s["vault_id"]]:
             _EDITS.pop(t, None)                                # this session too: one apply per authorization
@@ -1085,7 +1111,11 @@ def tfa_status(_body: dict) -> dict:
             "choices": {k: list(v) for k, v in twofactor.CHOICES.items()},
             "backup_password": m["backup_password"], "recovery_codes_left": m["recovery"],
             "locked_out_seconds": int(twofactor.locked_out()), "labels": twofactor.METHOD_LABELS,
-            "default_methods": list(twofactor.DEFAULT_POLICY), "not_offline": twofactor.NOT_OFFLINE}
+            "default_methods": list(twofactor.DEFAULT_POLICY), "not_offline": twofactor.NOT_OFFLINE,
+            # L9.343: the limit, the backup password's last use (a date), the policy vocabulary
+            "max_authenticators": twofactor.max_authenticators(),
+            "backup_password_last_used": twofactor.backup_password_info()["last_used"] if m["backup_password"] else 0,
+            "recovery_rules": {k: list(v) for k, v in twofactor.RECOVERY_RULES.items()}}
 
 
 def _manage(body: dict) -> None:
@@ -1096,21 +1126,59 @@ def _manage(body: dict) -> None:
         raise _Forbidden(str(exc)) from None
 
 
-def tfa_begin(body: dict) -> dict:
-    """Set up an authenticator app: the first method needs no proof; another app next to any method needs one."""
+def _step_up(body: dict, *kinds, item: Optional[str] = None, adding: bool = False) -> Optional[dict]:
+    """L9.343 (review P1): adding, replacing or removing a method kind needs a settings session whose proofs would open
+    every known vault that accepts that kind - so one factor can never stand in for another of an AND vault. None =
+    go ahead; else the answer the Second factor dialog handles (it asks for one more proof, then tries again)."""
     from . import twofactor
+    _manage(body)
+    for kind in kinds:
+        try:
+            twofactor.check_manage(str(body.get("manage_token") or ""), change=kind, item=item,
+                                   adding=adding and kind == "totp")
+        except twofactor.StepUpRequired as exc:
+            proven = twofactor.proven_by(str(body.get("manage_token") or ""))
+            first = twofactor.accepted_methods(exc.vaults[0]["policy"])
+            return {"ok": False, "reason": "step_up", "change": kind, "error": str(exc),
+                    "needed": [m for m in first if m not in proven] or first,      # what to ask for next (names)
+                    "vaults": [{"title": v["title"] or f"vault {v['vault_id'][:8]}",
+                                "policy": twofactor.policy_public(v["policy"])} for v in exc.vaults[:6]]}
+    return None
+
+
+def tfa_manage_check(body: dict) -> dict:
+    """May this settings session change `change` (a method kind)? {"ok": True} or the step_up answer."""
+    from . import twofactor
+    kind = str(body.get("change") or "")
+    if kind not in twofactor.METHODS:
+        raise _BadRequest("Name the method to change.")
+    return _step_up(body, kind) or {"ok": True}
+
+
+def tfa_begin(body: dict) -> dict:
+    """Set up an authenticator app: the first method needs no proof; another app next to any method needs one.
+    `recovery` (L9.343): "auto" (a first set of recovery codes only when none are left), "new" (a fresh set replaces
+    the old one when the app is confirmed - needs the same proof) or "keep"."""
+    from . import twofactor
+    recovery = str(body.get("recovery") or "auto")
     if twofactor.any_enrolled():
-        _manage(body)
+        refused = _step_up(body, "totp", *(("recovery",) if recovery == "new" else ()), adding=True)
+        if refused:
+            return refused
     try:
         return {"ok": True, **twofactor.begin_enrolment(label=str(body.get("label") or ""),
-                                                       add=twofactor.enrolled())}
+                                                       add=twofactor.enrolled(), recovery=recovery)}
+    except ValueError as exc:
+        raise _BadRequest(str(exc)) from None
     except PermissionError as exc:                            # too many / a name taken: a conflict, not a rate limit
         raise _Conflict(str(exc)) from None
 
 
 def tfa_manage_begin(body: dict) -> dict:
+    """A proof -> a settings token; with a live `manage_token` the proof is ADDED to that token (step-up)."""
     from . import twofactor
-    out = twofactor.manage_begin(_factor_of(body), origins=body.get("_req_origins") or ())
+    out = twofactor.manage_begin(_factor_of(body), origins=body.get("_req_origins") or (),
+                                 token=str(body.get("manage_token") or "") or None)
     if not out["ok"]:
         return {"ok": False, "reason": out["reason"], "error": out["message"],
                 **{k: out[k] for k in ("next_in",) if k in out}}
@@ -1137,7 +1205,8 @@ def _removal_gate(body: dict, method: str, item_id: Optional[str] = None, *, pro
         detail = twofactor.verify_factor(factor, scope="manage", origins=body.get("_req_origins") or ())
         if not detail["ok"]:
             return {"ok": False, "reason": detail["reason"], "error": detail["message"], "needs_proof": True}
-    return None
+        twofactor.add_proof(str(body.get("manage_token") or ""), detail)
+    return _step_up(body, method, item=item_id)
 
 
 def tfa_totp_remove(body: dict) -> dict:
@@ -1169,15 +1238,35 @@ def tfa_totp_rename(body: dict) -> dict:
 
 
 def tfa_recovery_new(body: dict) -> dict:
-    """A new set of recovery codes, returned ONCE (the old set stops working). Never logged."""
+    """A new set of recovery codes, returned ONCE (the old set stops working). Never logged. L9.343: while codes are
+    left, the first call only warns (`confirm` makes the new set) - nobody loses working codes by one click."""
+    from . import twofactor
+    refused = _step_up(body, "recovery")
+    if refused:
+        return refused
+    left = twofactor.recovery_codes_left()
+    if left and not body.get("confirm"):
+        what = f"Your {left} remaining recovery codes stop" if left != 1 else "Your remaining recovery code stops"
+        return {"ok": False, "reason": "confirm", "recovery_codes_left": left,
+                "warning": f"{what} working as soon as the new set is made. Keep the new codes somewhere safe."}
+    return {"ok": True, "recovery_codes": twofactor.new_recovery_codes(), "replaced": left}
+
+
+def tfa_overview(body: dict) -> dict:
+    """The Second factor dialog's extra facts, after a proof (vault names are not for anyone): the last
+    authentication activity and which policy each vault this installation knows uses. Names and dates only."""
     from . import twofactor
     _manage(body)
-    return {"ok": True, "recovery_codes": twofactor.new_recovery_codes()}
+    vaults = [{"title": v["title"] or f"vault {v['vault_id'][:8]}", "policy": twofactor.policy_public(v["policy"])}
+              for v in twofactor.known_vaults()]
+    return {"ok": True, "activity": twofactor.activity(), "vaults": vaults[:200]}
 
 
 def tfa_backup_password_set(body: dict) -> dict:
     from . import twofactor
-    _manage(body)
+    refused = _step_up(body, "backup_password")
+    if refused:
+        return refused
     try:
         twofactor.set_backup_password(str(body.get("secret") or ""))
     except ValueError as exc:
@@ -1197,9 +1286,12 @@ def tfa_backup_password_remove(body: dict) -> dict:
 
 def tfa_passkey_register_begin(body: dict) -> dict:
     from . import twofactor
-    _manage(body)
+    refused = _step_up(body, "passkey")
+    if refused:
+        return refused
     try:
-        return {"ok": True, **twofactor.passkey_register_begin(body.get("_req_host") or "", body.get("label") or "")}
+        return {"ok": True, **twofactor.passkey_register_begin(body.get("_req_host") or "", body.get("label") or "",
+                                                               str(body.get("kind") or "any"))}
     except PermissionError as exc:
         raise _BadRequest(str(exc)) from None
 
@@ -1207,7 +1299,9 @@ def tfa_passkey_register_begin(body: dict) -> dict:
 def tfa_passkey_register_finish(body: dict) -> dict:
     from . import twofactor
     from .webauthn_min import WebAuthnError
-    _manage(body)
+    refused = _step_up(body, "passkey")
+    if refused:
+        return refused
     try:
         cred = twofactor.passkey_register_finish(str(body.get("challenge_id") or ""), body.get("credential") or {},
                                                  body.get("_req_origins") or ())
@@ -1238,8 +1332,11 @@ def tfa_passkey_challenge(body: dict) -> dict:
 
 def tfa_confirm(body: dict) -> dict:
     from . import twofactor
-    try:
-        ok = twofactor.confirm_enrolment(str(body.get("code") or ""))
+    try:                                                       # L9.343: active only once the codes were saved
+        ok = twofactor.confirm_enrolment(str(body.get("code") or ""),
+                                         recovery_saved=body.get("recovery_saved") is True)
+    except ValueError as exc:
+        raise _BadRequest(str(exc)) from None
     except PermissionError as exc:
         raise _Conflict(str(exc)) from None
     return {"ok": ok, "error": None if ok else (twofactor.last_enrolment_error() or "That code is not right.")}
@@ -1257,12 +1354,18 @@ def tfa_reset(body: dict) -> dict:
     if body.get("manage_token"):
         _manage(body)
         strands_a_vault()
+        refused = _step_up(body, "totp")
+        if refused:
+            return refused
         twofactor.remove_totp()
         return {"ok": True}
     out = twofactor.manage_begin(_factor_of(body), origins=body.get("_req_origins") or ())
     if not out["ok"]:
         return {"ok": False, "reason": out["reason"], "error": out["message"]}
     strands_a_vault()
+    refused = _step_up({**body, "manage_token": out["manage_token"]}, "totp")
+    if refused:
+        return {**refused, "manage_token": out["manage_token"]}
     twofactor.remove_totp()
     return {"ok": True, "manage_token": out["manage_token"]}
 
@@ -1392,6 +1495,8 @@ def register_routes(server) -> None:
     routes.post("/h2vault/2fa/totp/remove")(wrap(tfa_totp_remove, 403, offload=True, local_only=settings))
     routes.post("/h2vault/2fa/totp/rename")(wrap(tfa_totp_rename, 403, local_only=settings))
     routes.post("/h2vault/2fa/recovery/new")(wrap(tfa_recovery_new, 403, offload=True, local_only=settings))
+    routes.post("/h2vault/2fa/overview")(wrap(tfa_overview, 403, local_only=settings))
+    routes.post("/h2vault/2fa/manage/check")(wrap(tfa_manage_check, 403, local_only=settings))
     routes.post("/h2vault/2fa/backup_password/set")(wrap(tfa_backup_password_set, 403, offload=True,
                                                          local_only=settings))
     routes.post("/h2vault/2fa/backup_password/remove")(wrap(tfa_backup_password_remove, 403, offload=True,

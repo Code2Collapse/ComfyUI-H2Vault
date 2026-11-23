@@ -132,9 +132,11 @@ export const PROTECTION_CHOICES = Object.freeze([
     summary: "Each editor uses whatever they set up on their own computer: authenticator app, passkey or backup " +
       "password." },
 ]);
-export const CUSTOM_CHOICE = Object.freeze({ label: "Advanced: pick methods", id: "custom",
-  summary: "Tick exactly which second factors may open it." });
+export const CUSTOM_CHOICE = Object.freeze({ label: "Advanced: build a policy", id: "custom",
+  summary: "Any one or ALL of the factors you tick, what a recovery code may do, and (per vault) particular " +
+    "authenticator apps." });
 const SHORT_NAMES = Object.freeze({ totp: "authenticator app", passkey: "passkey", backup_password: "backup password" });
+// shown under the one-click answers, where it holds; a built policy says its own recovery rule (policySummary)
 export const RECOVERY_FALLBACK_TEXT = "Recovery codes are always accepted as a fallback whenever a second factor is " +
   "required.";
 
@@ -190,6 +192,156 @@ export function choiceNotes(id, methods, status) {
   return notes;
 }
 
+// ── policies: ANY / ALL of the chosen factors (L9.343, docs/AUTH_POLICY.md; nodes/twofactor.py is the same model) ──
+export const FACTOR_ORDER = Object.freeze(["totp", "passkey", "backup_password"]);
+export const POLICY_MODES = Object.freeze([
+  { label: "Any one of them (OR)", id: "any" }, { label: "All of them (AND)", id: "all" }]);
+export const RECOVERY_RULES = Object.freeze({
+  any: Object.freeze([
+    { label: "Accepted instead of the factor", id: "fallback", hint: "Each code works once." },
+    { label: "Not accepted", id: "off", hint: "Only the chosen factors open it." }]),
+  all: Object.freeze([
+    { label: "Not accepted", id: "off", hint: "Safest: ALL factors are always needed." },
+    { label: "May replace ONE missing factor", id: "replace_one",
+      hint: "The editor gives every other factor plus one recovery code." },
+    { label: "Emergency override", id: "override",
+      hint: "The password plus a recovery code alone opens it - as strong as 'any one' with recovery codes." }]),
+});
+const FACTOR_WORDS = Object.freeze({ totp: "a code from an authenticator app", passkey: "a passkey or security key",
+  backup_password: "the backup password" });
+const RECOVERY_WORDS = Object.freeze({
+  "any/fallback": "A recovery code can be used instead (each works once).",
+  "any/off": "Recovery codes are not accepted.",
+  "all/off": "Recovery codes are not accepted.",
+  "all/replace_one": "A recovery code may replace ONE missing factor (each code works once).",
+  "all/override": "Emergency override: the password plus a recovery code alone also opens it (each code works once).",
+});
+
+/** A policy in plain words (the same sentence as twofactor.policy_summary). `appNames` = names of the chosen apps. */
+export function policySummary(policy, appNames = []) {
+  const methods = policy?.methods || [];
+  if (!methods.length) return "The vault password only - no second factor.";
+  const words = methods.map((m) => {
+    if (m === "totp" && (policy.authenticators?.length || policy.restricted)) {
+      const names = (appNames || []).filter(Boolean);
+      return "a code from " + (names.length ? `one of these authenticator apps: ${names.join(", ")}`
+        : "one of the authenticator apps chosen for this vault");
+    }
+    return FACTOR_WORDS[m];
+  });
+  let need;
+  if (words.length === 1) need = words[0];
+  else if (policy.mode === "all") need = words.join(" AND ");
+  else need = `ONE of: ${words.slice(0, -1).join(", ")} or ${words[words.length - 1]}`;
+  return `The vault password AND ${need}. ${RECOVERY_WORDS[`${policy.mode}/${policy.recovery}`] || ""}`.trim();
+}
+
+/** The builder's state -> {ok, policy, secondFactor} | {ok: false, error}. state = {factors: {totp, passkey,
+ *  backup_password}, mode, recovery, restrict, authenticators: [ids]}. `secondFactor` is what the server reads. */
+export function policyFromBuilder(state) {
+  const methods = FACTOR_ORDER.filter((m) => state?.factors?.[m]);
+  if (!methods.length) {
+    return { ok: false, error: "Tick at least one second factor besides recovery codes: authenticator app, passkey " +
+      "or backup password." };
+  }
+  const mode = state?.mode === "all" ? "all" : "any";
+  const rules = RECOVERY_RULES[mode].map((r) => r.id);
+  const recovery = rules.includes(state?.recovery) ? state.recovery : rules[0];
+  if (mode === "all" && recovery === "replace_one" && methods.length === 1) {
+    return { ok: false, error: "With only one factor, 'a recovery code may replace one missing factor' would let a " +
+      "recovery code alone open the vault. Choose 'Emergency override' if that is what you want, or tick more factors." };
+  }
+  const restrict = !!state?.restrict && methods.includes("totp");
+  const authenticators = restrict ? [...new Set(state?.authenticators || [])] : [];
+  if (restrict && !authenticators.length) {
+    return { ok: false, error: "Tick at least one authenticator app for this vault, or switch 'Only particular " +
+      "authenticator apps' off." };
+  }
+  const policy = { methods, mode, recovery, authenticators };
+  return { ok: true, policy, secondFactor: { choice: "custom", methods, mode, recovery, authenticators } };
+}
+
+/** A server answer's policy (twofactor.policy_public) or a vault's method list -> the builder's starting state. */
+export function builderStateOf(policy, status) {
+  if (policy?.methods?.length) {
+    const ids = (status?.authenticators || []).filter((a) => (policy.authenticators || []).includes(a.label))
+      .map((a) => a.id);
+    return { factors: Object.fromEntries(FACTOR_ORDER.map((m) => [m, policy.methods.includes(m)])),
+      mode: policy.mode === "all" ? "all" : "any", recovery: policy.recovery || "fallback",
+      restrict: !!policy.restricted, authenticators: ids };
+  }
+  const ticks = initialTicks(status);
+  return { factors: Object.fromEntries(FACTOR_ORDER.map((m) => [m, !!ticks[m]])), mode: "any", recovery: "fallback",
+    restrict: false, authenticators: [] };
+}
+
+/** Is this policy one of the one-click answers? -> its id, else "custom". */
+export function choiceOfPolicy(policy) {
+  if (!policy) return "any";
+  if (!policy.methods?.length) return "password";
+  if (policy.mode !== "any" || policy.recovery !== "fallback" || policy.restricted || policy.authenticators?.length) {
+    return "custom";
+  }
+  return choiceOfMethods([...policy.methods, "recovery"]);
+}
+
+/** What the author must know before sealing: factors not set up on this computer, the AND / restriction caveats. */
+export function policyNotes(policy, status) {
+  const notes = [];
+  if (!policy?.methods?.length) return notes;
+  const have = status?.methods || {};
+  const missing = policy.methods.filter((m) => !have[m]);
+  if (policy.mode === "all" && missing.length) {
+    notes.push({ tone: "warn", text: `Not set up on this computer yet: ${missing.map((m) => SHORT_NAMES[m]).join(", ")}. ` +
+      "With 'all of them' you cannot open this vault for editing here until every one is set up (H2Vault menu › " +
+      "Second factor). Running it is not affected." });
+  } else if (missing.length === policy.methods.length) {
+    notes.push({ tone: "warn", text: "None of them is set up on this computer yet. Set one up (H2Vault menu › Second " +
+      "factor) before you open this vault for editing here; other editors use their own." });
+  }
+  if (policy.authenticators?.length) {
+    notes.push({ tone: "info", text: "Only the ticked authenticator apps of THIS computer count. Other editors' apps " +
+      "are not accepted, and removing a ticked app here leaves this vault without its app." });
+  }
+  if (policy.mode === "all" && policy.recovery === "off") {
+    notes.push({ tone: "info", text: "If a factor is lost, this vault cannot be opened for editing until it is set " +
+      "up again (the administrator reset removes the methods of this computer; new ones then count)." });
+  }
+  if (policy.mode === "all" && policy.recovery === "override") {
+    notes.push({ tone: "warn", text: "Emergency override: a recovery code alone (with the password) opens this vault." });
+  }
+  return notes;
+}
+
+/** Which inputs the open dialog shows: one picker for "any", one per factor for "all". */
+export function promptPlan(policy) {
+  const methods = policy?.methods || [];
+  if (!methods.length) return { mode: "none", steps: [] };
+  if (policy.mode !== "all") {
+    return { mode: "any", accepted: policy.accepted || [...methods, ...(policy.recovery === "off" ? [] : ["recovery"])] };
+  }
+  return { mode: "all", steps: [...methods], recovery: policy.recovery || "off" };
+}
+
+/** The factors an "all" prompt sends: every step's factor, except the one a recovery code replaces (replace_one) or
+ *  all of them (override). -> {ok, factors} | {ok: false, error}. `got` = {method: factor}, `recovery` = factor|null,
+ *  `replaces` = the method the recovery code stands in for. */
+export function allFactors(plan, got, recovery = null, replaces = null) {
+  if (recovery && plan.recovery === "override") return { ok: true, factors: [recovery] };
+  const steps = plan.steps.filter((m) => !(recovery && plan.recovery === "replace_one" && m === replaces));
+  const missing = steps.filter((m) => !got?.[m]);
+  if (missing.length) {
+    return { ok: false, error: `This vault needs all of its factors: still missing ${missing.map((m) => METHOD_LABELS[m].toLowerCase()).join(", ")}.` };
+  }
+  return { ok: true, factors: [...steps.map((m) => got[m]), ...(recovery && plan.recovery === "replace_one" ? [recovery] : [])] };
+}
+
+/** "used: <name>" after a successful check (names only; the server never sends a secret). */
+export function usedText(used) {
+  const names = (used || []).map((u) => u?.label || METHOD_LABELS[u?.method]).filter(Boolean);
+  return names.length ? `Used: ${names.join(" + ")}` : "";
+}
+
 /** The same page on http://localhost (passkeys refuse an IP address) - only for this computer's loopback address. */
 export function localhostUrl(loc) {
   const host = String(loc?.hostname || "").replace(/^\[|\]$/g, "");
@@ -218,7 +370,7 @@ export function methodCatalog(status, env) {
       canAdd: true, detail: m.backup_password ? "Set. Stored as a hash; nobody can read it back."
         : "A second secret, different from every vault password." },
     { label: "Recovery codes", id: "recovery", state: codes ? "set_up" : "not_set_up", canAdd: true,
-      detail: codes ? `${codes} left. Each works once; accepted wherever a second factor is required.`
+      detail: codes ? `${codes} left. Each works once, where a vault's protection allows recovery codes.`
         : "Single-use codes for when a phone or key is lost." },
     { label: "Email code", id: "email", state: "unavailable", canAdd: false, detail: "",
       reason: "Needs an email provider and a server that sends mail; H2Vault works offline, so it cannot send codes." },
