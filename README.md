@@ -242,3 +242,10 @@ Code2Collapse ComfyUI-CustomNodePacks (Apache-2.0); see NOTICE.
 Node panels from this pack were checked in both renderers, light and dark themes, two display scales and three zoom
 levels. Dim text, badges and chips now reach the WCAG contrast of 4.5:1, and the C2C colours apply wherever a panel is
 shown. Saved workflows are unchanged.
+
+## Lock dialog: outputs judged by what they carry (2026-11-23)
+
+A wildcard (*) output, for example from a switch node, no longer blocks locking when it carries an image or mask; a
+real model output (also custom ones like SeC) is caught and named. Every problem sits on its output row with a fix:
+remove the output, show it as its real type, or lock without concealment. The vault also checks output values when it
+runs and stops if one would hand out a model.
