@@ -320,6 +320,7 @@ def protect(body: dict) -> dict:
             raise VaultError(str(exc)) from None
     public = _with_conceal(plain, body.get("conceal"))
     public_lock = _with_lock(plain, body.get("lock"))
+    show_previews = _previews_choice(plain, body.get("previews"))
     licensing = None
     if profile == "sealed_licensed":                           # V5: a fresh licence key; this author's signing key
         from . import licence as L
@@ -334,7 +335,8 @@ def protect(body: dict) -> dict:
         SS.RUN_SESSIONS.put(str(body["client_id"]), vault_id, kek)   # the creator can run it right away
         _note_pending(vault_id, str(body["client_id"]))
     out = {"vault_id": vault_id, "payload": payload, "profile": profile,
-           "outputs_node": bool(body.get("outputs_node")), "node_count": len(api["nodes"])}
+           "outputs_node": bool(body.get("outputs_node")), "node_count": len(api["nodes"]),
+           "previews": show_previews}
     if public is not None:
         out["public_interface"] = public
     if public_lock is not None:
@@ -422,6 +424,21 @@ def run_status(body: dict) -> dict:
     if not client_id:
         return {"ok": True, "unlocked": []}
     return {"ok": True, "unlocked": SS.RUN_SESSIONS.touch(client_id)}
+
+
+def _previews_choice(plain: dict, raw) -> bool:
+    """Owner 2026-11-23: the author's "Show previews from inside" setting (+ preview labels), kept INSIDE the
+    encryption. -> whether previews show (public: the vault node says when they are off)."""
+    from . import previews
+    try:
+        pv = previews.choice(raw, plain.get("api"))
+    except ValueError as exc:
+        raise VaultError(str(exc)) from None
+    if pv is None:
+        plain.pop("previews", None)                             # not given: shown (the default)
+        return True
+    plain["previews"] = pv
+    return pv["show"]
 
 
 def _second_factor_choice(value) -> dict:
@@ -521,12 +538,14 @@ def open_for_edit(body: dict) -> dict:
                          "lock": plain.get("lock"),                        # V5
                          "licensing": v2_licensing(plain),                 # V5: an edit keeps the licence key
                          "second_factor": plain.get("second_factor"),      # an edit keeps the author's methods
+                         "previews": plain.get("previews"),                # an edit keeps the preview setting
                          # L9.327: commit rebuilds the inside; these were lost on every edit (model download links,
                          # editor name labels, creation time)
                          "carry": {key: plain[key] for key in ("models", "access_labels", "created") if key in plain},
                          "client_id": str(body.get("client_id") or "")}
+    from . import previews
     out = {"ok": True, "edit_token": token, "interface": plain.get("interface"), "profile": _EDITS[token]["profile"],
-           **_factor_answer(detail)}
+           "previews": previews.setting_of(plain), **_factor_answer(detail)}
     if isinstance(plain.get("conceal"), dict):
         out["conceal"] = plain["conceal"]                      # the author may change what the recipient sees
     if not isinstance(plain.get("ui"), dict):
@@ -779,6 +798,10 @@ def commit(body: dict) -> dict:
     for key, value in (s.get("carry") or {}).items():          # L9.327: never drop what the author set up
         plain.setdefault(key, value)
     public = _with_conceal(plain, conceal)
+    # owner 2026-11-23: an edit that does not resend the preview setting keeps the one the vault had
+    show_previews = _previews_choice(plain, body["previews"] if "previews" in body else s.get("previews"))
+    with _lock:
+        s["previews"] = plain.get("previews")
     # V5: an explicit `lock` is checked strictly; the session's lock is kept only while it still fits the inside
     public_lock = (_with_lock(plain, body["lock"]) if "lock" in body
                    else _with_lock(plain, s.get("lock"), strict=False))
@@ -797,7 +820,7 @@ def commit(body: dict) -> dict:
         with _lock:
             _EDITS.pop(str(body.get("edit_token")), None)
     out = {"ok": True, "payload": payload, "vault_id": s["vault_id"], "profile": s["profile"],
-           "node_count": len(api["nodes"]), "public_lock": public_lock}
+           "node_count": len(api["nodes"]), "public_lock": public_lock, "previews": show_previews}
     if public is not None:
         out["public_interface"] = public
     return out

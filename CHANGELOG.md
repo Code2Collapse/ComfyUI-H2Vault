@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Previews from inside a vault (owner 2026-11-23)** - every preview an inner node produces shows on the vault node:
+images through ComfyUI's own preview (merged, all preview nodes together), videos / audio / text in a new *Previews from
+inside* panel, live sampler frames (also KJNodes Model Preview Override), the running step's progress, and the previews
+of a cached run. Labels are "Preview N" or the author's own names, never inner names. New lock-dialog setting *Show
+previews from inside on the vault* (default on, stored inside the encryption; *Previews on the vault…* in an open
+vault). VHS `fullpath` and KJNodes' sigma schedule are no longer passed to the browser for inner nodes.
+
 **Vault outputs when locking with concealment** - "Lock as a vault" no longer refuses a subgraph with no way out:
 
 - A `*` (any-type) output is judged by what really reaches it: it is traced through pass-through nodes (Lazy Switch,

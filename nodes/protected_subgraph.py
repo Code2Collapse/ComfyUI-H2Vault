@@ -24,6 +24,7 @@ import time
 from typing import Any, Optional
 
 from . import concealment
+from . import previews
 from .crypto import VaultError
 
 log = logging.getLogger("h2vault")
@@ -491,6 +492,9 @@ class H2Vault_ProtectedSubgraph:
         _ACTIVE_VAULTS.add(str(unique_id))
         _INNER_TYPES[str(unique_id)] = {k: str(n["class_type"]) for k, n in graph.items()}
         register_redaction(str(unique_id), plain)               # V5: a Locked node's values never reach a message
+        previews.HUB.register(str(unique_id), plain, prefix, api)  # owner 2026-11-23: inner previews show on the vault
+        if not previews.HUB.show(str(unique_id)):
+            previews.HUB.note_hidden_run(str(unique_id))
         if licence_id:                                         # V5: a real run of a Licensed vault (never a cache hit)
             from . import licence
             licence.record_run(licence_id)
@@ -794,11 +798,44 @@ def _sanitize_error(d: dict) -> dict:
     return d
 
 
+_RUNNING: list = [None]                       # the vault whose inside runs now (the last `executing`), else None
+
+
+def _preview_vault(node_id) -> Optional[str]:
+    """The vault a preview is drawn on: an inner id's vault, or a vault id itself (display ids name the vault)."""
+    s = str(node_id) if node_id is not None else ""
+    v = _vault_of(s)
+    return v if v is not None else (s if s in _ACTIVE_VAULTS else None)
+
+
+def _hidden(vault: Optional[str]) -> bool:
+    return vault is not None and not previews.HUB.show(vault)
+
+
+def _vhs_preview_id(data) -> Optional[str]:
+    """VHS / KJNodes animated latent preview (PREVIEW_IMAGE, event 1): >I 1, >I 1, >I index, 16p node id, JPEG.
+    core's own event 1 is >I type + the encoded image."""
+    b = bytes(data[:29])
+    if len(b) < 14 or b[:8] != b"\x00\x00\x00\x01\x00\x00\x00\x01":
+        return None
+    n = b[12]
+    return b[13:13 + n].decode("ascii", "replace") if 0 < n <= 15 else None
+
+
 def _sanitize_binary(event: int, data: Any) -> Any:
-    """Binary websocket events: PREVIEW_IMAGE_WITH_METADATA = (image, metadata dict), TEXT = >I len + node id + text."""
+    """Binary websocket events: PREVIEW_IMAGE_WITH_METADATA = (image, metadata dict), TEXT = >I len + node id + text,
+    UNENCODED_PREVIEW_IMAGE (2, legacy clients) and PREVIEW_IMAGE (1) = drawn on the node that runs. A vault whose
+    author turned its previews off shows none of them (owner 2026-11-23)."""
     if event == 4 and isinstance(data, tuple) and len(data) == 2 and isinstance(data[1], dict):
+        if any(_hidden(_preview_vault(data[1].get(k))) for k in ("node_id", "display_node_id", "real_node_id")):
+            return concealment.DROP
         meta, changed = _deep_map(data[1])
         return (data[0], meta) if changed else data
+    if event == 2:
+        return concealment.DROP if _hidden(_RUNNING[0]) else data
+    if event == 1 and isinstance(data, (bytes, bytearray)):
+        vid = _vhs_preview_id(data)
+        return concealment.DROP if _hidden(_preview_vault(vid) if vid is not None else _RUNNING[0]) else data
     if event == 3 and isinstance(data, (bytes, bytearray)) and len(data) >= 4:
         import struct
         n = struct.unpack(">I", bytes(data[:4]))[0]
@@ -826,38 +863,48 @@ def sanitize_message(event: str, data: Any, track: bool = True) -> Any:
     d = dict(data)
     if event == "execution_start" and track:
         _LAST_INNER.clear()
+        _RUNNING[0] = None
+        previews.HUB.reset_prompt()
         end_redaction_window()
     if event in ("executing", "executed", "progress"):
         node = d.get("node")
         v = _vault_of(node)
-        if event == "executing" and node is not None and track:
-            if v is not None:
+        if event == "executing" and track:
+            if node is not None and v is not None:
                 _LAST_INNER[v] = str(node)
-            elif str(node) in _ACTIVE_VAULTS:
+            elif node is not None and str(node) in _ACTIVE_VAULTS:
                 _LAST_INNER.pop(str(node), None)           # the vault itself starts: nothing inside has run yet
+            _RUNNING[0] = _preview_vault(node) if node is not None else None
         if v is not None:
             d["node"] = v
             if "display_node" in d:
                 d["display_node"] = v
-            if event == "executed" and v in _REDACT and "output" in d:
-                d["output"] = redact(v, d["output"])
+            if event == "executed":
+                # owner 2026-11-23: every inner preview shows on the vault, merged and labelled (nodes/previews.py)
+                out = redact(v, d.get("output")) if v in _REDACT else d.get("output")
+                if not track:
+                    if not previews.HUB.show(v):
+                        return concealment.DROP
+                    d["output"] = out
+                else:
+                    merged = previews.HUB.collect(v, str(node), out)
+                    if merged is concealment.DROP:
+                        return concealment.DROP
+                    d["output"] = merged
+        elif event == "executed" and track and str(node) in _ACTIVE_VAULTS and not previews.is_merged(d.get("output")):
+            replay = previews.HUB.replay(str(node))          # a vault served from core's cache: its last previews
+            if isinstance(replay, dict):
+                d["output"] = replay
     elif event == "execution_cached":
         d["nodes"] = [x for x in (d.get("nodes") or []) if _vault_of(x) is None]
     elif event == "progress_state":
-        nodes_ = {}
-        for k, st in (d.get("nodes") or {}).items():
-            v = _vault_of(k)
-            if v is None:
-                nodes_[k] = st
-            elif v not in nodes_:
-                st = dict(st)
-                st.update({"node_id": v, "display_node_id": v, "real_node_id": v, "parent_node_id": None})
-                nodes_[v] = st
-        d["nodes"] = nodes_
+        d["nodes"] = previews.collapse_progress(d.get("nodes") or {}, _vault_of)
     d, changed = _deep_map(d)                                # any other event (custom packs' telemetry included)
     if changed and event not in ("executing", "executed", "progress", "progress_state", "execution_cached"):
         for k in _DETAIL_KEYS:
             d.pop(k, None)
+    if event not in previews.CORE_EVENTS:                    # live previews of other packs drawn on a vault
+        return previews.filter_custom_event(event, d, lambda x: x in _ACTIVE_VAULTS)
     return d
 
 
@@ -872,11 +919,16 @@ def sanitize_history(result: dict) -> dict:
         if vault is None:
             outputs[k] = v
             continue
+        if not previews.HUB.show(vault):                      # the author turned this vault's previews off
+            continue
         merged = outputs.setdefault(vault, {})
-        v = redact(vault, v)
+        v = previews.history_form([("", redact(vault, v))])
         for key, val in (v or {}).items():
             merged.setdefault(key, [])
             merged[key] = list(merged[key]) + (list(val) if isinstance(val, (list, tuple)) else [val])
+    for vault, groups in previews.HUB.replayed.items():      # vaults served from core's cache in this prompt
+        if not outputs.get(vault):
+            outputs[vault] = previews.history_form(groups)
     out["outputs"] = outputs
     if "meta" in result:
         out["meta"] = {k: v for k, v in (result.get("meta") or {}).items() if _vault_of(k) is None}
@@ -902,6 +954,8 @@ def install_message_filter(server=None) -> bool:
                 data = sanitize_message(event, data)
             except Exception:  # noqa: BLE001 - never break core messaging
                 log.exception("H2Vault: message filter failed")
+            if data is concealment.DROP:                     # a preview the vault's author chose not to show
+                return None
             return _orig(event, data, sid)
 
         server.send_sync = send_sync
@@ -916,6 +970,7 @@ def install_message_filter(server=None) -> bool:
                     history_result = sanitize_history(history_result)
                     if status is not None and getattr(status, "messages", None):
                         msgs = [(e, sanitize_message(e, d, track=False)) for e, d in status.messages]
+                        msgs = [(e, d) for e, d in msgs if d is not concealment.DROP]
                         status = status._replace(messages=msgs) if hasattr(status, "_replace") else status
                 except Exception:  # noqa: BLE001
                     log.exception("H2Vault: history filter failed")
@@ -925,6 +980,8 @@ def install_message_filter(server=None) -> bool:
                     end_redaction_window()                    # V5: the prompt ended
 
             q.task_done = task_done
+        if not previews.install_replay():                    # cached vault runs show their previews again
+            log.info("H2Vault: cached vault runs will not replay their previews (core's executor not found)")
         _installed = True
         return True
     except Exception as exc:  # noqa: BLE001

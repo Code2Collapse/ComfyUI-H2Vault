@@ -310,3 +310,28 @@ runs and stops if one would hand out a model.
   new set (shown once, downloadable). Passkeys need http://localhost:PORT (browsers refuse them on 127.0.0.1).
 - Password boxes no longer trigger the browser's "Save password?" prompt, and a page reload no longer asks again for
   a Locked vault's password.
+
+## Previews from inside show on the vault (2026-11-23)
+
+Lock preview or save nodes inside a vault and their results appear on the vault node when you queue it:
+
+- **Images** (Preview Image, Save Image, any node that shows images): ComfyUI's own image preview on the vault, all of
+  them together (several preview nodes inside = one gallery), in classic and Nodes 2.0.
+- **Videos, audio, text** (VHS Video Combine, Save Video, Save Audio, "show text" nodes): a *Previews from inside*
+  panel on the vault plays and shows them.
+- **Live sampler previews** of a sampler inside the vault, also with KJNodes' **Model Preview Override** (its live
+  frames show in the vault's panel, with the step count).
+- **Progress**: the vault's bar follows the step that runs inside (a sampler's steps).
+- **Cached runs**: when ComfyUI serves the vault from its cache, its previews come back too.
+
+Each preview is labelled **Preview 1, Preview 2, ...** (the inner graph's order) or with a name you give in the lock
+dialog (*Previews › Preview names*) - never with an inner node's name, type or id. The lock dialog has **Show previews
+from inside on the vault** (on by default); off, nothing from inside shows and the vault's card says so. Inside an open
+vault, right-click the canvas › *Previews on the vault…* changes it. The setting and the names are stored inside the
+encryption.
+
+What a preview can say: saved files keep the file name prefix / folder you set (the person who runs the vault sees
+them in their output folder anyway; the dialog warns when a prefix is your own), and a text preview shows its text.
+VHS's server file path is not passed on, nor KJNodes' sigma schedule. Concealed vaults show only the previews their
+author ticked, saved under H2Vault's own neutral file prefix. Kinds the panel cannot show (anything that is not an image, video,
+audio or text) are named by label and counted, never dropped silently.
