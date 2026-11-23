@@ -401,10 +401,11 @@ def forget_run(body: dict) -> dict:
     return {"ok": True}
 
 
-def _authorize(body: dict) -> tuple:
+def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
     """Password -> second factor -> editor list (A18 3.5) -> (plain, k, second factor, None), or (None, None, None,
     error answer) for the answers the dialog handles (enrolment, code reasons, not an editor). A wrong password or a
-    tampered payload raises VaultError (one message for both)."""
+    tampered payload raises VaultError (one message for both). `require_editor=False` only where the author signing
+    key itself is the proof (author-key restore / issue on the author's new computer, review 2026-11-23)."""
     from . import twofactor as vault_2fa, crypto as v2
 
     payload, vault_id = str(body.get("payload") or ""), str(body.get("vault_id") or "")
@@ -427,12 +428,24 @@ def _authorize(body: dict) -> tuple:
         return None, None, None, {"ok": False, "reason": detail["reason"], "error": detail["message"],
                                   **({"next_in": detail["next_in"]} if "next_in" in detail else {})}
     editors = plain.get("editors")
-    if editors and _this_install_code() not in editors:
+    if require_editor and editors and _this_install_code() not in editors:
         return None, None, None, {
             "ok": False, "reason": "not_editor",
             "error": "This installation is not an editor of this vault. Ask its author to add your installation code "
                      "(H2Vault menu > My installation code)."}
     return plain, k, detail["reason"], None
+
+
+def _holds_author_key(p: dict) -> bool:
+    """True when THIS installation stores the signing key of the vault's author (header author_pub). Whoever holds it
+    can sign licences offline anyway, so the editor list adds no protection for licence actions - a restored key on
+    the author's new computer must be usable without first becoming an editor."""
+    from . import licence as L
+    try:
+        priv = L.author_private_key(create=False)
+        return bool(priv) and L.ed25519_public(priv) == p.get("author_pub")
+    except Exception:  # noqa: BLE001 - no key / unreadable store = not the author here
+        return False
 
 
 def open_for_edit(body: dict) -> dict:
@@ -847,7 +860,7 @@ def licence_issue(body: dict) -> dict:
     install_pub = vault_keys.parse_public_text(str(body.get("install_code") or ""))
     now = int(time.time())
     terms = _licence_terms(body, now)
-    plain, _k, _factor, refused = _authorize(body)
+    plain, _k, _factor, refused = _authorize(body, require_editor=not _holds_author_key(p))
     if refused:
         return refused
     author_priv = _author_for(p)
@@ -925,7 +938,7 @@ def author_export(body: dict) -> dict:
     file_password = str(body.get("file_password") or "")
     if len(file_password) < 8:                                 # checked before the password: never a counted guess
         raise _BadRequest("Choose a password of at least 8 characters for the backup.")
-    _plain, _k, _factor, refused = _authorize(body)
+    _plain, _k, _factor, refused = _authorize(body, require_editor=not _holds_author_key(p))
     if refused:
         return refused
     _author_for(p)
@@ -942,7 +955,9 @@ def author_import(body: dict) -> dict:
     if p["mode"] != v2.MODE_SEALED_LICENSED:
         raise _BadRequest(NOT_LICENSED)
     file_password = str(body.get("file_password") or "")
-    _plain, _k, _factor, refused = _authorize(body)
+    # restore on the author's NEW computer: that installation is not an editor yet; the backup must still be this
+    # vault's author key (checked below), with the vault password + authenticator + the backup's own password
+    _plain, _k, _factor, refused = _authorize(body, require_editor=False)
     if refused:
         return refused
     priv = L.read_author_file(body.get("file"), file_password)
