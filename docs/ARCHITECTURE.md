@@ -90,6 +90,7 @@ nodes/
   workflow_encrypt.py    encrypted workflow files + key store     <- __init__
   local_guard.py         loopback-page check                      <- routes, workflow_encrypt
   licence.py             V5 offline licences (Ed25519, install wraps), stores, author key   <- routes, protected_subgraph
+  previews.py            inner previews -> the vault (merge, labels, author setting, cached replay)   <- protected_subgraph, concealment, routes
 web/js/
   _h2v_ui.js             dialog kit + CSS (h2v-)                  <- the two below
   _h2v_protect_tx.js     protect transaction                     <- h2vault_vault.js
@@ -99,6 +100,9 @@ web/js/
   h2vault_workflow.js    encrypted files (extension "H2Vault.WorkflowEncrypt")
   _h2v_lockparams.js     V5 Lock parameters: lockable rows, the lock request (pure)
   _h2v_licence.js        V5 licence UI: terms, status lines, honour-system note (pure)
+  h2vault_previews.js    the vault's 'Previews from inside' panel (extension "H2Vault.Previews")
+  _h2v_previews_core.js  preview panel plan + 'Preview N' numbering (pure)
+  _h2v_previews_ui.js    the author's preview setting (lock dialog, open vault)
 tests/                   pytest (comfy_env python) + node --test for the .mjs
 ```
 
@@ -243,3 +247,19 @@ header, a licence slot = the data key under the licence key); `licence.py` signs
 runs; `protected_subgraph.open_licensed` -> `licence.best_for_run`: the newest licence that opens this copy decides
 (no fall-back to an older one). Licences stop casual sharing; one licence key per vault is shared by its licensees,
 so they are not copy protection. Author key backup / restore need a Licensed vault's password + authenticator.
+
+## Previews from inside a vault (2026-11-23)
+
+`nodes/previews.py`. Every `executed` ui output of an inner node is collected per vault and per run (`HUB.register` at
+expansion, `HUB.collect` in both message filters: protected_subgraph for ordinary vaults, concealment for the declared
+previews of a concealed vault) and sent to the vault id as ONE merged output: core's `images` (still / animated images,
+drawn by core's own preview in both renderers) + `h2v_previews` (every item with its public label: the author's or
+"Preview N" in `order_of(api)` order; files without VHS's `fullpath`; never a top-level `filename`, so the frontend's
+result-item parsers skip it). `web/js/h2vault_previews.js` renders videos / audio / text and KJNodes'
+`kj_preview_override` frames (whose `node_id` is the display id = the vault; the sigma schedule is stripped).
+Live b_preview metadata already names the vault (display id + `_deep_map`). progress_state collapses per vault onto
+the running inner step (`collapse_progress`). Cached runs: core sends the vault's own `executed` with `output: null`;
+`install_replay` wraps `execution.execute` to note the vault's input-signature cache key (core's internal
+`cache_key_set.get_data_key`, read-only, guarded) and the filter replays the previews stored under that key (history
+too). The author's `previews: {show, labels}` lives inside the encryption; off = every inner executed / binary preview /
+custom preview event naming the vault is dropped (progress stays), and only the bit `previews_off` is public on the node.

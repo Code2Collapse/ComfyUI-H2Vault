@@ -1097,6 +1097,10 @@ class Concealer:
         if event == "progress_state":
             if not self.rules["progress_state"]:
                 return data
+            pv = _previews_module()
+            if pv is not None:                                  # one entry per vault, with the running step
+                d["nodes"] = pv.collapse_progress(d.get("nodes") or {}, self.vault_of)
+                return d
             nodes_ = {}
             synth = {}
             for k, st in (d.get("nodes") or {}).items():
@@ -1122,7 +1126,10 @@ class Concealer:
                 return DROP
             d["node"] = v
             d["display_node"] = v
-            d["output"] = self._reduce_ui(d.get("output"))
+            merged = _collect_preview(v, str(node), self._reduce_ui(d.get("output")), live)
+            if merged is None:
+                return DROP
+            d["output"] = merged
             return d
         if event == "execution_cached":
             if self.rules["execution_cached"]:
@@ -1147,7 +1154,7 @@ class Concealer:
             if vault is None:
                 outputs[k] = v
                 continue
-            if str(k) not in self._vaults[vault]["previews"]:
+            if str(k) not in self._vaults[vault]["previews"] or not _preview_shown(vault):
                 continue
             merged = outputs.setdefault(vault, {})
             for key, entries in self._reduce_ui(v).items():
@@ -1196,6 +1203,32 @@ class Concealer:
 
 
 CONCEALER = Concealer()
+
+
+def _previews_module():
+    """nodes/previews.py when this module is part of the package (a copy loaded by file path, in tests, has none)."""
+    try:
+        from . import previews
+        return previews
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _preview_shown(vault_id) -> bool:
+    pv = _previews_module()
+    return True if pv is None else pv.HUB.show(vault_id)
+
+
+def _collect_preview(vault_id, inner_id, output, live: bool):
+    """A declared preview of a concealed vault -> the vault's merged previews (owner 2026-11-23), or None when the
+    author turned previews off. Without the preview hub: the reduced output as before."""
+    pv = _previews_module()
+    if pv is None:
+        return output
+    if not live:
+        return output if pv.HUB.show(vault_id) else None
+    merged = pv.HUB.collect(vault_id, inner_id, output)
+    return None if type(merged).__name__ == "_Drop" else merged
 
 
 # ── V8: zero-information guards that do not depend on a websocket message ────────────────────────────────────

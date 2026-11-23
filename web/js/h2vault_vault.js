@@ -27,6 +27,8 @@ import { EXPIRY_CHOICES, HONOUR_NOTE, fmtDate, ledgerState, licenceLine, licence
 // second-factor methods (owner 2026-11-23): authenticator, passkey, backup password, recovery codes - per vault
 import { METHOD_LABELS, factorErrorText } from "./_h2v_factor.js";
 import { factorPicker, policyEditor, secondFactorDialog } from "./_h2v_factor_ui.js";
+// previews from inside shown on the vault (owner 2026-11-23); the panel itself: h2vault_previews.js
+import { previewItems, previewSection } from "./_h2v_previews_ui.js";
 
 const VAULT_TYPES = new Set(["H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput"]);
 const PACK_AUX_ID = "Code2Collapse/ComfyUI-H2Vault";
@@ -339,8 +341,9 @@ function updateStatusCard(node) {
   const n = info.interface?.concealed ? 0 : (Number(info.node_count) || 0);     // V3: a concealed vault hides it
   const lockInfo = whitelistLock(info.lock);
   const nLocked = lockInfo ? (Number(info.lock?.count) || lockInfo.rows.length) : 0;
-  const detail = lockInfo ? `${nLocked} value${nLocked === 1 ? "" : "s"} locked`
-    : n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph";
+  const detail = (lockInfo ? `${nLocked} value${nLocked === 1 ? "" : "s"} locked`
+    : n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph") +
+    (info.previews_off ? " · previews from inside off (author's choice)" : "");
   if (!vid) {
     card.update({ tone: "warn", title: "Empty vault", detail: "Lock a selection to fill it",
       meta: "Right-click nodes › Protect with H2Vault" });
@@ -679,7 +682,8 @@ async function protectTransaction(nodes, opts) {
           recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui: exportUi(sg),
           outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
           ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.lock ? { lock: opts.lock } : {}),
-          ...(opts.secondFactor ? { second_factor: { methods: opts.secondFactor } } : {}), });
+          ...(opts.secondFactor ? { second_factor: { methods: opts.secondFactor } } : {}),
+          ...(opts.previews ? { previews: opts.previews } : {}), });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
         built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
@@ -691,7 +695,7 @@ async function protectTransaction(nodes, opts) {
         if (!vault) throw new ProtectError("VAULT_NODE_INSERTION", `${type} is not registered (is the pack loaded?).`);
         vault.properties = { ...(vault.properties || {}), h2vault: { interface: publicInterface(built), profile: res.profile,
           node_count: res.node_count, title: sg.title, vault_id: res.vault_id, outputs_node: !!built.outputsNode,
-          input_map: built.inputMap || null,
+          input_map: built.inputMap || null, ...(res.previews === false ? { previews_off: true } : {}),
           ...(res.public_lock ? { lock: lockPublic(res.public_lock), lock_node: opts.lock?.node ?? null } : {}) } };
         vault.widgets.find((w) => w.name === "vault_id").value = res.vault_id;
         vault.widgets.find((w) => w.name === "vault_payload").value = res.payload;
@@ -752,7 +756,8 @@ async function protectSubgraphNode(sg, opts) {
   const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
     recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui,
     outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
-          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.secondFactor ? { second_factor: { methods: opts.secondFactor } } : {}), });
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.secondFactor ? { second_factor: { methods: opts.secondFactor } } : {}),
+    ...(opts.previews ? { previews: opts.previews } : {}), });
   if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
   const v = makeVaultNode(sg.graph, r.data, built, sg);
   removeDefinitionIfUnused(sg);
@@ -767,7 +772,7 @@ function makeVaultNode(graph, res, built, replace) {
   built.public = serverPublic(res);                        // V3: a concealed vault publishes the server's whitelist
   v.properties = { ...(v.properties || {}), h2vault: { interface: publicInterface(built), profile: res.profile,
     node_count: res.node_count, title: replace?.title, vault_id: res.vault_id, outputs_node: !!built.outputsNode,
-    input_map: built.inputMap || null,
+    input_map: built.inputMap || null, ...(res.previews === false ? { previews_off: true } : {}),
     ...(res.public_lock ? { lock: lockPublic(res.public_lock), lock_node: res.lock_node ?? null } : {}) } };
   v.widgets.find((w) => w.name === "vault_id").value = res.vault_id;
   v.widgets.find((w) => w.name === "vault_payload").value = res.payload;
@@ -874,6 +879,8 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
   }
   const sfChoice = secondFactorChoice();                    // second-factor methods (owner 2026-11-23)
   d.body.append(vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), sfChoice.el, others.el);
+  const pvSec = previewSection({ items: exposure?.previewItems || [], nestedNote: !!exposure?.nestedPreviews });
+  d.body.append(pvSec.el);
   // V3: "Conceal models and nodes" -> the "Choose what to expose" step (docs/h2vault/V3_concealment_design.md)
   let step = null, refusedNotice = false;
   const stepHost = vel("div");
@@ -948,7 +955,7 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, conceal, downloads, dropOutputs, secondFactor: sf.methods,
+        title: name.input.value, conceal, downloads, dropOutputs, secondFactor: sf.methods, previews: pvSec.value(),
         onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
@@ -1179,7 +1186,7 @@ async function enterOpened(v, res, payload) {
   }
   OPEN.set(sg, { token: res.edit_token, vaultId: v.widgets.find((w) => w.name === "vault_id").value, payload,
     profile: res.profile, info: { ...vaultInfo(v) }, title: v.title, graph, extraParams,
-    conceal: res.conceal ?? null, removeConceal: false });
+    conceal: res.conceal ?? null, removeConceal: false, previews: res.previews ?? null, previewsChanged: false });
   app.canvas.openSubgraph?.(sg.subgraph, sg);
   LOG("opened", sg.id);
 }
@@ -1191,7 +1198,8 @@ async function lockOpened(sg, sess) {
   try {
     const built = await buildApi(sg, sess.extraParams);
     const r = await post("/h2vault/vault/commit", { edit_token: sess.token, api: built.api, ui: exportUi(sg),
-      interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}) });
+      interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}),
+      ...(sess.previewsChanged ? { previews: sess.previews } : {}) });
     if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
     OPEN.delete(sg);
     makeVaultNode(sg.graph, { ...r.data, node_count: r.data.node_count, lock_node: sess.info?.lock_node ?? null },
@@ -1369,14 +1377,15 @@ async function snapshotOpen() {
     for (const [sg, sess] of OPEN) {
       const built = await buildApi(sg, sess.extraParams);
       const r = await post("/h2vault/vault/snapshot", { edit_token: sess.token, api: built.api, ui: exportUi(sg),
-        interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}) });
+        interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}),
+        ...(sess.previewsChanged ? { previews: sess.previews } : {}) });
       if (!r.ok) throw new Error(r.data.error || "Could not encrypt the open vault for this run.");
       sess.payload = r.data.payload;
       built.public = serverPublic(r.data);                 // V3 (see publicInterface)
       sess.built = built;
       sess.payloadHash = undefined;
       sess.info = { ...sess.info, interface: publicInterface(built), outputs_node: built.outputsNode,
-        node_count: r.data.node_count };
+        node_count: r.data.node_count, previews_off: r.data.previews === false };
     }
   } finally { SNAPPING = false; }
 }
@@ -1501,6 +1510,30 @@ async function lockSelection(canvas, profileHint, items = null) {
   return vault;
 }
 
+/** Owner 2026-11-23: an editor of an open vault changes what it shows from inside; sent when the vault is locked
+ *  again (commit / snapshot `previews`). */
+function previewMenuItems(sg, sess) {
+  return [null, { content: "Previews on the vault…", callback: () => previewSettingsDialog(sg, sess) }];
+}
+
+async function previewSettingsDialog(sg, sess) {
+  const defOf = (type) => globalThis.LiteGraph?.registered_node_types?.[type]?.nodeData ?? null;
+  const nodes = [...(sg.subgraph?.nodes || sg.subgraph?._nodes || [])];
+  const d = vaultDialog({ title: "Previews on the vault", width: 560,
+    subtitle: "What the vault node shows from inside when it runs. Saved when you leave the vault." });
+  const sec = previewSection({ items: previewItems(nodes, { defOf }), value: sess.previews,
+    nestedNote: nodes.some((n) => isSubgraphNode(n)) });
+  d.body.append(sec.el);
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  d.addAction("Keep", { primary: true, onClick: () => d.close(sec.value()) });
+  const v = await d.result;
+  if (!v) return;
+  sess.previews = v;
+  sess.previewsChanged = true;
+  toast(v.show ? "Previews from inside will show on the vault." : "Previews from inside are turned off for this vault.",
+    "info", "Previews");
+}
+
 /** V3 (lead decision 3): an editor of an open concealed vault may remove the concealment - after confirming. The
  *  removal happens when the vault is locked again (commit / snapshot send `conceal: null`). */
 function concealMenuItems(sess) {
@@ -1588,6 +1621,8 @@ function exposureOf(r, boundary) {
   return {
     controls: inventory(nodes, { defOf, promoted: sg ? promotedValues(sg) : null }), sockets,
     previews: previewsOf(nodes, { defOf }),
+    previewItems: previewItems(nodes, { defOf }),
+    nestedPreviews: nodes.some((n) => isSubgraphNode(n)),
     models: modelFilesOf(nodes),
     check: async (conceal) => {
       const c = cand();
@@ -2566,7 +2601,7 @@ app.registerExtension({
   getCanvasMenuItems(canvas) {
     const items = [...lockMenuItems(selectedItemsOf(canvas)), ...groupMenuItems(canvas)];
     for (const [sg, sess] of OPEN) {                    // V3: inside an open concealed vault
-      if (sg.subgraph === canvas?.graph) items.push(...concealMenuItems(sess));
+      if (sg.subgraph === canvas?.graph) items.push(...concealMenuItems(sess), ...previewMenuItems(sg, sess));
     }
     return items;
   },
