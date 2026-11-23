@@ -266,3 +266,12 @@ A wildcard (*) output, for example from a switch node, no longer blocks locking 
 real model output (also custom ones like SeC) is caught and named. Every problem sits on its output row with a fix:
 remove the output, show it as its real type, or lock without concealment. The vault also checks output values when it
 runs and stops if one would hand out a model.
+
+## Second factor: your choice per vault, no save-password prompts (2026-11-23)
+
+- Pick which methods may open a vault for editing: authenticator app, passkey / security key / Windows Hello, backup
+  password, and recovery codes (always accepted as the fallback). Old vaults keep the authenticator + recovery codes.
+- Recovery codes can be entered wherever the second factor is asked; the dialog says how many are left and makes a
+  new set (shown once, downloadable). Passkeys need http://localhost:PORT (browsers refuse them on 127.0.0.1).
+- Password boxes no longer trigger the browser's "Save password?" prompt, and a page reload no longer asks again for
+  a Locked vault's password.
