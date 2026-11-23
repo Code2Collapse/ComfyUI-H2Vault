@@ -343,7 +343,7 @@ function updateStatusCard(node) {
   const nLocked = lockInfo ? (Number(info.lock?.count) || lockInfo.rows.length) : 0;
   const detail = (lockInfo ? `${nLocked} value${nLocked === 1 ? "" : "s"} locked`
     : n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph") +
-    (info.previews_off ? " · previews from inside off (author's choice)" : "");
+    (info.previews_off ? " · previews off" : "");     // the author turned previews from inside off
   if (!vid) {
     card.update({ tone: "warn", title: "Empty vault", detail: "Lock a selection to fill it",
       meta: "Right-click nodes › Protect with H2Vault" });
