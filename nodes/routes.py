@@ -188,6 +188,22 @@ def _expose(api, interface, conceal):
 
 # ── V5: Lock parameters (a one-node vault drawn like its node; design 5) ─────────────────────────────────────────
 LOCK_TITLE_MAX = 80
+LOCK_NEUTRAL_TITLE = "Locked node"
+
+
+def _names_kind(title: str, class_type) -> bool:
+    """V8: does a Locked node's title name the node's kind (its class id or display name)? Then it is not published
+    unless the author chose to show the kind."""
+    t = str(title or "").strip().lower()
+    if not t or not isinstance(class_type, str):
+        return False
+    kinds = {class_type}
+    try:
+        import nodes as core_nodes
+        kinds.add(str(getattr(core_nodes, "NODE_DISPLAY_NAME_MAPPINGS", {}).get(class_type) or ""))
+    except Exception:  # noqa: BLE001 - outside ComfyUI: the class id alone
+        pass
+    return any(k and len(k.strip()) >= 3 and k.strip().lower() in t for k in kinds)
 _COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 
@@ -226,6 +242,8 @@ def _with_lock(plain: dict, lock, *, strict: bool = True) -> Optional[dict]:
         for key in ("color", "bgcolor"):
             c = look_in.get(key)
             look[key] = c if isinstance(c, str) and _COLOR.match(c) else None
+        if not look["node_label"] and _names_kind(look["title"], nodes_[node_id].get("class_type")):
+            look["title"] = LOCK_NEUTRAL_TITLE          # V8: an un-renamed node's title IS its kind ("Load Checkpoint")
         # owner 2026-11-23 ("0 information"): the setting names and the node's kind are published only when the
         # author asks for it; otherwise the node shows its title and how many values are locked
         public = {"rows": list(rows) if look["show_rows"] else [], "count": len(rows), "look": look}

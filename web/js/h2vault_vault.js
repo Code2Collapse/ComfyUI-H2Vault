@@ -1878,7 +1878,15 @@ async function lockNodeParameters(node, locked, opts) {
   const req = lockRequest(node, nodeDefOf(node.type), locked);
   if (!req.lock.rows.length) throw new ProtectError("SELECTION_VALIDATION", `"${node.title}" has no value left to lock.`);
   req.lock.look.show_rows = !!opts.showRows;
-  if (!opts.showKind) req.lock.look.node_label = null;
+  if (!opts.showKind) {
+    const kind = req.lock.look.node_label;
+    req.lock.look.node_label = null;
+    // V8: an un-renamed node's title IS its kind ("Load Checkpoint"); without "show the kind" it is not published
+    const t = String(req.lock.look.title || "").trim().toLowerCase();
+    if ([kind, node.type].some((k) => k && String(k).trim().length >= 3 && t.includes(String(k).trim().toLowerCase()))) {
+      req.lock.look.title = "Locked node";
+    }
+  }
   if (typeof opts.title === "string" && opts.title.trim()) req.lock.look.title = opts.title.trim().slice(0, 80);
   const vault = await protectTransaction([node], { profile: opts.profile, password: opts.password,
     recipients: opts.recipients || [], editors: [], title: req.lock.look.title, lock: req.lock,

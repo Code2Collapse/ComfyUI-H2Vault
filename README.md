@@ -121,7 +121,7 @@ Right-click a node (or a selection, or a group) > **Lock parameters...**. Each n
 colours and sockets; the values you tick are encrypted inside it, the ones you leave open stay editable. By default
 every value is locked, and the node shows only its title and *3 values locked* - tick *Show the names of the locked
 settings* or *Show what kind of node each one is* only if others may see them (otherwise even an error names only the
-vault). Underneath, a Locked node is a one-node vault, so it uses the same profiles (Sealed, Licensed, Locked), runs on
+vault, and a node whose title is still its kind - "Load Checkpoint" - is shown as *Locked node*). Underneath, a Locked node is a one-node vault, so it uses the same profiles (Sealed, Licensed, Locked), runs on
 ComfyUI's own scheduler and keeps its values out of the workflow file, PNG metadata, the queue and history. While it
 runs, its locked values are blanked (`•••`) in error messages, progress text, text outputs and the server log. Nodes
 locked together share their password: one prompt per browser tab unlocks the set. Right-click > **Unlock parameters
