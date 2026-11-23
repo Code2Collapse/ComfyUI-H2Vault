@@ -7,6 +7,9 @@
 - Log files ComfyUI writes itself (`--verbose LEVEL FILE`) get `[H2Vault] concealed output` for lines written inside a concealed vault, like the console and the log panel.
 - Model lists (`/object_info`, `/models`, `/experiment/models`, `/embeddings`, `/api/assets`) never show the hash-named model copies a vault downloaded; their safetensors metadata and previews are not served.
 - Installing a vault's missing extensions never repeats git's error text or a folder path (both name the extension).
+- A warning core prints while it prepares an inner node of a concealed vault (for example a missing file found while checking whether the node changed) becomes `[H2Vault] concealed output` too.
+- A plain vault that reuses the node id of an earlier concealed vault is no longer half-treated as concealed.
+- Lock parameters: without *Show what kind of node*, a node whose title is still its kind ("Load Checkpoint") is shown as *Locked node*.
 
 ## 0.2.0 - 2026-11-23
 
