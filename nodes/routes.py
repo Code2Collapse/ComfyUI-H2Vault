@@ -214,10 +214,14 @@ def protect(body: dict) -> dict:
     plain = {"exec": boundary_exec(interface), "api": api, "ui": body.get("ui"), "interface": interface,
              "editors": editors, "profile": profile, "packs": vault_packs.record_safely(api),          # L9.50
              "created": int(time.time())}
-    if body.get("models"):                                  # V7: model downloads, kept INSIDE the encryption
+    if body.get("models") or body.get("downloads"):         # V7: model downloads, kept INSIDE the encryption
         from . import provision
         try:
-            plain["models"] = provision.validate_manifest(body.get("models"))
+            manifest = provision.validate_manifest(body.get("models") or [])
+            known = {e["file"] for e in manifest}
+            manifest += [e for e in provision.describe_downloads(body.get("downloads") or []) if e["file"] not in known]
+            if manifest:
+                plain["models"] = manifest
         except provision.ProvisionError as exc:
             raise VaultError(str(exc)) from None
     public = _with_conceal(plain, body.get("conceal"))
@@ -677,7 +681,7 @@ def register_routes(server) -> None:
                 return web.json_response({"ok": False, "error": str(exc)}, status=429)
         return handler
 
-    routes.post("/h2vault/vault/protect")(wrap(protect, 400))
+    routes.post("/h2vault/vault/protect")(wrap(protect, 400, offload=True))   # V7: hashing model files is slow
     routes.post("/h2vault/vault/conceal/check")(wrap(conceal_check, 400))
     routes.post("/h2vault/vault/protect/abort")(wrap(protect_abort))
     routes.post("/h2vault/vault/unlock_run")(wrap(unlock_run, offload=True))

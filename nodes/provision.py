@@ -271,3 +271,43 @@ def cancel(token: str) -> None:
         job = _JOBS.get(token)
     if job is not None:
         job["cancel"] = True
+
+
+# ── author side: the author gives links; size and SHA-256 come from the author's own files ─────────────────
+
+def _find_local(file: str):
+    """(folder, full path) of a model file on THIS (the author's) machine, searching ComfyUI's model folders."""
+    import folder_paths
+    names = getattr(folder_paths, "folder_names_and_paths", {}) or {}
+    for folder in names:
+        if folder in ("custom_nodes", "configs"):
+            continue
+        try:
+            if file in (folder_paths.get_filename_list(folder) or []):
+                full = folder_paths.get_full_path(folder, file)
+                if full:
+                    return folder, Path(full)
+        except Exception:  # noqa: BLE001 - one odd folder never blocks the others
+            continue
+    return None, None
+
+
+def describe_downloads(links) -> list:
+    """[{file, url}] from the protect dialog -> validated manifest entries (empty links are skipped)."""
+    out = []
+    for item in links or []:
+        file, url = str((item or {}).get("file") or ""), str((item or {}).get("url") or "").strip()
+        if not url:
+            continue
+        if not url.lower().startswith("https://"):
+            raise ProvisionError("Download links must use HTTPS (start with https://).")
+        check_url(url)
+        folder, full = _find_local(file)
+        if full is None:
+            raise ProvisionError(f"The model file {file!r} was not found in this ComfyUI's model folders.")
+        h = hashlib.sha256()
+        with open(full, "rb") as fh:
+            for chunk in iter(lambda: fh.read(CHUNK), b""):
+                h.update(chunk)
+        out.append({"folder": folder, "file": file, "url": url, "sha256": h.hexdigest(), "size": full.stat().st_size})
+    return validate_manifest(out)

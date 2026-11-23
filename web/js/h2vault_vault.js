@@ -562,7 +562,8 @@ async function protectTransaction(nodes, opts) {
       ["ENCRYPTION_AND_SEALING", async () => {
         const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
           recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui: exportUi(sg),
-          outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}) });
+          outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}) });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
         built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
@@ -633,7 +634,8 @@ async function protectSubgraphNode(sg, opts) {
   const ui = exportUi(sg);
   const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
     recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui,
-    outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}) });
+    outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}) });
   if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
   const v = makeVaultNode(sg.graph, r.data, built, sg);
   removeDefinitionIfUnused(sg);
@@ -765,6 +767,22 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
       text: "The recipient sees only the controls you choose - never model, node or custom-node names." })]), stepHost);
     exposure.on = () => concealSw.checked();
   }
+  // V7: "Downloads for people who run it" - one HTTPS link per model file; kept inside the encryption
+  const links = [];
+  if (exposure?.models?.length) {
+    const dl = disclosure(`Downloads for people who run it (optional, ${exposure.models.length} model file` +
+      `${exposure.models.length === 1 ? "" : "s"})`);
+    dl.body.append(vel("p", { class: "h2v-dim", text: "Give a download link (https://) for each model file. When " +
+      "someone runs this vault on a ComfyUI without the file, it downloads by itself under a private name and is " +
+      "checked against your file. The links and file names stay inside the vault." }));
+    for (const file of exposure.models) {
+      const f = textField({ label: file, value: "", maxLength: 2000, hint: "" });
+      f.input.placeholder = "https://...";
+      links.push({ file, input: f.input });
+      dl.body.append(f.el);
+    }
+    d.body.append(dl.el);
+  }
   render();
   d.status(PROTECT_FOOT);
   d.addAction("Cancel", { onClick: () => d.close(null) });
@@ -783,11 +801,14 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
       }
       conceal = r.conceal;
     }
-    d.setBusy(true, "Locking…");
+    const downloads = links.map((l) => ({ file: l.file, url: l.input.value.trim() })).filter((l) => l.url);
+    const badLink = downloads.find((l) => !/^https:\/\//i.test(l.url));
+    if (badLink) { d.notice("danger", "Download links must start with https://."); return; }
+    d.setBusy(true, downloads.length ? "Locking (checking model files)…" : "Locking…");
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, conceal,
+        title: name.input.value, conceal, downloads,
         onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
@@ -1328,6 +1349,23 @@ async function confirmRemoveConceal(sess) {
 
 /** V3: what the "Choose what to expose" step offers for this selection (the nodes about to be locked, or the inside
  *  of the subgraph), and how it asks the server to check a choice (same rules as sealing). */
+// V7: model files the selection uses (widget values that look like model files) - offered in the protect dialog so
+// the author can give a download link for each; size and SHA-256 are computed on the author's machine at lock time.
+const MODEL_EXT = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx|pkl|pb|engine)$/i;
+function modelFilesOf(nodes) {
+  const seen = new Set();
+  const walk = (list) => {
+    for (const n of list || []) {
+      for (const w of n.widgets || []) {
+        if (typeof w.value === "string" && MODEL_EXT.test(w.value) && !w.value.includes("..")) seen.add(w.value);
+      }
+      if (n.subgraph) walk(n.subgraph.nodes || n.subgraph._nodes);
+    }
+  };
+  walk(nodes);
+  return [...seen].sort();
+}
+
 function exposureOf(r, boundary) {
   const defOf = (type) => globalThis.LiteGraph?.registered_node_types?.[type]?.nodeData ?? null;
   const sg = r.kind === "subgraph" ? r.nodes[0] : null;
@@ -1337,6 +1375,7 @@ function exposureOf(r, boundary) {
   return {
     controls: inventory(nodes, { defOf, promoted: sg ? promotedValues(sg) : null }), sockets,
     previews: previewsOf(nodes, { defOf }),
+    models: modelFilesOf(nodes),
     check: async (conceal) => {
       const c = cand();
       const res = await post("/h2vault/vault/conceal/check", { api: c.api, interface: c.interface, ui: c.ui, conceal });

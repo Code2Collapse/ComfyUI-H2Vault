@@ -107,8 +107,9 @@ resumable, capped at the declared size and checked against the SHA-256 before us
 the commits pinned inside the vault (they are code: ComfyUI needs a restart). Setting *H2Vault > Run > Install what a
 vault needs*: Install automatically (default) / Ask first / Never.
 
-Today the download list is given to H2Vault's protect route (`models`: folder, file, url, sha256, size); the
-author's dialog for it is the next release. Someone watching the machine's network or disk can still see download
+**For authors:** the protect dialog lists the model files your selection uses under *Downloads for people who run
+it*; paste an https:// link for each. H2Vault reads the size and SHA-256 from your own copy when it locks the vault.
+Someone watching the machine's network or disk can still see download
 hosts and sizes, and a public model can be recognised by its hash.
 
 ## Encrypted workflow files
