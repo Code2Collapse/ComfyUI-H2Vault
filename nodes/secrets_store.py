@@ -111,6 +111,64 @@ def _kr_index_save(idx: dict) -> None:
         log.warning("keyring index save failed: %s", type(exc).__name__)
 
 
+# Windows Credential Manager keeps at most 2560 bytes per entry (UTF-16: ~1280 characters); several passkeys or a long
+# record did not fit (2026-11-23). A longer value is stored in pieces: the entry itself holds a marker with the piece
+# count, the pieces sit under "<name>#h2vc<i>". Short values are stored exactly as before (old stores keep working).
+_KR_PIECE = 1000
+_KR_MARK = "~h2v-pieces~:"           # printable: a Windows credential string must not start with a NUL
+
+
+def _kr_piece_name(name: str, i: int) -> str:
+    return f"{name}#h2vc{i}"
+
+
+def _kr_pieces(service: str, name: str) -> int:
+    try:
+        raw = _KR.get_password(service, name)
+    except Exception:  # noqa: BLE001
+        return 0
+    if raw and raw.startswith(_KR_MARK):
+        try:
+            return max(0, int(raw[len(_KR_MARK):]))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _kr_drop_pieces(service: str, name: str, keep: int = 0) -> None:
+    for i in range(keep, _kr_pieces(service, name)):
+        try:
+            _KR.delete_password(service, _kr_piece_name(name, i))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _kr_set(service: str, name: str, value: str) -> None:
+    if len(value) <= _KR_PIECE:
+        _kr_drop_pieces(service, name)
+        _KR.set_password(service, name, value)
+        return
+    parts = [value[i:i + _KR_PIECE] for i in range(0, len(value), _KR_PIECE)]
+    _kr_drop_pieces(service, name, keep=len(parts))
+    for i, part in enumerate(parts):
+        _KR.set_password(service, _kr_piece_name(name, i), part)
+    _KR.set_password(service, name, f"{_KR_MARK}{len(parts)}")      # written last: a crash leaves the old value
+
+
+def _kr_get(service: str, name: str):
+    raw = _KR.get_password(service, name)
+    if not raw or not raw.startswith(_KR_MARK):
+        return raw
+    parts = []
+    for i in range(_kr_pieces(service, name)):
+        part = _KR.get_password(service, _kr_piece_name(name, i))
+        if part is None:
+            log.warning("secret %s is incomplete (a piece is missing)", name)
+            return None
+        parts.append(part)
+    return "".join(parts)
+
+
 # ── encrypted file ──────────────────────────────────────────────────────────────────────────────────────────────
 def _read_or_create_passphrase() -> bytes:
     env = os.environ.get("H2VAULT_SECRETS_PASSPHRASE")
@@ -168,7 +226,7 @@ def get(scope: str, name: str) -> Optional[str]:
     with _LOCK:
         if _BACKEND == "keyring":
             try:
-                return _KR.get_password(_kr_service(scope), name)
+                return _kr_get(_kr_service(scope), name)
             except Exception as exc:  # noqa: BLE001
                 log.warning("secret %s/%s could not be read: %s", scope, name, type(exc).__name__)
                 return None
@@ -191,7 +249,7 @@ def set_(scope: str, name: str, value: str) -> None:
         raise ValueError("value too large (max 64 KiB)")
     with _LOCK:
         if _BACKEND == "keyring":
-            _KR.set_password(_kr_service(scope), name, value)
+            _kr_set(_kr_service(scope), name, value)
             idx = _kr_index_load()
             idx[scope] = sorted(set(idx.get(scope, [])) | {name})
             _kr_index_save(idx)
@@ -211,6 +269,7 @@ def delete(scope: str, name: str) -> bool:
     with _LOCK:
         if _BACKEND == "keyring":
             try:
+                _kr_drop_pieces(_kr_service(scope), name)
                 _KR.delete_password(_kr_service(scope), name)
                 ok = True
             except Exception:  # noqa: BLE001
