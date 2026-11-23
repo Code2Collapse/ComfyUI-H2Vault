@@ -194,12 +194,30 @@ def check(p: dict) -> Optional[str]:
     if u.scheme == "file" and os.environ.get(_TEST_ALLOW_FILE) == "1":
         pass
     elif u.scheme != "https" or (u.hostname or "").lower() not in ALLOWED_HOSTS:
-        return f"a pack is not on a known git host over https ({u.hostname or url[:30]}) - ask the vault's author"
+        # V8: only the host (already shown by design), never a piece of the URL - its path names the pack
+        return (f"a pack is not on a known git host over https ({u.hostname or 'unrecognised address'}) - ask the "
+                "vault's author")
     if not _SHA.match(commit):
         return "a pack has no pinned commit - ask the vault's author"
     if not _NAME.match(folder_name(url)):
         return "a pack's folder name is not safe"
     return None
+
+
+CLONE_REASONS = ("the repository or commit was not found", "the git host could not be reached",
+                 "the git host asked for credentials", "git failed")
+
+
+def clone_failure_reason(git_output: str) -> str:
+    """git's own error text names the repository URL (= the pack); the answer is one of CLONE_REASONS only (V8)."""
+    t = (git_output or "").lower()
+    if "not found" in t or "did not match any" in t or "unknown revision" in t or "reference is not a tree" in t:
+        return CLONE_REASONS[0]
+    if "could not resolve host" in t or "unable to access" in t or "timed out" in t or "connection" in t:
+        return CLONE_REASONS[1]
+    if "authentication" in t or "terminal prompts disabled" in t or "username" in t:
+        return CLONE_REASONS[2]
+    return CLONE_REASONS[3]
 
 
 # ── installing ──────────────────────────────────────────────────────────────────────────────────────────────
@@ -260,13 +278,16 @@ def install(want: list, custom_nodes_dir: Path) -> dict[str, Any]:
             if r.returncode == 0:
                 r = _git(["checkout", "--quiet", "--detach", p["commit"]], cwd=dest)
             if r.returncode != 0:
-                raise RuntimeError((r.stderr or r.stdout or "git failed").strip().splitlines()[-1][:200])
+                raise RuntimeError(clone_failure_reason(r.stderr or r.stdout or ""))
         except Exception as exc:  # noqa: BLE001 - only the folder this call created is removed
             try:
                 _remove_new_folder(dest)
             except OSError as rm_exc:
-                failed.append(f"a half-cloned folder could not be removed ({rm_exc.strerror or rm_exc})")
-            failed.append(f"a pack could not be cloned ({type(exc).__name__}: {str(exc)[:160]})")
+                # V8: strerror only - str(OSError) carries the folder path, i.e. the pack's name
+                failed.append("a half-cloned folder could not be removed "
+                              f"({rm_exc.strerror or 'operating system error'})")
+            why = str(exc) if isinstance(exc, RuntimeError) and str(exc) in CLONE_REASONS else type(exc).__name__
+            failed.append(f"a pack could not be cloned ({why})")
             continue
         installed += 1
         reqs += _requirements(dest)

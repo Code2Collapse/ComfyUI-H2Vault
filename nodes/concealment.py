@@ -16,6 +16,8 @@ Interface (everything else here is implementation):
     public_node_type(vault_id, inner_type)
     install(server) / uninstall()                                           server adapters
     hosted_enabled() / hosted_middleware()                                  Hosted profile guard
+    metadata_guard / WindowLogFilter / hash_folder_middleware               V8 zero-information guards (every
+                                                                            vault / every profile; install() wires them)
 
 The honest limit (design section 7): code in the same process, the server's filesystem and the model files on disk
 are out of reach of any filter. Concealment protects against the workflow's recipient using the ComfyUI UI / API.
@@ -446,10 +448,13 @@ def _send_phase(data: dict) -> None:
 
 
 def after_expansion(vault_id, plain, graph: dict, prefix: str, *, concealer: "Optional[Concealer]" = None) -> dict:
-    """Post-process the expansion of a concealed vault and register it, so the filters can attribute its ids."""
-    if not is_concealed(plain):
-        return graph
+    """Post-process the expansion of a concealed vault and register it, so the filters can attribute its ids.
+    A vault that is not concealed is only noted (V8: its inner outputs carry no prompt / workflow metadata either);
+    its graph is returned unchanged."""
     c = concealer or CONCEALER
+    if not is_concealed(plain):
+        c.register_plain(str(vault_id), set(graph) if isinstance(graph, dict) else ())
+        return graph
     g = copy.deepcopy(graph)
     for node in g.values():
         if not isinstance(node, dict):
@@ -481,6 +486,7 @@ class Concealer:
         self.rules = {r: True for r in RULE_NAMES}
         self._lock = threading.RLock()
         self._vaults: "OrderedDict[str, dict]" = OrderedDict()     # vault id -> {inner, previews, terms}
+        self._plain: "OrderedDict[str, set]" = OrderedDict()       # V8: vaults that are not concealed -> inner ids
         self._active: set = set()
         self._window: Optional[str] = None
         self._last_executing: Optional[str] = None
@@ -492,13 +498,24 @@ class Concealer:
         with self._lock:
             self._vaults.pop(vault_id, None)
             inner = set(map(str, inner_ids))
+            phase_map = {str(k): str(v) for k, v in (phases or {}).items()}
+            # V8: steps count distinct functional labels, never inner nodes (a node count is graph structure)
             self._vaults[vault_id] = {"inner": inner, "previews": set(map(str, preview_ids)),
                                       "low_terms": sorted({t.lower() for t in terms}, key=len, reverse=True),
-                                      "phases": {str(k): str(v) for k, v in (phases or {}).items()},
-                                      "started": [], "total": len(inner)}
+                                      "phases": phase_map, "started": [], "seen": [], "last_label": None,
+                                      "total": max(1, len(set(phase_map.values())))}
             while len(self._vaults) > MAX_VAULTS:
                 self._vaults.popitem(last=False)
             self._active.add(vault_id)
+
+    def register_plain(self, vault_id: str, inner_ids: Iterable[str]) -> None:
+        """V8: a vault that is not concealed. Only the metadata guard uses this (its inner outputs embed no prompt /
+        workflow); the message filters leave such a vault to the A18 rules of protected_subgraph."""
+        with self._lock:
+            self._plain.pop(vault_id, None)
+            self._plain[vault_id] = set(map(str, inner_ids))
+            while len(self._plain) > MAX_VAULTS:
+                self._plain.popitem(last=False)
 
     def is_concealed_vault(self, vault_id: str) -> bool:
         return vault_id in self._vaults
@@ -506,19 +523,32 @@ class Concealer:
     def any_registered(self) -> bool:
         return bool(self._vaults)
 
-    def vault_of(self, node_id) -> Optional[str]:
-        """Structural attribution: the vault whose expansion made this id (or an expansion inside it)."""
+    @staticmethod
+    def _lookup(table: dict, node_id, inner_of: Callable[[Any], set]) -> Optional[str]:
         if not isinstance(node_id, str) or "." not in node_id:
             return None
         best = None
-        for v, info in self._vaults.items():
+        for v, info in table.items():
             if not node_id.startswith(v + "."):
                 continue
-            inner = info["inner"]
+            inner = inner_of(info)
             hit = node_id in inner or any(node_id.startswith(i + ".") for i in inner)
             if hit and (best is None or len(v) < len(best)):
-                best = v                                     # the outermost concealed vault wins
+                best = v                                     # the outermost vault wins
         return best
+
+    def vault_of(self, node_id) -> Optional[str]:
+        """Structural attribution: the concealed vault whose expansion made this id (or an expansion inside it)."""
+        return self._lookup(self._vaults, node_id, lambda info: info["inner"])
+
+    def protected_vault_of(self, node_id) -> Optional[str]:
+        """Any vault (concealed or not) whose expansion made this id."""
+        v = self.vault_of(node_id)
+        if v is not None:
+            return v
+        with self._lock:
+            plain = dict(self._plain)
+        return self._lookup(plain, node_id, lambda inner: inner)
 
     def on_node_start(self, node_id) -> None:
         event = None
@@ -530,10 +560,19 @@ class Concealer:
                 key = next((i for i in info["inner"] if nid == i or nid.startswith(i + ".")), nid)
                 if key not in info["started"]:
                     info["started"].append(key)
-                    event = {"vault": self._window, "label": info["phases"].get(key, "Processing"),
-                             "step": len(info["started"]), "total": max(info["total"], len(info["started"]))}
+                label = info["phases"].get(key, "Processing")
+                if label != info["last_label"]:            # one event per change of label, not per node
+                    info["last_label"] = label
+                    if label not in info["seen"]:
+                        info["seen"].append(label)
+                    event = {"vault": self._window, "label": label, "step": len(info["seen"]),
+                             "total": max(info["total"], len(info["seen"]))}
         if event is not None:
             _send_phase(event)
+
+    def current_label(self, vault_id) -> Optional[str]:
+        info = self._vaults.get(str(vault_id))
+        return info.get("last_label") if info else None
 
     def end_prompt(self) -> None:
         with self._lock:
@@ -613,6 +652,9 @@ class Concealer:
                 msg = MSG_MISSING
             else:
                 msg = MSG_FAILED
+            label = self.current_label(v)                   # V8: the functional label of the failing step only
+            if label:
+                msg = f"{msg} (failed step: {label})"
             d.update({"exception_type": CONCEALED_EXCEPTION_TYPE, "exception_message": msg, "traceback": [],
                       "current_inputs": {}, "current_outputs": []})
         else:
@@ -775,6 +817,146 @@ class Concealer:
 CONCEALER = Concealer()
 
 
+# ── V8: zero-information guards that do not depend on a websocket message ────────────────────────────────────
+
+_METADATA_HIDDEN = {"PROMPT": {}, "EXTRA_PNGINFO": None}       # V1 hidden type -> what an inner node receives
+_METADATA_HIDDEN_V3 = {"prompt": {}, "extra_pnginfo": None}     # io.Hidden member name -> the same
+
+
+def strip_metadata(class_def, result):
+    """core `get_input_data` result for a node INSIDE a vault -> the same without the prompt / workflow that save and
+    preview nodes embed in their files (PNG text chunks, video metadata). Every other value is untouched."""
+    if not isinstance(result, tuple) or not result:
+        return result
+    input_data_all = result[0]
+    try:
+        hidden = class_def.INPUT_TYPES().get("hidden") or {}
+    except Exception:  # noqa: BLE001 - a V3 node's hidden inputs are in v3_data below
+        hidden = {}
+    if isinstance(input_data_all, dict) and isinstance(hidden, dict):
+        for name, kind in hidden.items():
+            if kind in _METADATA_HIDDEN and name in input_data_all:
+                input_data_all[name] = [copy.copy(_METADATA_HIDDEN[kind])]
+    if len(result) >= 3 and isinstance(result[2], dict):
+        h3 = result[2].get("hidden_inputs")
+        if isinstance(h3, dict):
+            for k in list(h3):
+                name = str(getattr(k, "name", k))
+                if name in _METADATA_HIDDEN_V3:
+                    h3[k] = copy.copy(_METADATA_HIDDEN_V3[name])
+    return result
+
+
+def metadata_guard(orig, *, concealer: "Optional[Concealer]" = None):
+    """Wrap core `execution.get_input_data`: a node inside any vault gets no prompt / workflow to embed. Fails
+    CLOSED: if the strip itself fails, the node does not run (an inner save would otherwise write the metadata)."""
+    c = concealer or CONCEALER
+
+    def get_input_data(inputs, class_def, unique_id, *a, **k):
+        result = orig(inputs, class_def, unique_id, *a, **k)
+        if c.protected_vault_of(None if unique_id is None else str(unique_id)) is None:
+            return result
+        try:
+            return strip_metadata(class_def, result)
+        except Exception:  # noqa: BLE001
+            raise RuntimeError("H2Vault could not withhold a protected step's file metadata, so the step did not "
+                               "run.") from None
+
+    get_input_data.__h2vault_guard__ = True
+    return get_input_data
+
+
+class WindowLogFilter(logging.Filter):
+    """V8: a logging filter for handlers that write formatted records directly (core `--verbose LEVEL FILE` file
+    logs, any other root handler): inside a Concealed Window a record becomes the concealed marker, without its
+    arguments or traceback. Outside the window nothing is touched (no oracle)."""
+
+    def __init__(self, concealer: "Optional[Concealer]" = None):
+        super().__init__("h2vault.window")
+        self.c = concealer or CONCEALER
+
+    def filter(self, record):
+        try:
+            if self.c.window is not None and self.c.rules.get("logs", True):
+                record.msg, record.args = CONCEALED_LOG_LINE, None
+                record.exc_info = record.exc_text = record.stack_info = None
+        except Exception:  # noqa: BLE001 - never break logging
+            pass
+        return True
+
+
+_HASH_NAME_RE = re.compile(r"^h2v[\\/]")                  # provision.HASH_DIR: V7 hash-named model copies
+_HASH_SCRUB_EXACT = {"/object_info", "/embeddings", "/api/assets"}
+_HASH_SCRUB_PREFIX = ("/object_info/", "/models/", "/experiment/models/")
+_HASH_NAME_KEYS = ("name", "loader_path", "filename", "path")
+
+
+def _is_hash_name(s) -> bool:
+    return isinstance(s, str) and bool(_HASH_NAME_RE.match(s))
+
+
+def scrub_hash_names(obj):
+    """Drop every V7 hash-named model file (``h2v/<sha256 prefix>.<ext>``) from a JSON listing: a SHA-256 prefix is
+    a public lookup key (model sites search by hash), so the name alone would identify a vault's model. -> (new, n
+    removed)."""
+    removed = 0
+
+    def walk(o):
+        nonlocal removed
+        if isinstance(o, list):
+            out = []
+            for x in o:
+                if _is_hash_name(x) or (isinstance(x, dict) and any(_is_hash_name(x.get(k)) for k in _HASH_NAME_KEYS)):
+                    removed += 1
+                    continue
+                out.append(walk(x))
+            return out
+        if isinstance(o, dict):
+            return {k: walk(v) for k, v in o.items() if not _is_hash_name(v)}
+        return o
+
+    new = walk(obj)
+    return new, removed
+
+
+def hash_folder_middleware():
+    """aiohttp middleware (every profile, not only Hosted): model listings never show the hash-named copies a vault
+    downloaded, and their safetensors metadata / previews are not served. Vault runs are unaffected - the server
+    resolves those names itself."""
+    from aiohttp import web
+    import json as _json
+
+    def not_found():
+        return web.json_response({"error": "Not found."}, status=404)
+
+    @web.middleware
+    async def h2vault_hash_folder_guard(request, handler):
+        if request.method != "GET":
+            return await handler(request)
+        path = request.path
+        p = path[4:] if path.startswith("/api/") and not path.startswith("/api/assets") else path
+        if p.startswith("/view_metadata/") and _is_hash_name(request.query.get("filename", "")):
+            return not_found()
+        if p.startswith("/experiment/models/preview/") and re.search(r"/\d+/h2v[\\/]", p):
+            return not_found()
+        resp = await handler(request)
+        if not (p in _HASH_SCRUB_EXACT or p.startswith(_HASH_SCRUB_PREFIX)):
+            return resp
+        body = getattr(resp, "body", None)
+        if not isinstance(body, (bytes, bytearray)) or not (b'"h2v/' in body or b'"h2v\\\\' in body):
+            return resp
+        try:
+            data = _json.loads(bytes(body))
+        except Exception:  # noqa: BLE001 - not JSON: nothing this guard understands, refuse rather than leak
+            return not_found()
+        data, removed = scrub_hash_names(data)
+        if isinstance(data, dict) and isinstance(data.get("total"), int):
+            data["total"] = max(0, data["total"] - removed)
+        return web.json_response(data, status=resp.status)
+
+    return h2vault_hash_folder_guard
+
+
 # ── server adapters ─────────────────────────────────────────────────────────────────────────────────────────
 
 _INSTALL: dict = {}
@@ -870,8 +1052,33 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("H2Vault concealment: no log interceptor (log concealment off): %s", exc)
 
+    # V8: handlers that format records themselves (core's --verbose LEVEL FILE log files, any other root handler)
+    flt = WindowLogFilter(c)
+    handlers = [h for h in logging.getLogger().handlers
+                if not any(isinstance(f, WindowLogFilter) for f in h.filters)]
+    for h in handlers:
+        h.addFilter(flt)
+    _INSTALL["log_filters"] = (flt, handlers)
+
+    # V8: nodes inside a vault embed no prompt / workflow in the files they write
+    try:
+        import execution as core_execution
+        orig_gid = core_execution.get_input_data
+        if not getattr(orig_gid, "__h2vault_guard__", False):
+            core_execution.get_input_data = metadata_guard(orig_gid, concealer=c)
+            _INSTALL["metadata"] = (core_execution, orig_gid)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("H2Vault: output metadata guard not installed (outputs made inside a vault may embed the "
+                    "workflow): %s", exc)
+
+    app = getattr(server, "app", None)
+    if app is not None:
+        try:
+            app.middlewares.append(hash_folder_middleware())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("H2Vault: model-listing guard not attached (downloaded vault models may be listed): %s", exc)
+
     if hosted_enabled():
-        app = getattr(server, "app", None)
         try:
             app.middlewares.append(hosted_middleware())
             log.info("H2Vault hosted mode: model lists, logs and model routes are withheld from every client")
@@ -896,6 +1103,13 @@ def uninstall() -> None:
             del s.write
         except AttributeError:
             pass
+    if "log_filters" in _INSTALL:
+        flt, handlers = _INSTALL["log_filters"]
+        for h in handlers:
+            h.removeFilter(flt)
+    if "metadata" in _INSTALL:
+        mod, orig = _INSTALL["metadata"]
+        mod.get_input_data = orig
     _INSTALL.clear()
 
 
