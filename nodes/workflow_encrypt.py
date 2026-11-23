@@ -138,10 +138,11 @@ def _aad(kdf: dict, salt_b64: str) -> bytes:
     return _canon({MARKER: 1, "scheme": SCHEME_PASSWORD, "kdf": kdf, "salt": salt_b64})
 
 
-def encrypt_fernet(workflow: dict) -> tuple[str, dict]:
-    """-> (key, wrapper). The key exists only in the return value."""
+def encrypt_fernet(workflow: dict, key: Optional[str] = None) -> tuple[str, dict]:
+    """-> (key, wrapper). The key exists only in the return value. `key` = save again with a key already in use (V5
+    "same key": only ever a key remembered in this installation's secrets store, never one sent by a page)."""
     from cryptography.fernet import Fernet
-    key = Fernet.generate_key()
+    key = key.encode("ascii") if key else Fernet.generate_key()
     token = Fernet(key).encrypt(_workflow_bytes(workflow)).decode("ascii")
     return key.decode("ascii"), {MARKER: 1, "scheme": SCHEME_FERNET, "token": token, "fingerprint": fingerprint(token),
                                  "note": NOTE}
@@ -290,6 +291,15 @@ def encrypt(body: dict) -> dict:
     if scheme == SCHEME_PASSWORD:
         file = encrypt_password(workflow, str(body.get("password") or ""))
         return {"ok": True, "file": file, "fingerprint": file["fingerprint"], "remembered": False}
+    same = body.get("same_key_of")
+    if same:                                   # V5: save again with the key of the file this tab opened
+        old = lookup(_check_fp(same))
+        if not old:
+            raise NeedsSecret("The key of the file you opened is not remembered on this installation, so it cannot be "
+                              "reused. Save with a new key instead.", "key")
+        _key, file = encrypt_fernet(workflow, old)
+        remember(file["fingerprint"], old, str(body.get("label") or ""))
+        return {"ok": True, "file": file, "fingerprint": file["fingerprint"], "remembered": True, "key_reused": True}
     key, file = encrypt_fernet(workflow)
     remembered = False
     if body.get("remember", True):
@@ -314,7 +324,8 @@ def decrypt(body: dict) -> dict:
                 _note_failure(fp)
             raise
         _clear(fp)
-        return {"ok": True, "workflow": workflow, "scheme": SCHEME_PASSWORD, "used_remembered": False}
+        return {"ok": True, "workflow": workflow, "scheme": SCHEME_PASSWORD, "used_remembered": False,
+                "fingerprint": fp}
     key = str(body.get("key") or "").strip()
     used_remembered = False
     if not key:
@@ -328,7 +339,7 @@ def decrypt(body: dict) -> dict:
         remember(fp, key, str(body.get("label") or ""))
         remembered = True
     return {"ok": True, "workflow": workflow, "scheme": SCHEME_FERNET, "used_remembered": used_remembered,
-            "remembered": remembered}
+            "remembered": remembered, "fingerprint": fp}
 
 
 def keys_list(_body: dict) -> dict:

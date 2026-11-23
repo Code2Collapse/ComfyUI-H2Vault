@@ -53,3 +53,14 @@ This product includes software from the following projects. Their notices are ke
 3. QR Code generator library (Python)
    https://github.com/nayuki/QR-Code-generator - nodes/_vendor/qrcodegen.py, unchanged
    Copyright (c) Project Nayuki. MIT License (the full notice is at the top of the file).
+
+-------------------------------------------------------------------------------------------------------------------
+4. Ideas only - no code or text was copied
+   ComfyUI-NodeEncrypt (lvqunx, https://github.com/lvqunx/ComfyUI-NodeEncrypt, commit d3b2f08): locking a node's
+   parameters in place from the node, group and multi-selection menus. (Its README and pyproject say MIT, but the
+   repository has no licence file, so nothing was taken from it.)
+   ComfyUI-XLJworkflowCipher (weiqing1987, https://github.com/weiqing1987/ComfyUI-XLJworkflowCipher, commit fae2cae; no
+   licence): per-recipient access keys with an expiry and a creator's overview of the keys issued.
+   H2Vault's implementations are independent: Locked nodes are one-node vaults on H2Vault's own engine
+   (web/js/_h2v_lockparams.js); licences are offline, Ed25519-signed and bound to an installation key
+   (nodes/licence.py, web/js/_h2v_licence.js).

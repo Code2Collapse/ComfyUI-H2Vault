@@ -112,6 +112,40 @@ it*; paste an https:// link for each. H2Vault reads the size and SHA-256 from yo
 Someone watching the machine's network or disk can still see download
 hosts and sizes, and a public model can be recognised by its hash.
 
+## Lock parameters: keep a node, hide its values
+
+Right-click a node (or a selection, or a group) > **Lock parameters...**. Each node stays where it is, with its title,
+colours and sockets; the values you tick are encrypted inside it, the ones you leave open stay editable. By default
+every value is locked, and the node shows only its title and *3 values locked* - tick *Show the names of the locked
+settings* or *Show what kind of node each one is* only if others may see them (otherwise even an error names only the
+vault). Underneath, a Locked node is a one-node vault, so it uses the same profiles (Sealed, Licensed, Locked), runs on
+ComfyUI's own scheduler and keeps its values out of the workflow file, PNG metadata, the queue and history. While it
+runs, its locked values are blanked (`•••`) in error messages, progress text, text outputs and the server log. Nodes
+locked together share their password: one prompt per browser tab unlocks the set. Right-click > **Unlock parameters
+(remove protection)...** (password + authenticator) puts the original node back for good.
+
+![Lock parameters](docs/media/lock_parameters.png)
+
+## Licences: one workflow for everyone, one licence per installation
+
+Protect with **Licensed - one licence per installation**. Share the workflow as widely as you like: it runs only on
+installations you send a licence to (yours gets one automatically). Each person sends you their installation code
+(right-click a vault > My installation code); right-click the vault > **Issue a licence...** (password +
+authenticator) gives a short `h2vl1:` text or a `.h2vlicence` file - valid until a date and/or for a number of runs,
+if you like. They add it with right-click > **Add licence...**; the vault node then shows *Licensed on this
+installation* with the end date and the runs left. **Revoke licences (new licence key)...** re-seals the vault and
+re-issues licences to the people you tick; **H2Vault > Licences issued** lists everything you issued; **Back up my
+author key** keeps the key that signs your licences (without it you cannot issue licences for workflows you already
+shared). Nothing is sent anywhere: there is no licence server.
+
+| What a licence guarantees | How |
+|---|---|
+| Without a licence for their installation, nobody can run or read the workflow | The vault's data key is wrapped only under its licence key; the licence key travels only inside licences, wrapped to one installation's own X25519 key |
+| A licence works on one installation and for one workflow only | That installation's private key is needed to unwrap it; the licence names the workflow |
+| Only you can issue licences | Ed25519 signature checked against your author key, which is bound into the vault (authenticated, cannot be swapped) |
+| After *Revoke licences*, the new copy refuses the old licences | A new licence key |
+| **Honour-system only:** end dates, run limits, the clock check, newest licence wins | Kept by the unmodified H2Vault on the other person's computer. Someone who has already run the workflow and changes software on their own machine can ignore them, and can keep running a copy they already hold. For limits that are truly enforced, run the vault on your own server (Hosted mode). |
+
 ## Encrypted workflow files
 
 - **H2Vault > Save workflow encrypted...**: choose **A key** (a random key, shown once - copy it or save it as a file;
@@ -125,8 +159,15 @@ hosts and sizes, and a public model can be recognised by its hash.
 ![The key, shown once](docs/media/workflow_key_dialog.png)
 
 - **H2Vault > Remembered workflow keys...** lists the remembered keys by name (never the key) and forgets them.
+- **H2Vault > Save workflow encrypted again (same key)**: after editing a workflow you opened from an encrypted file,
+  save it with the same key (only a key this installation remembers; it never travels to the page) or password, so
+  the people who have the key can open the new file too.
 
 Once opened, the workflow is an ordinary workflow again. Protect the parts that must stay hidden with a vault.
+**Images are not covered:** ComfyUI writes the workflow and the prompt into every PNG it saves, so images rendered
+from a decrypted workflow carry it in readable form. Keep a pipeline out of images by protecting its nodes as a vault
+(a vault's inside never reaches image metadata), or start ComfyUI with `--disable-metadata`. While a decrypted
+workflow is open, the ComfyUI front end keeps a draft of it in this browser's storage.
 
 ## What it protects, and what it does not (for a CTO)
 
@@ -136,7 +177,10 @@ Once opened, the workflow is an ordinary workflow again. Protect the parts that 
 | Opening a vault for editing | Password + TOTP second factor (RFC 6238, codes single-use, 8 recovery codes) + the vault's editor list. 5 wrong passwords lock that vault for 5 minutes; one key derivation at a time. |
 | Workflow JSON, PNG metadata, history, logs, the queued prompt | The vault node carries only the encrypted payload and its public sockets / controls. Server messages about inner nodes are rewritten to the vault; errors keep the inner node type and the message, never values or tracebacks. |
 | Local secrets (install key, TOTP secret, remembered keys) | OS credential store (keyring) or an encrypted file in `ComfyUI/user/h2vault/`. Never in a workflow, log or git. |
-| Routes that set up the second factor, manage remembered keys or install custom nodes | Answer only the ComfyUI page on the same machine (loopback peer + loopback Host + no cross-site request). |
+| Routes that set up the second factor, manage remembered keys, licences or the author key, or install custom nodes | Answer only the ComfyUI page on the same machine (loopback peer + loopback Host + no cross-site request). |
+| Licences (Licensed profile) | Ed25519-signed, offline, bound to one installation's X25519 key; the vault opens only with a licence key unwrapped there. End dates and run limits are honour-system (see *Licences*). |
+| Locked nodes | One-node vaults: values only in the ciphertext; blanked in messages and the log while they run. |
+| Passwords typed on a remote page over plain http | Every password field warns that the password travels unencrypted (use an SSH tunnel or https). |
 
 Honest limits: a machine that runs a vault has to decrypt its inside to run it, so someone who controls that machine
 (memory, a debugger, a modified ComfyUI) can read it. A Locked vault can be decrypted by anyone with its password. A

@@ -88,6 +88,7 @@ nodes/
   routes.py              /h2vault/vault/*, /h2vault/2fa/*         <- __init__
   workflow_encrypt.py    encrypted workflow files + key store     <- __init__
   local_guard.py         loopback-page check                      <- routes, workflow_encrypt
+  licence.py             V5 offline licences (Ed25519, install wraps), stores, author key   <- routes, protected_subgraph
 web/js/
   _h2v_ui.js             dialog kit + CSS (h2v-)                  <- the two below
   _h2v_protect_tx.js     protect transaction                     <- h2vault_vault.js
@@ -95,6 +96,8 @@ web/js/
   _h2v_rebind.js         Nodes 2.0 DOM-widget rebind (extension "H2Vault.VueDomRebind")
   h2vault_vault.js       vault front end (extension "H2Vault.Vault")
   h2vault_workflow.js    encrypted files (extension "H2Vault.WorkflowEncrypt")
+  _h2v_lockparams.js     V5 Lock parameters: lockable rows, the lock request (pure)
+  _h2v_licence.js        V5 licence UI: terms, status lines, honour-system note (pure)
 tests/                   pytest (comfy_env python) + node --test for the .mjs
 ```
 
@@ -205,3 +208,12 @@ registry id is the install folder, case included, and permanent after the first 
 git clone, ComfyUI-Manager and comfy-cli installs give the same folder), `[tool.comfy] PublisherId = "code2collapse"`,
 `DisplayName = "ComfyUI-H2Vault"`. JS never hard-codes `/extensions/ComfyUI-H2Vault/` (relative imports only).
 Publishing is the lead's / owner's decision.
+
+## V5 (0.2.0): Lock parameters and offline licences
+
+Design and threat model: workspace `docs/h2vault/V5_enhancements_design.md`. A Locked node is a one-node vault with a
+`lock` section in its plaintext (`routes._with_lock`; public part = title, colours, count, and the setting names / node
+kind only when the author publishes them); `protected_subgraph.register_redaction` blanks its values in messages and the
+log while its prompt runs. Licensed vaults are envelope version 2 / mode 3 (`crypto.py`: author Ed25519 key in the
+header, a licence slot = the data key under the licence key); `licence.py` signs, verifies, stores licences and counts
+runs; `protected_subgraph.open_licensed` tries the stored licences newest first until one opens this copy.

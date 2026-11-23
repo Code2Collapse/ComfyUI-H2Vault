@@ -60,6 +60,9 @@ NEEDS_LICENCE = ("This workflow needs a licence from its author for this install
                  "code (right-click the vault > My installation code), then add the licence they send you (right-click "
                  "the vault > Add licence...).")
 NEWER_STORED = "A newer licence for this workflow is already installed."
+OTHER_VERSION = ("The licences on this installation are for another copy of this workflow (its author has since "
+                 "renewed its licence key). Ask the author for a licence for this copy, or use the copy they sent "
+                 "with your licence.")
 CLOCK_BACK = ("Your computer's clock is earlier than the last time this workflow ran. Correct the clock and try "
               "again.")
 WRONG_FILE_PASSWORD = "Wrong password, or the file was changed."
@@ -363,6 +366,23 @@ def record_run(lid: str, now: Optional[float] = None) -> dict:
         if last is None or now > last:
             _ss().set_(SCOPE_CLOCK, "last_seen", str(now))
     return u
+
+
+def candidates(vault_id: str, *, author_pub: bytes, install_pub: bytes) -> list:
+    """The stored licences that verify for this vault and installation, newest issued first."""
+    valid = []
+    for t in stored(vault_id):
+        try:
+            valid.append(verify(parse(t), author_pub=author_pub, vault_id=vault_id, install_pub=install_pub))
+        except LicenceError:
+            continue
+    return sorted(valid, key=lambda m: m["issued"], reverse=True)
+
+
+def policy(lic: dict, now: Optional[float] = None) -> Optional[str]:
+    """check_policy with this installation's stored usage and clock."""
+    now = float(now if now is not None else time.time())
+    return check_policy(lic, now=now, used_runs=usage(lic["lid"])["runs"], last_seen=clock_last_seen())
 
 
 def best_for_run(vault_id: str, *, author_pub: bytes, install_pub: bytes,

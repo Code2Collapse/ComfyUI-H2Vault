@@ -115,9 +115,10 @@ def open_for_run(payload: str, vault_id: str, client_id: Optional[str] = None) -
     return _open_for_run(payload, vault_id, client_id)[0]
 
 
-def _open_licensed(payload: str, vault_id: str) -> tuple:
-    """V5 Licensed vault: the newest licence stored on this installation that verifies and may run now. -> (plain,
-    licence id). Every refusal is the plain-English text of nodes/licence.py."""
+def open_licensed(payload: str, vault_id: str) -> tuple:
+    """V5 Licensed vault: the newest licence stored on this installation that verifies, may run now and opens THIS copy
+    (after a licence-key rotation an installation can hold licences for the old and the new copy). -> (plain,
+    licence). Every refusal is the plain-English text of nodes/licence.py. Never counts a run."""
     from . import crypto as v2, keys as vault_keys, licence
 
     priv = vault_keys.install_private_key(create=False)
@@ -125,14 +126,25 @@ def _open_licensed(payload: str, vault_id: str) -> tuple:
         raise VaultError(licence.NEEDS_LICENCE)
     pub = vault_keys.install_public_key()
     author_pub = v2.parse(payload)["author_pub"]
-    lic, problem = licence.best_for_run(vault_id, author_pub=author_pub, install_pub=pub)
-    if problem:
-        raise VaultError(problem)
-    try:
-        lk = licence.unwrap(lic, priv)
-    except licence.LicenceError as exc:
-        raise VaultError(str(exc)) from None
-    return v2.open_with_licence_key(payload, lk, vault_id=vault_id), lic["lid"]
+    cands = licence.candidates(vault_id, author_pub=author_pub, install_pub=pub)
+    if not cands:
+        raise VaultError(licence.NEEDS_LICENCE)
+    problem = None
+    for lic in cands:
+        p = licence.policy(lic)
+        if p:
+            problem = problem or p
+            continue
+        try:
+            return v2.open_with_licence_key(payload, licence.unwrap(lic, priv), vault_id=vault_id), lic
+        except (licence.LicenceError, VaultError):
+            continue                                       # a licence for another copy of this vault
+    raise VaultError(problem or licence.OTHER_VERSION)
+
+
+def _open_licensed(payload: str, vault_id: str) -> tuple:
+    plain, lic = open_licensed(payload, vault_id)
+    return plain, lic["lid"]
 
 
 def _open_for_run(payload: str, vault_id: str, client_id: Optional[str] = None) -> tuple:
@@ -515,7 +527,14 @@ def _redact_terms(plain: dict) -> list:
     return terms
 
 
+_HIDE_TYPE: set = set()             # Locked nodes whose author did not publish the node's kind
+
+
 def register_redaction(vault_id: str, plain: dict) -> None:
+    lock = plain.get("lock") if isinstance(plain, dict) else None
+    if isinstance(lock, dict):
+        look = lock.get("look") if isinstance(lock.get("look"), dict) else {}
+        (_HIDE_TYPE.discard if look.get("node_label") else _HIDE_TYPE.add)(str(vault_id))
     terms = _redact_terms(plain)
     if not terms:
         return
@@ -625,6 +644,8 @@ def public_node_type(vault_id: str, inner_type: Optional[str]) -> Optional[str]:
     """What an error may say about the inner node that failed (docs/ARCHITECTURE.md s7: the V3 concealment seam).
     The class type for an ordinary vault (the A18 rule "type + message, no values"); a neutral label for a concealed
     one (V3, nodes/concealment.py)."""
+    if str(vault_id) in _HIDE_TYPE:                          # V5: a Locked node that does not show its kind
+        return _VAULT_CLASSES[0]
     return concealment.public_node_type(vault_id, inner_type)
 
 

@@ -8,12 +8,12 @@ export const HONOUR_NOTE = "Expiry dates and run limits are kept by H2Vault on t
   "bypassed: without a licence for their installation the workflow does not run at all.";
 
 export const EXPIRY_CHOICES = Object.freeze([
-  { id: "none", label: "No end date" },
-  { id: "7", label: "7 days" },
-  { id: "30", label: "30 days" },
-  { id: "90", label: "90 days" },
-  { id: "365", label: "1 year" },
-  { id: "date", label: "Until a date…" },
+  { value: "none", label: "No end date" },
+  { value: "7", label: "7 days" },
+  { value: "30", label: "30 days" },
+  { value: "90", label: "90 days" },
+  { value: "365", label: "1 year" },
+  { value: "date", label: "Until a date…" },
 ]);
 
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
@@ -27,7 +27,7 @@ export function fmtDate(unix) {
 
 /**
  * The terms for /h2vault/licence/issue from the dialog's raw values.
- * choice: an EXPIRY_CHOICES id; date: "YYYY-MM-DD" (end of that day, UTC); runs: "" or a whole number.
+ * choice: an EXPIRY_CHOICES value; date: "YYYY-MM-DD" (end of that day, UTC); runs: "" or a whole number.
  * -> {ok: true, terms: {exp_days?|exp?, runs}} | {ok: false, error}
  */
 export function licenceTerms({ choice = "none", date = "", runs = "" } = {}, nowMs = Date.now()) {

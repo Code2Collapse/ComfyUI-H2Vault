@@ -69,6 +69,16 @@ function pickFile(accept) {
   });
 }
 
+// V5 (design 7.5): an encrypted FILE does not keep a pipeline out of images - ComfyUI writes the workflow and the
+// prompt into every PNG it saves (core SaveImage, unless ComfyUI runs with --disable-metadata)
+const METADATA_NOTE = "This protects the file. Images you render from it contain the workflow in readable form " +
+  "(ComfyUI writes it into every PNG). To keep a pipeline out of images, protect its nodes as a vault, or start " +
+  "ComfyUI with --disable-metadata.";
+
+// V5 (design 7.3): the encrypted file this tab opened last, to save it again with the same key. Fingerprint + scheme
+// only: the key itself stays in the server's secrets store (only a remembered key can be reused).
+let LAST_OPENED = null;
+
 // ── save ────────────────────────────────────────────────────────────────────────────────────────────────────────
 async function saveEncrypted() {
   let workflow;
@@ -99,7 +109,7 @@ async function saveEncrypted() {
     keyBox.style.display = scheme === "fernet" ? "" : "none";
     pwBox.style.display = scheme === "fernet" ? "none" : "";
   }
-  d.body.append(name.el, choice.el, keyBox, pwBox);
+  d.body.append(name.el, choice.el, keyBox, pwBox, noticeEl("info", METADATA_NOTE));
   render();
   d.status("The decrypted workflow is plain again once opened: protect the parts you want hidden with a vault.");
   d.addAction("Cancel", { onClick: () => d.close(null) });
@@ -123,6 +133,49 @@ async function saveEncrypted() {
   download(`${out.fileName}.h2vault.json`, JSON.stringify(out.file, null, 1));
   if (out.key) await showKeyOnce(out);
   else toast(`Saved "${out.fileName}.h2vault.json". It opens with the password you chose.`, "success", "Encrypted");
+}
+
+/** V5: save the workflow again with the key (or password) of the encrypted file this tab opened. */
+async function saveSameKey() {
+  if (!LAST_OPENED) {
+    toast("Open an encrypted workflow first; then this saves it again with the same key.", "warn");
+    return;
+  }
+  let workflow;
+  try { workflow = (await app.graphToPrompt())?.workflow; } catch (e) {
+    toast(`Could not read the workflow: ${e?.message || e}`, "error");
+    return;
+  }
+  const fileName = safeName(LAST_OPENED.name || activeWorkflowName());
+  if (LAST_OPENED.scheme !== "fernet") {
+    const d = vaultDialog({ title: "Save again with the same password", width: 480,
+      subtitle: `"${fileName}" was protected with a password. Type it again (it is never kept).` });
+    const pw = passwordField({ label: "Password", autocomplete: "current-password" });
+    d.body.append(pw.el, noticeEl("info", METADATA_NOTE));
+    d.addAction("Cancel", { onClick: () => d.close(null) });
+    const go = async () => {
+      if (d.busy) return;
+      if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the password."); return; }
+      d.setBusy(true, "Encrypting…");
+      const r = await post("/h2vault/workflow/encrypt", { workflow, scheme: "argon2id-aesgcm", password: pw.value() });
+      if (!r.ok) { d.setBusy(false); d.notice("danger", r.data.error || `Encrypting failed (${r.status}).`); return; }
+      d.close(r.data);
+    };
+    d.addAction("Encrypt and save", { primary: true, onClick: go });
+    d.onSubmit(go);
+    const out = await d.result;
+    if (!out) return;
+    download(`${fileName}.h2vault.json`, JSON.stringify(out.file, null, 1));
+    toast(`Saved "${fileName}.h2vault.json" with the same password.`, "success", "Encrypted");
+    return;
+  }
+  const r = await post("/h2vault/workflow/encrypt", { workflow, scheme: "fernet", same_key_of: LAST_OPENED.fingerprint,
+    label: fileName });
+  if (!r.ok) { toast(r.data.error || `Encrypting failed (${r.status}).`, "error"); return; }
+  download(`${fileName}.h2vault.json`, JSON.stringify(r.data.file, null, 1));
+  LAST_OPENED = { ...LAST_OPENED, fingerprint: r.data.fingerprint };
+  toast(`Saved "${fileName}.h2vault.json" with the same key. It opens with the key you already shared.`, "success",
+    "Encrypted");
 }
 
 /** The key, shown exactly once (spec: Workflow-Encrypt's "the key will ONLY be shown ONCE"). */
@@ -150,6 +203,7 @@ async function decryptFile(file, fileName) {
   const first = await post("/h2vault/workflow/decrypt", { file });
   if (first.ok) {
     if (first.data.used_remembered) toast("Opened with the key this installation remembers.", "success", "Decrypted");
+    LAST_OPENED = { fingerprint: first.data.fingerprint, scheme: first.data.scheme, name: fileName };
     return first.data.workflow;
   }
   if (first.status !== 401) { toast(first.data.error || `Could not open the file (${first.status}).`, "error"); return null; }
@@ -183,7 +237,12 @@ async function decryptFile(file, fileName) {
     d.setBusy(true, "Decrypting…");
     const r = await post("/h2vault/workflow/decrypt", needs === "password" ? { file, password: value }
       : { file, key: value, remember: !!remember?.checked(), label: fileName || "" });
-    if (r.ok) { workflow = r.data.workflow; d.close(true); return; }
+    if (r.ok) {
+      workflow = r.data.workflow;
+      LAST_OPENED = { fingerprint: r.data.fingerprint, scheme: r.data.scheme, name: fileName };
+      d.close(true);
+      return;
+    }
     d.setBusy(false);
     d.notice("danger", r.data.error || `Could not open the file (${r.status}).`);
     secret.input.select?.();
@@ -272,13 +331,15 @@ app.registerExtension({
       function: () => openEncrypted() },
     { id: "h2vault.workflow.manageKeys", label: "H2Vault: Remembered workflow keys…", icon: "pi pi-key",
       function: () => manageKeys() },
+    { id: "h2vault.workflow.saveSameKey", label: "H2Vault: Save workflow encrypted again (same key)", icon: "pi pi-save",
+      function: () => saveSameKey() },
   ],
-  menuCommands: [{ path: ["H2Vault"], commands: ["h2vault.workflow.saveEncrypted", "h2vault.workflow.openEncrypted",
-    "h2vault.workflow.manageKeys"] }],
+  menuCommands: [{ path: ["H2Vault"], commands: ["h2vault.workflow.saveEncrypted", "h2vault.workflow.saveSameKey",
+    "h2vault.workflow.openEncrypted", "h2vault.workflow.manageKeys"] }],
   settings: [{ id: REMEMBER_SETTING, category: ["H2Vault", "Encrypted workflows", "Remember keys"],
     name: "Remember workflow keys on this installation by default", type: "boolean", defaultValue: true,
     tooltip: "Keys go to the OS credential store (or H2Vault's encrypted file in the user folder), never into a workflow." }],
   setup() { installLoadHook(); },
 });
 
-globalThis.__h2vaultWorkflow = { saveEncrypted, openEncrypted, decryptFile, manageKeys };
+globalThis.__h2vaultWorkflow = { saveEncrypted, saveSameKey, openEncrypted, decryptFile, manageKeys };

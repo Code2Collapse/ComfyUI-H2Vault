@@ -14,13 +14,16 @@ import { BUSY_MESSAGE, ProtectError, absSource, captureBoundary, ensureReroutes,
   rerouteChain, runTransaction, verifyConversion, verifyVaultWiring } from "./_h2v_protect_tx.js";
 // V1 (owner 2026-11-20): one-step "Lock selection as H2Vault" + the Vault UI overhaul (docs/h2vault/V1_cnp_vault_ux_spec.md)
 import { isVaultType, protectFailureText, resolveLockSelection, stageLabel, summarizeSelection } from "./_h2v_selection.js";
-import { block, capsule, choiceCards, codeField, copyRow, disclosure, el as vel, factList, noticeEl, passwordField,
+import { block, capsule, choiceCards, codeField, copyRow, disclosure, el as vel, factList, field, noticeEl, passwordField,
   statusCard, stepSection, switchRow, textArea, textField, vaultDialog, vbutton } from "./_h2v_ui.js";
 import { tagDomWidget } from "./_h2v_rebind.js";
 // V3 identity concealment, recipient side (docs/h2vault/V3_concealment_design.md)
 import { ensureControl, serverPublic } from "./_h2v_conceal.js";
 import { candidate, inventory, previewsOf, promotedValues, socketsOf } from "./_h2v_expose.js";
 import { exposeStep } from "./_h2v_expose_ui.js";
+// V5 (docs/h2vault/V5_enhancements_design.md): Lock parameters and offline licences
+import { lockRequest, lockableRows, reopenParams, whitelistLock } from "./_h2v_lockparams.js";
+import { EXPIRY_CHOICES, HONOUR_NOTE, fmtDate, ledgerState, licenceLine, licenceTerms } from "./_h2v_licence.js";
 
 const VAULT_TYPES = new Set(["H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput"]);
 const PACK_AUX_ID = "Code2Collapse/ComfyUI-H2Vault";
@@ -36,6 +39,15 @@ const PROFILES = [
     net: "None - runs offline.", where: "On each authorized installation's GPU.",
     custody: "A per-vault key, wrapped for each authorized installation's own key pair.",
     security: "Encrypted. Other installations cannot run or read it, even with this pack.", risk: "" },
+  { id: "sealed_licensed", title: "Licensed — one licence per installation", tag: "Share widely",
+    run: "Only on installations you send a licence to (yours gets one automatically). Everyone gets the same " +
+      "workflow; each person adds the small licence you send them.",
+    edit: "Vault password + your authenticator code + editor list.",
+    net: "None - licences are checked offline, nothing is sent anywhere.", where: "On each licensed installation's GPU.",
+    custody: "A per-vault licence key, wrapped inside each licence for that installation's own key pair; licences " +
+      "are signed with your author key.",
+    security: "Encrypted. Without a licence for their installation nobody can run or read it. End dates and run " +
+      "limits are kept by H2Vault on their computer (see the licence dialog).", risk: "" },
   { id: "locked", title: "Locked — password to run", tag: "",
     run: "Anyone with the vault password; asked once per browser tab.",
     edit: "Vault password + your authenticator code + editor list.",
@@ -234,12 +246,15 @@ function applyInterface(node) {
   node.properties.aux_id = PACK_AUX_ID;                   // a machine without the pack offers to install it
   const prof = PROFILES.find((p) => p.id === info.profile);
   const legacy = info.profile === "sealed_portable";
-  node.title = info.title || (iface.concealed && iface.title) || node.title || "H2Vault";
-  node.color = legacy ? "#5a4a22" : "#2b2552";
-  node.bgcolor = legacy ? "#2e2716" : "#191632";
+  const lock = whitelistLock(info.lock);                  // V5: a Locked node is drawn like the node it replaced
+  node.title = info.title || (lock && lock.look.title) || (iface.concealed && iface.title) || node.title || "H2Vault";
+  node.color = lock?.look.color || (legacy ? "#5a4a22" : "#2b2552");
+  node.bgcolor = lock?.look.bgcolor || (legacy ? "#2e2716" : "#191632");
   node.__h2vBadge = `🔒 ${legacy ? "portable - obfuscation only" : (prof?.id === "locked" ? "locked" : "sealed")}` +
-    (info.node_count && !iface.concealed ? ` · ${info.node_count} nodes` : "");      // V3: no inner count
+    (info.node_count && !iface.concealed && !lock ? ` · ${info.node_count} nodes` : "");      // V3: no inner count
+  ensureLockRows(node, lock);
   ensureStatusCard(node);
+  if (info.profile === "sealed_licensed") refreshLicence(node);
   if (!node.__h2vMinWidth && typeof node.computeSize === "function") {
     // a DOM widget's computeSize gives a height only: the status card's minimum width comes from the node
     const cs = node.computeSize;
@@ -318,7 +333,10 @@ function updateStatusCard(node) {
     return;
   }
   const n = info.interface?.concealed ? 0 : (Number(info.node_count) || 0);     // V3: a concealed vault hides it
-  const detail = n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph";
+  const lockInfo = whitelistLock(info.lock);
+  const nLocked = lockInfo ? (Number(info.lock?.count) || lockInfo.rows.length) : 0;
+  const detail = lockInfo ? `${nLocked} value${nLocked === 1 ? "" : "s"} locked`
+    : n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph";
   if (!vid) {
     card.update({ tone: "warn", title: "Empty vault", detail: "Lock a selection to fill it",
       meta: "Right-click nodes › Protect with H2Vault" });
@@ -329,6 +347,15 @@ function updateStatusCard(node) {
       action: { label: "Open…", ariaLabel: `Open ${node.title || "vault"}`, onClick: () => openVault(node) } });
     return;
   }
+  if (info.profile === "sealed_licensed") {
+    const line = licenceLine(LICENCE_STATE.get(vid));
+    card.update({ tone: line?.tone || "accent", title: line?.title || "Licensed · one licence per installation", detail,
+      meta: line?.meta || "Checking this installation's licence…", metaTone: line?.tone === "ok" ? "ok" : "",
+      action: line && line.tone !== "ok"
+        ? { label: "Add licence…", ariaLabel: `Add a licence for ${node.title || "vault"}`, onClick: () => addLicence(node) }
+        : { label: "Open…", ariaLabel: `Open ${node.title || "vault"}`, onClick: () => openVault(node) } });
+    return;
+  }
   const locked = info.profile === "locked";
   const unlocked = locked && RUN_UNLOCKED.has(vid);
   card.update({ tone: unlocked ? "ok" : "accent",
@@ -336,6 +363,75 @@ function updateStatusCard(node) {
     meta: locked ? (unlocked ? "Unlocked in this tab" : "Asks for the password when you run it")
       : "Runs without a password on authorized installations", metaTone: unlocked ? "ok" : "",
     action: { label: "Open…", ariaLabel: `Open ${node.title || "vault"}`, onClick: () => openVault(node) } });
+}
+
+// ── V5: the locked rows of a Locked node (display only, never saved) ──────────────────────────────────────────
+// One DOM widget listing what is locked: the setting names when the author published them, otherwise only how many.
+// widget.serialize = false and it sits just before the status card, so the saved order [vault_id, vault_payload,
+// p_* ...] never moves (frontend 1.53 restores by position, L9.102).
+const LOCKROWS_WIDGET = "vault_locked_rows";
+const ROW_H = 22;
+
+function ensureLockRows(node, lock) {
+  const existing = node.widgets?.find((x) => x.name === LOCKROWS_WIDGET);
+  if (!lock) {
+    if (existing) {
+      const i = node.widgets.indexOf(existing);
+      existing.onRemove?.();
+      node.widgets.splice(i, 1);
+    }
+    return;
+  }
+  if (typeof document === "undefined" || typeof node?.addDOMWidget !== "function") return;
+  const count = Number(vaultInfo(node).lock?.count) || lock.rows.length;
+  const lines = lock.rows.length ? lock.rows : [`${count} value${count === 1 ? "" : "s"} locked`];
+  const h = lines.length * ROW_H + 8;
+  let w = existing;
+  if (!w) {
+    const box = vel("div", { class: "h2v h2v-lockrows", style: { display: "flex", flexDirection: "column", gap: "2px",
+      padding: "4px 6px", boxSizing: "border-box", font: "12px/1.4 var(--font-sans, system-ui, sans-serif)" } });
+    w = node.addDOMWidget(LOCKROWS_WIDGET, LOCKROWS_WIDGET, box, { serialize: false, margin: 4,
+      getMinHeight: () => w.__h2vH, getHeight: () => w.__h2vH });
+    w.serialize = false;
+    w.__h2vBox = box;
+    try { tagDomWidget(w); } catch (_) { /* the Nodes 2.0 rebind tag is a nicety */ }
+  }
+  w.__h2vH = h;
+  w.computeSize = (width) => [width, h + 8];
+  w.__h2vBox.replaceChildren(...lines.map((name) => vel("div", { style: { display: "flex", justifyContent:
+    "space-between", alignItems: "center", height: `${ROW_H - 2}px`, padding: "0 8px", borderRadius: "6px",
+    background: "var(--comfy-input-bg, #16171a)", color: "var(--input-text, #ddd)" } }, [
+    vel("span", { text: `🔒 ${name}`, style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }),
+    vel("span", { text: lock.rows.length ? "locked" : "", style: { opacity: "0.6", fontSize: "11px" } })])));
+}
+
+// ── V5: licence state per vault id (this installation), from /h2vault/licence/status ───────────────────────────
+const LICENCE_STATE = new Map();
+const LICENCE_ASKED = new Set();
+
+async function refreshLicence(node, force = false) {
+  const vid = node.widgets?.find((w) => w.name === "vault_id")?.value;
+  const payload = node.widgets?.find((w) => w.name === "vault_payload")?.value;
+  if (!vid || !payload || (!force && LICENCE_ASKED.has(vid))) return;
+  LICENCE_ASKED.add(vid);
+  try {
+    const r = await post("/h2vault/licence/status", { payload, vault_id: vid });
+    if (r.ok) LICENCE_STATE.set(vid, r.data);
+  } catch (_) { /* the card keeps "checking" */ }
+  refreshCards(vid);
+}
+
+/** After a run: the licence state of every Licensed vault on screen (runs left, an ended licence). */
+function refreshLicensedCards() {
+  const walk = (g, seen = new Set()) => {
+    if (!g || seen.has(g)) return;
+    seen.add(g);
+    for (const n of g.nodes || g._nodes || []) {
+      if (VAULT_TYPES.has(n.type) && vaultInfo(n).profile === 'sealed_licensed') refreshLicence(n, true);
+      if (isSubgraphNode(n)) walk(n.subgraph, seen);
+    }
+  };
+  try { walk(app.rootGraph ?? app.graph); } catch (_) { /* display only */ }
 }
 
 /** Refresh the cards of every vault with this id (after a run unlock). */
@@ -467,7 +563,8 @@ async function buildApi(sg, extraParams = []) {
     if (!nodes[ep.nodeId] || promoted.some((p) => p.key === ep.key)) continue;
     const w = sg.subgraph?.getNodeById?.(ep.nodeId)?.widgets?.find((x) => x.name === ep.input);
     apiPromoted.push({ key: ep.key, node: ep.nodeId, input: ep.input });
-    carried.push({ key: ep.key, name: ep.name, type: ep.type, value: w?.value, options: ep.options });
+    carried.push({ key: ep.key, name: ep.name, type: ep.type, value: w?.value, options: ep.options,
+      ...(ep.input ? { input: ep.input } : {}) });
   }
   const interface_ = {
     in: inputs.filter((_, i) => !promotedIdx.has(i)).map((s) => s),
@@ -557,13 +654,13 @@ async function protectTransaction(nodes, opts) {
           throw new ProtectError("SUBGRAPH_INTERFACE_VALIDATION", `A vault can have at most ${MAX_VAULT_OUTPUTS} outputs.`);
         }
       }],
-      ["INNER_GRAPH_EXTRACTION", async () => { built = await buildApi(sg); }],
+      ["INNER_GRAPH_EXTRACTION", async () => { built = await buildApi(sg, opts.extraParams || []); }],
       ["VAULT_PAYLOAD_VALIDATION", () => validateBuilt(built)],
       ["ENCRYPTION_AND_SEALING", async () => {
         const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
           recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui: exportUi(sg),
           outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
-          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}) });
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.lock ? { lock: opts.lock } : {}) });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
         built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
@@ -575,7 +672,8 @@ async function protectTransaction(nodes, opts) {
         if (!vault) throw new ProtectError("VAULT_NODE_INSERTION", `${type} is not registered (is the pack loaded?).`);
         vault.properties = { ...(vault.properties || {}), h2vault: { interface: publicInterface(built), profile: res.profile,
           node_count: res.node_count, title: sg.title, vault_id: res.vault_id, outputs_node: !!built.outputsNode,
-          input_map: built.inputMap || null } };
+          input_map: built.inputMap || null,
+          ...(res.public_lock ? { lock: lockPublic(res.public_lock), lock_node: opts.lock?.node ?? null } : {}) } };
         vault.widgets.find((w) => w.name === "vault_id").value = res.vault_id;
         vault.widgets.find((w) => w.name === "vault_payload").value = res.payload;
         // a FRESH id: Nodes 2.0 keys a node's view by id and kept showing the subgraph's view ("New Subgraph",
@@ -650,7 +748,8 @@ function makeVaultNode(graph, res, built, replace) {
   built.public = serverPublic(res);                        // V3: a concealed vault publishes the server's whitelist
   v.properties = { ...(v.properties || {}), h2vault: { interface: publicInterface(built), profile: res.profile,
     node_count: res.node_count, title: replace?.title, vault_id: res.vault_id, outputs_node: !!built.outputsNode,
-    input_map: built.inputMap || null } };
+    input_map: built.inputMap || null,
+    ...(res.public_lock ? { lock: lockPublic(res.public_lock), lock_node: res.lock_node ?? null } : {}) } };
   v.widgets.find((w) => w.name === "vault_id").value = res.vault_id;
   v.widgets.find((w) => w.name === "vault_payload").value = res.payload;
   if (!replace) {
@@ -663,6 +762,12 @@ function makeVaultNode(graph, res, built, replace) {
   restoreWires(graph, wires, v, (i) => vaultSlotOf(v, built.inputMap, i));
   if (replace.title) v.title = replace.title;
   return v;
+}
+
+/** The public lock part as stored on the node: the whitelist + the locked-value count. */
+function lockPublic(pub) {
+  const w = whitelistLock(pub);
+  return w ? { ...w, count: Number(pub?.count) || w.rows.length } : null;
 }
 
 function removeDefinitionIfUnused(sg) {
@@ -687,6 +792,7 @@ function removeDefinitionIfUnused(sg) {
 // ── dialogs (V1: js/_vault_ui.js design system; docs/h2vault/V1_cnp_vault_ux_spec.md) ─────────────────────────
 const SHORT = {
   sealed_installs: { title: "Sealed", tag: "Recommended", tone: "ok" },
+  sealed_licensed: { title: "Licensed", tag: "Licence per person", tone: "" },
   locked: { title: "Locked", tag: "Password to run", tone: "" },
   sealed_portable: { title: "Portable", tag: "Obfuscation only", tone: "warn" },
 };
@@ -997,7 +1103,7 @@ async function enterOpened(v, res, payload) {
   const graph = v.graph;
   const root = app.rootGraph ?? app.graph;
   let sg;
-  let extraParams = [];
+  const extraParams = reopenParams(vaultInfo(v));        // V5: a Locked node's open controls survive an edit
   if (res.ui?.definitions?.length) {
     // nested definitions first, the vault's own last
     const defs = [...res.ui.definitions];
@@ -1034,7 +1140,8 @@ async function lockOpened(sg, sess) {
       interface: built.interface, payload_hash: sess.payloadHash, ...(sess.removeConceal ? { conceal: null } : {}) });
     if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
     OPEN.delete(sg);
-    makeVaultNode(sg.graph, { ...r.data, node_count: r.data.node_count }, built, sg);
+    makeVaultNode(sg.graph, { ...r.data, node_count: r.data.node_count, lock_node: sess.info?.lock_node ?? null },
+      built, sg);
     removeDefinitionIfUnused(sg);
     if (sess.profile === "locked") markRunUnlocked(sess.vaultId);
     toast("Vault locked again: what you changed is encrypted.", "success", "Vault locked");
@@ -1227,17 +1334,28 @@ async function ensureRunKeys(output) {
     const info = graphNode ? vaultInfo(graphNode) : {};
     const vid = n.inputs?.vault_id;
     if (info.profile !== "locked" || RUN_UNLOCKED.has(vid)) continue;
+    // V5: Locked nodes made together share their password - one prompt unlocks the whole set
+    if (info.lock_set && SET_PASSWORDS.has(info.lock_set)) {
+      const r = await post("/h2vault/vault/unlock_run", { payload: n.inputs.vault_payload, vault_id: vid,
+        password: SET_PASSWORDS.get(info.lock_set), client_id: api.clientId });
+      if (r.ok) { markRunUnlocked(vid); continue; }
+    }
+    let typed = "";
     const ok = await credentialDialog({ title: `Run "${graphNode?.title || "this vault"}"`, needCode: false,
       primary: "Run", subtitle: "This vault is Locked: it needs its password once per browser tab.",
       submit: async ({ password }) => {
         const r = await post("/h2vault/vault/unlock_run", { payload: n.inputs.vault_payload, vault_id: vid, password,
           client_id: api.clientId });
+        if (r.ok) typed = password;
         return r.ok ? { ok: true } : { error: authError(r, "Wrong password.") };
       } });
-    if (!ok) throw new Error("Run cancelled: a Locked vault needs its password.");
+    if (!ok) { SET_PASSWORDS.clear(); throw new Error("Run cancelled: a Locked vault needs its password."); }
     markRunUnlocked(vid);
+    if (info.lock_set) SET_PASSWORDS.set(info.lock_set, typed);
   }
+  SET_PASSWORDS.clear();                                  // held only while this queue's prompts are answered
 }
+const SET_PASSWORDS = new Map();
 
 // ── menus ───────────────────────────────────────────────────────────────────────────────────────────────────
 /** The canvas selection as canvas items (nodes, groups, reroutes); _vault_selection.js decides what is locked. */
@@ -1733,8 +1851,417 @@ async function manageAccess(v, focus) {
   out.data.password_changed ? "Password changed" : "Access updated");
 }
 
+// ── V5: Lock parameters (docs/h2vault/V5_enhancements_design.md section 5) ────────────────────────────────────────
+// Each chosen node becomes a one-node vault drawn like itself. The locked values are sealed inside; the open rows stay
+// editable as the vault's controls. Nodes are locked one after the other, each in its own A26 transaction (a failure
+// restores that node and stops; the nodes already locked stay locked and are named in the message).
+const USUAL_OPEN = new Set(["seed", "noise_seed", "steps", "cfg", "sampler_name", "scheduler", "denoise", "width",
+  "height", "batch_size"]);
+
+function lockableNodes(nodes) {
+  return (nodes || []).filter((n) => n && !isSubgraphNode(n) && !VAULT_TYPES.has(n.type) && Number(n.id) >= 0
+    && lockableRows(n, nodeDefOf(n.type)).length > 0);
+}
+
+function checkRow(label, checked, hint) {
+  const input = vel("input", { type: "checkbox" });
+  input.checked = !!checked;
+  const row = vel("label", { class: "h2v-row", style: { gap: "8px", alignItems: "center", cursor: "pointer",
+    padding: "2px 0" } }, [input, vel("span", { text: label }), hint ? vel("span", { class: "h2v-dim", text: hint }) : null]
+    .filter(Boolean));
+  return { el: row, input, checked: () => input.checked };
+}
+
+/** Lock one node's parameters (no dialog). `locked` = row names (null = every row, owner D5). */
+async function lockNodeParameters(node, locked, opts) {
+  const req = lockRequest(node, nodeDefOf(node.type), locked);
+  if (!req.lock.rows.length) throw new ProtectError("SELECTION_VALIDATION", `"${node.title}" has no value left to lock.`);
+  req.lock.look.show_rows = !!opts.showRows;
+  if (!opts.showKind) req.lock.look.node_label = null;
+  if (typeof opts.title === "string" && opts.title.trim()) req.lock.look.title = opts.title.trim().slice(0, 80);
+  const vault = await protectTransaction([node], { profile: opts.profile, password: opts.password,
+    recipients: opts.recipients || [], editors: [], title: req.lock.look.title, lock: req.lock,
+    extraParams: req.extraParams, onStage: opts.onStage });
+  if (opts.lockSet) {
+    vault.properties.h2vault.lock_set = opts.lockSet;            // one password unlocks the set (ensureRunKeys)
+  }
+  return vault;
+}
+
+async function lockParameters(items) {
+  const r = resolveLockSelection(items ?? selectedItemsOf(app.canvas), { LiteGraph: globalThis.LiteGraph });
+  if (r.problems.length) { toast(r.problems[0], true); return null; }
+  const nodes = lockableNodes(r.nodes);
+  if (!nodes.length) {
+    toast("Nothing to lock: select nodes that have settings (a subgraph is protected as a vault instead).", true);
+    return null;
+  }
+  const ids = nodes.map((n) => n.id);
+  const graph = nodes[0].graph;
+  const many = nodes.length !== 1;
+  const d = vaultDialog({ title: many ? `Lock the parameters of ${nodes.length} nodes`
+    : `Lock the parameters of "${nodes[0].title}"`,
+  subtitle: "Each node stays where it is with its sockets. The values you lock are encrypted; the ones you leave " +
+    "open stay editable.", width: 640 });
+  d.body.append(noticeEl("info", "Anyone who receives the workflow sees each node's title and how many values are " +
+    "locked - never the locked values. To hide what the nodes are as well, protect them as a concealed vault."));
+  const perNode = nodes.map((n) => {
+    const rows = lockableRows(n, nodeDefOf(n.type));
+    const title = textField({ label: "Title shown on the node", value: n.title || "", maxLength: 80 });
+    const checks = rows.map((row) => ({ name: row.name, box: checkRow(row.label, true) }));
+    const list = vel("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+      gap: "0 12px" } }, checks.map((c) => c.box.el));
+    return { node: n, title, checks, el: block(n.title || n.type, "Ticked = locked (hidden). Untick what the person " +
+      "running it may change.", title.el, list) };
+  });
+  const usual = vbutton("Keep seed, steps, CFG, sampler, scheduler, denoise and sizes open", { kind: "text", small: true,
+    onClick: () => perNode.forEach((p) => p.checks.forEach((c) => { if (USUAL_OPEN.has(c.name)) c.box.input.checked = false; })) });
+  const showRows = checkRow("Show the names of the locked settings", false, "(otherwise only how many)");
+  const showKind = checkRow("Show what kind of node each one is", false, "(otherwise only its title)");
+  const choice = choiceCards({ label: "Who can run them", value: "sealed_installs",
+    options: PROFILES.filter((p) => ["sealed_installs", "sealed_licensed", "locked"].includes(p.id))
+      .map((p) => ({ id: p.id, title: SHORT[p.id]?.title ?? p.title, tag: SHORT[p.id]?.tag, tone: SHORT[p.id]?.tone,
+        summary: p.run })), onChange: () => { recip.el.style.display = choice.value() === "sealed_installs" ? "" : "none"; } });
+  const pw2 = passwordField({ label: "Repeat the password" });
+  const pw = passwordField({ label: "Password", strength: true, generate: true,
+    hint: "Opens the nodes for editing, together with your authenticator app.", onGenerate: (v) => pw2.setValue(v) });
+  const recip = textArea({ label: "Other installations that may run them (optional)", placeholder: "h2vk1:...", rows: 2,
+    hint: "Installation codes, one per line. Yours is always included." });
+  d.body.append(...perNode.map((p) => p.el), vel("div", { class: "h2v-row" }, [usual]), showRows.el, showKind.el,
+    choice.el, vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), recip.el);
+  d.status(PROTECT_FOOT);
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  const done = [];
+  const go = async () => {
+    if (d.busy) return;
+    d.notice(null);
+    if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the password."); pw.input.focus(); return; }
+    if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); pw2.input.focus(); return; }
+    const plan = perNode.map((p) => ({ id: p.node.id, title: p.title.input.value,
+      locked: p.checks.filter((c) => c.box.checked()).map((c) => c.name) }));
+    const empty = plan.find((x) => !x.locked.length);
+    if (empty) { d.notice("danger", `Tick at least one value to lock on "${empty.title || "every node"}".`); return; }
+    d.setBusy(true, "Locking…");
+    const lockSet = `ls${Math.random().toString(36).slice(2, 10)}`;
+    for (const x of plan) {
+      if (done.includes(x.id)) continue;
+      const node = graph.getNodeById?.(x.id) ?? (app.canvas?.graph?.getNodeById?.(x.id));
+      try {
+        if (!node) throw new Error("The node is no longer in the graph on screen.");
+        d.status(`Locking "${x.title || node.title}"…`);
+        await lockNodeParameters(node, x.locked, { profile: choice.value(), password: pw.value(), title: x.title,
+          recipients: splitCodes(recip.input.value), showRows: showRows.checked(), showKind: showKind.checked(), lockSet });
+        done.push(x.id);
+      } catch (e) {
+        d.setBusy(false);
+        d.status(PROTECT_FOOT);
+        const kept = done.length ? ` ${done.length} node${done.length === 1 ? " is" : "s are"} already locked.` : "";
+        d.notice(e?.busy ? "warn" : "danger", `"${x.title || "A node"}" was not locked: ${protectFailureText(e)}${kept}`);
+        return;
+      }
+    }
+    d.close(done.length);
+  };
+  d.addAction(many ? `Lock ${nodes.length} nodes` : "Lock parameters", { primary: true, onClick: go });
+  d.onSubmit(go);
+  const n = await d.result;
+  if (n) toast(`Locked the parameters of ${n} node${n === 1 ? "" : "s"}. Their values are encrypted.`, "success",
+    "Parameters locked");
+  return n;
+}
+
+// ── V5: Remove protection (design 7.4) ──────────────────────────────────────────────────────────────────────────
+async function removeProtection(v) {
+  const isLock = !!vaultInfo(v).lock;
+  const sure = vaultDialog({ title: isLock ? "Unlock these parameters for good?" : "Remove the protection for good?",
+    subtitle: isLock ? "The original node comes back with its values in plain view." :
+      "The vault becomes an ordinary subgraph. Anyone who receives the workflow can then read everything inside.",
+    width: 460, tone: "warn" });
+  sure.addAction("Cancel", { onClick: () => sure.close(false) });
+  sure.addAction(isLock ? "Unlock for good" : "Remove protection", { primary: true, danger: true,
+    onClick: () => sure.close(true) });
+  if (!(await sure.result)) return;
+  const st = await (await api.fetchApi("/h2vault/2fa/status")).json().catch(() => ({}));
+  if (!st.enrolled && !(await enrolDialog())) return;
+  const payload = v.widgets.find((w) => w.name === "vault_payload")?.value;
+  const vaultId = v.widgets.find((w) => w.name === "vault_id")?.value;
+  let opened = null;
+  const out = await credentialDialog({ title: `Remove the protection of "${v.title || "vault"}"`, primary: "Remove",
+    subtitle: "Type the password and the code your authenticator app shows.",
+    submit: async ({ password, code }) => {
+      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, code, client_id: api.clientId });
+      if (r.ok) { opened = r.data; return { ok: true }; }
+      if (r.data.needs_enrolment) return { enrol: true };
+      return { error: authError(r, "Could not open the vault.") };
+    } });
+  if (!out?.ok || !opened) return;
+  post("/h2vault/vault/cancel", { edit_token: opened.edit_token });     // nothing is re-sealed: the session ends
+  try {
+    const graph = v.graph;
+    const sg = materialize(v, opened);
+    if (isLock && typeof graph.unpackSubgraph === "function") graph.unpackSubgraph(sg);
+    graph.setDirtyCanvas?.(true, true);
+    toast(isLock ? "The node is back with its values." : "The vault is now an ordinary subgraph.", "success",
+      "Protection removed");
+  } catch (e) {
+    toast(`The vault opened but could not be shown: ${e?.message || e}`, "error");
+  }
+}
+
+/** The vault's editable layout as a native subgraph node in its place (no edit session, no auto-lock). */
+function materialize(v, res) {
+  if (!res.ui?.definitions?.length) throw new Error("This vault has no editable layout. Ask its author for a fresh copy.");
+  const graph = v.graph;
+  const root = app.rootGraph ?? app.graph;
+  const defs = [...res.ui.definitions];
+  const own = defs.find((d) => d.id === res.ui.root) ?? defs[0];
+  for (const d of defs) if (d !== own && !root.subgraphs?.has?.(d.id)) root.createSubgraph(d);
+  const subgraph = root.subgraphs?.get?.(own.id) ?? root.createSubgraph(own);
+  const sg = LiteGraph.createNode(subgraph.id);
+  if (!sg) throw new Error("This front end cannot create the subgraph node.");
+  const inputMap = vaultInfo(v).input_map;
+  const wires = replaceNode(graph, v, sg);
+  if (res.ui.size) sg.size = [...res.ui.size];
+  sg.title = v.title || res.ui.title;
+  restoreWires(graph, wires, sg, (slot) => subgraphSlotOf(v, inputMap, slot));
+  return sg;
+}
+
+// ── V5: licences (design section 6) ─────────────────────────────────────────────────────────────────────────────
+function downloadText(name, text, type = "text/plain") {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = el("a", { href: url, download: name });
+  document.body.append(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 0);
+}
+
+function pickTextFile(accept) {
+  return new Promise((resolve) => {
+    const inp = el("input", { type: "file", accept, style: { display: "none" } });
+    const done = (v) => { inp.remove(); resolve(v); };
+    inp.addEventListener("cancel", () => done(null));
+    inp.addEventListener("change", async () => {
+      const f = inp.files?.[0];
+      done(f ? { name: f.name, text: (await f.text().catch(() => "")).trim() } : null);
+    });
+    document.body.append(inp);
+    inp.click();
+  });
+}
+
+const safeFile = (s) => String(s || "licence").replace(/[^\w.-]+/g, "_").slice(0, 40);
+
+function vaultRefs(v) {
+  return { payload: v.widgets.find((w) => w.name === "vault_payload")?.value,
+    vault_id: v.widgets.find((w) => w.name === "vault_id")?.value };
+}
+
+async function addLicence(v) {
+  const d = vaultDialog({ title: `Add a licence for "${v.title || "this workflow"}"`,
+    subtitle: "Paste the licence its author sent you, or open the licence file.", width: 520 });
+  const box = textArea({ label: "Licence", placeholder: "h2vl1:...", rows: 4 });
+  d.body.append(box.el, vel("div", { class: "h2v-row" }, [vbutton("Open licence file…", { small: true, onClick: async () => {
+    const f = await pickTextFile(".h2vlicence,.txt");
+    if (f) box.input.value = f.text;
+  } })]));
+  const st = LICENCE_STATE.get(vaultRefs(v).vault_id);
+  if (st?.install_code) d.body.append(copyRow({ label: "your installation code (send it to the author)", value: st.install_code }));
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  const go = async () => {
+    if (d.busy) return;
+    d.notice(null);
+    if (!box.input.value.trim()) { d.notice("danger", "Paste the licence first."); return; }
+    d.setBusy(true, "Checking…");
+    const r = await post("/h2vault/licence/add", { ...vaultRefs(v), licence: box.input.value.trim() });
+    d.setBusy(false);
+    if (!r.ok) { d.notice("danger", r.data?.error || "That licence could not be added."); return; }
+    d.close(r.data);
+  };
+  d.addAction("Add licence", { primary: true, onClick: go });
+  d.onSubmit(go);
+  const ok = await d.result;
+  if (ok) {
+    await refreshLicence(v, true);
+    toast("Licence added. This workflow can run on this installation now.", "success", "Licence added");
+  }
+}
+
+async function issueLicence(v) {
+  const d = vaultDialog({ title: `Issue a licence for "${v.title || "this workflow"}"`,
+    subtitle: "For one ComfyUI installation. Ask the person for their installation code.", width: 560 });
+  const code = textArea({ label: "Their installation code", placeholder: "h2vk1:...", rows: 2 });
+  const name = textField({ label: "Name (you and they see it)", placeholder: "e.g. Studio B", maxLength: 60 });
+  const until = vel("select", { class: "h2v-input" }, EXPIRY_CHOICES.map((c) => vel("option", { value: c.value, text: c.label })));
+  until.value = "30";
+  const date = vel("input", { type: "date", class: "h2v-input", style: { display: "none" } });
+  until.addEventListener("change", () => { date.style.display = until.value === "date" ? "" : "none"; });
+  const runs = textField({ label: "Run limit (optional)", placeholder: "no limit" });
+  d.body.append(code.el, vel("div", { class: "h2v-row" }, [vbutton("Import key file…", { small: true, onClick: async () => {
+    const k = await importKeyFile();
+    if (k?.error) { d.notice("danger", k.error); return; }
+    if (k) { code.input.value = k.code; if (!name.input.value) name.input.value = k.label || ""; }
+  } })]), name.el, field({ label: "Valid until", control: vel("div", { class: "h2v-row" }, [until, date]) }),
+  runs.el, noticeEl("info", HONOUR_NOTE));
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  const go = () => {
+    d.notice(null);
+    if (!code.input.value.trim().startsWith("h2vk1:")) { d.notice("danger", "Paste their installation code (it starts with h2vk1:)."); return; }
+    const t = licenceTerms({ choice: until.value, date: date.value, runs: runs.input.value });
+    if (!t.ok) { d.notice("danger", t.error); return; }
+    d.close({ install_code: code.input.value.trim().split(/\s+/)[0], label: name.input.value.trim(), ...t.terms });
+  };
+  d.addAction("Next", { primary: true, onClick: go });
+  d.onSubmit(go);
+  const terms = await d.result;
+  if (!terms) return;
+  let issued = null;
+  const out = await credentialDialog({ title: "Sign the licence", primary: "Issue licence",
+    subtitle: "Type this workflow's password and your authenticator code.",
+    submit: async ({ password, code: c }) => {
+      const r = await post("/h2vault/licence/issue", { ...vaultRefs(v), password, code: c, title: v.title || "", ...terms });
+      if (r.ok && r.data.licence_text) { issued = r.data; return { ok: true }; }
+      if (r.data?.needs_enrolment) return { enrol: true };
+      return { error: authError(r, "The licence could not be issued.") };
+    } });
+  if (out?.enrol) { await enrolDialog(); return; }
+  if (!issued) return;
+  showLicences([{ ...issued, label: terms.label }], v.title);
+}
+
+function showLicences(list, title) {
+  const d = vaultDialog({ title: list.length === 1 ? "Licence ready" : `${list.length} licences ready`,
+    subtitle: "Send each one to its person. It only works on their installation, for this workflow.", width: 600 });
+  for (const it of list) {
+    const l = it.licence || {};
+    const what = `${l.label || "Licence"} · ${l.exp ? `until ${fmtDate(l.exp)}` : "no end date"}${l.runs ? ` · ${l.runs} runs` : ""}`;
+    d.body.append(vel("p", { class: "h2v-dim", text: what }), copyRow({ label: "licence", value: it.licence_text,
+      display: `${it.licence_text.slice(0, 36)}…` }),
+    vel("div", { class: "h2v-row" }, [vbutton("Download licence file", { small: true,
+      onClick: () => downloadText(`${safeFile(title)}-${safeFile(l.label)}.h2vlicence`, it.licence_text) })]));
+  }
+  d.addAction("Done", { primary: true, onClick: () => d.close(true) });
+  d.onSubmit(() => d.close(true));
+  return d.result;
+}
+
+async function rotateLicences(v) {
+  const refs = vaultRefs(v);
+  const ledger = await (await api.fetchApi("/h2vault/licence/ledger")).json().catch(() => ({}));
+  const rows = (ledger.rows || []).filter((r) => r.vault_id === refs.vault_id && r.state !== "ended");
+  const d = vaultDialog({ title: "Revoke this workflow's licences", width: 560, tone: "warn",
+    subtitle: "A new licence key is made and the vault is sealed again. Every licence issued so far stops working " +
+      "for the NEW copy of the workflow; tick the people who should get a new licence right away." });
+  d.body.append(noticeEl("warn", "People who already have the old copy of the workflow and its licence can keep " +
+    "running that old copy - an offline licence cannot be taken back. Send everyone the new copy."));
+  const checks = rows.map((r) => ({ lid: r.lid, box: checkRow(`${r.label || "Unnamed"} · ${ledgerState(r).detail}`, true) }));
+  if (checks.length) d.body.append(block("Issue new licences to", null, ...checks.map((c) => c.box.el)));
+  else d.body.append(vel("p", { class: "h2v-dim", text: "No licence of this workflow is listed on this installation." }));
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  d.addAction("Next", { primary: true, onClick: () => d.close(checks.filter((c) => c.box.checked()).map((c) => c.lid)) });
+  const reissue = await d.result;
+  if (!reissue) return;
+  let res = null;
+  const out = await credentialDialog({ title: "Revoke licences", primary: "Revoke and re-seal",
+    subtitle: "Type this workflow's password and your authenticator code.",
+    submit: async ({ password, code }) => {
+      const r = await post("/h2vault/licence/rotate", { ...refs, password, code, reissue });
+      if (r.ok && r.data.payload) { res = r.data; return { ok: true }; }
+      if (r.data?.needs_enrolment) return { enrol: true };
+      return { error: authError(r, "The licences could not be revoked.") };
+    } });
+  if (out?.enrol) { await enrolDialog(); return; }
+  if (!res) return;
+  v.widgets.find((w) => w.name === "vault_payload").value = res.payload;
+  LICENCE_ASKED.delete(refs.vault_id);
+  await refreshLicence(v, true);
+  v.graph?.setDirtyCanvas?.(true, true);
+  toast("Licences revoked. Save the workflow and send the new copy.", "success", "Licences revoked");
+  if (res.reissued?.length) await showLicences(res.reissued, v.title);
+}
+
+async function ledgerDialog() {
+  const data = await (await api.fetchApi("/h2vault/licence/ledger")).json().catch(() => ({}));
+  const rows = data?.rows || [];
+  const d = vaultDialog({ title: "Licences issued", width: 680,
+    subtitle: "Every licence you issued on this installation. Nothing here is sent anywhere." });
+  const only = checkRow("Only those ending within 7 days", false);
+  const list = vel("div", { style: { display: "flex", flexDirection: "column", gap: "6px" } });
+  const paint = () => {
+    const shown = rows.filter((x) => !only.checked() || x.state === "expiring");
+    list.replaceChildren(...(shown.length ? shown.map((x) => {
+      const st = ledgerState(x);
+      return vel("div", { class: "h2v-row", style: { justifyContent: "space-between", gap: "12px" } }, [
+        vel("span", { text: `${x.vault_title || "Workflow"} · ${x.label || "Unnamed"}` }),
+        vel("span", { class: "h2v-dim", text: `${st.detail} · ${shortCode(String(x.install_code || ""))}` }),
+        vel("span", { text: st.state })]);
+    }) : [vel("p", { class: "h2v-dim", text: rows.length ? "None ends within 7 days." : "You have not issued a licence yet." })]));
+  };
+  only.input.addEventListener("change", paint);
+  paint();
+  d.body.append(only.el, list);
+  d.addAction("Done", { primary: true, onClick: () => d.close(true) });
+  d.onSubmit(() => d.close(true));
+  await d.result;
+}
+
+async function exportAuthorKey() {
+  const d = vaultDialog({ title: "Back up my author key", width: 480,
+    subtitle: "Your author key signs every licence. Without it (a new computer, a reinstall) you cannot issue licences " +
+      "for the workflows you already shared." });
+  const pw2 = passwordField({ label: "Repeat the password" });
+  const pw = passwordField({ label: "Password for the backup file", strength: true, generate: true,
+    onGenerate: (x) => pw2.setValue(x) });
+  d.body.append(pw.el, pw2.el);
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  const go = async () => {
+    if (d.busy) return;
+    if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters."); return; }
+    if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); return; }
+    d.setBusy(true, "Encrypting…");
+    const r = await post("/h2vault/licence/author/export", { password: pw.value() });
+    d.setBusy(false);
+    if (!r.ok) { d.notice("danger", r.data?.error || "The backup could not be made."); return; }
+    downloadText("h2vault-author-key.h2vauthor", JSON.stringify(r.data.file, null, 1), "application/json");
+    d.close(true);
+  };
+  d.addAction("Download backup", { primary: true, onClick: go });
+  d.onSubmit(go);
+  if (await d.result) toast("Author key backup downloaded. Keep the file and its password apart.", "success");
+}
+
+async function importAuthorKey() {
+  const f = await pickTextFile(".h2vauthor,.json");
+  if (!f) return;
+  const d = vaultDialog({ title: "Restore author key", subtitle: f.name, width: 460 });
+  const pw = passwordField({ label: "Backup password", autocomplete: "current-password" });
+  let replace = false;
+  d.body.append(pw.el);
+  d.addAction("Cancel", { onClick: () => d.close(null) });
+  const go = async () => {
+    if (d.busy) return;
+    d.setBusy(true, "Restoring…");
+    const r = await post("/h2vault/licence/author/import", { file: f.text, password: pw.value(), replace });
+    d.setBusy(false);
+    if (!r.ok) {
+      d.notice("danger", r.data?.error || "The backup could not be restored.");
+      if (/different author key/.test(r.data?.error || "") && !replace) {
+        replace = true;
+        d.notice("warn", "This installation has another author key. Press Restore again to REPLACE it (licences " +
+          "signed with the old key keep working only for the vaults that key sealed).");
+      }
+      return;
+    }
+    d.close(true);
+  };
+  d.addAction("Restore", { primary: true, onClick: go });
+  d.onSubmit(go);
+  if (await d.result) toast("Author key restored.", "success");
+}
+
 // ── commands, menus, settings ───────────────────────────────────────────────────────────────────────────────
 const LOCK_LABEL = "🔒 Protect with H2Vault (locked, password to run)…";
+const PARAMS_LABEL = "🔒 Lock parameters…";
 const SEAL_LABEL = "🔒 Protect with H2Vault (sealed, authorized installations)…";
 const DEFAULT_PROFILE_SETTING = "h2vault.protect.defaultProfile";
 
@@ -1753,9 +2280,27 @@ function lockMenuItems(items) {
     return [null, { content: "🔒 Protect this subgraph with H2Vault…",
       callback: () => lockSelection(app.canvas, defaultProfile(), items) }];
   }
-  return [null,
+  const out = [null,
     { content: SEAL_LABEL, callback: () => lockSelection(app.canvas, "sealed_installs", items) },
     { content: LOCK_LABEL, callback: () => lockSelection(app.canvas, "locked", items) }];
+  const n = lockableNodes(r.nodes).length;
+  if (n) out.push({ content: n === 1 ? PARAMS_LABEL : `🔒 Lock parameters of ${n} nodes…`,
+    callback: () => lockParameters(items) });
+  return out;
+}
+
+/** V5 design 7.1: right-click on a group (core's own group entries use the same hook and getGroupOnPos). */
+function groupMenuItems(canvas) {
+  const g = canvas?.graph?.getGroupOnPos?.(canvas.graph_mouse?.[0], canvas.graph_mouse?.[1]);
+  if (!g || selectedItemsOf(canvas).length) return [];
+  const items = [g];
+  const r = resolveLockSelection(items, { LiteGraph: globalThis.LiteGraph });
+  if (r.kind === "empty" || r.problems.length) return [];
+  const out = [null, { content: "🔒 Protect this group with H2Vault…",
+    callback: () => lockSelection(app.canvas, defaultProfile(), items) }];
+  if (lockableNodes(r.nodes).length) out.push({ content: "🔒 Lock parameters in this group…",
+    callback: () => lockParameters(items) });
+  return out;
 }
 
 function isOutputNodeType(type) {
@@ -1788,9 +2333,18 @@ app.registerExtension({
       function: () => twoFactorSetup() },
     { id: "h2vault.installCode.show", label: "H2Vault: My installation code", icon: "pi pi-key",
       function: () => showInstallCode() },
+    { id: "h2vault.lockParams", label: "H2Vault: Lock parameters of the selected nodes", icon: "pi pi-lock",
+      function: () => lockParameters(selectedItemsOf(app.canvas)) },
+    { id: "h2vault.licence.ledger", label: "H2Vault: Licences issued", icon: "pi pi-list",
+      function: () => ledgerDialog() },
+    { id: "h2vault.licence.exportAuthor", label: "H2Vault: Back up my author key", icon: "pi pi-download",
+      function: () => exportAuthorKey() },
+    { id: "h2vault.licence.importAuthor", label: "H2Vault: Restore author key", icon: "pi pi-upload",
+      function: () => importAuthorKey() },
   ],
   menuCommands: [{ path: ["H2Vault"], commands: ["h2vault.protect.sealed", "h2vault.protect.locked",
-    "h2vault.protect.wholeWorkflow", "h2vault.twoFactor.setup", "h2vault.installCode.show"] }],
+    "h2vault.protect.wholeWorkflow", "h2vault.lockParams", "h2vault.twoFactor.setup", "h2vault.installCode.show",
+    "h2vault.licence.ledger", "h2vault.licence.exportAuthor", "h2vault.licence.importAuthor"] }],
   settings: [{ id: DEFAULT_PROFILE_SETTING, category: ["H2Vault", "Protect", "Default profile"],
     name: "Profile chosen first when protecting a subgraph", type: "combo", defaultValue: "sealed_installs",
     options: [{ text: "Sealed - authorized installations", value: "sealed_installs" },
@@ -1807,7 +2361,10 @@ app.registerExtension({
     app.canvas?.canvas?.addEventListener("litegraph:set-graph", onSetGraph);
     api.addEventListener("execution_error", onExecutionError);      // offer the install on every failed attempt
     api.addEventListener("h2vault.phase", onPhase);
-    for (const ev of ["execution_success", "execution_error", "execution_interrupted"]) api.addEventListener(ev, clearPhases);
+    for (const ev of ["execution_success", "execution_error", "execution_interrupted"]) {
+      api.addEventListener(ev, clearPhases);
+      api.addEventListener(ev, refreshLicensedCards);              // V5: runs left / an ended licence
+    }
   },
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (VAULT_TYPES.has(nodeData.name)) {
@@ -1836,7 +2393,7 @@ app.registerExtension({
     }
   },
   getCanvasMenuItems(canvas) {
-    const items = lockMenuItems(selectedItemsOf(canvas));
+    const items = [...lockMenuItems(selectedItemsOf(canvas)), ...groupMenuItems(canvas)];
     for (const [sg, sess] of OPEN) {                    // V3: inside an open concealed vault
       if (sg.subgraph === canvas?.graph) items.push(...concealMenuItems(sess));
     }
@@ -1845,11 +2402,18 @@ app.registerExtension({
   getNodeMenuItems(node) {
     const type = node?.comfyClass ?? node?.type;
     if (VAULT_TYPES.has(type)) {
+      const licensed = vaultInfo(node).profile === "sealed_licensed";
       return [null,
         { content: "🔓 Open / edit vault…", callback: () => openVault(node) },
+        ...(licensed ? [
+          { content: "🎫 Add licence…", callback: () => addLicence(node) },
+          { content: "🧾 Issue a licence…", callback: () => issueLicence(node) },
+          { content: "♻️ Revoke licences (new licence key)…", callback: () => rotateLicences(node) }] : []),
         { content: "👥 Manage installations & editors…", callback: () => manageAccess(node, "access") },
         { content: "🔐 Change password…", callback: () => manageAccess(node, "password") },
         { content: "📦 Install missing custom nodes…", callback: () => installMissing(node) },
+        { content: vaultInfo(node).lock ? "🔓 Unlock parameters (remove protection)…" : "🗝️ Remove protection…",
+          callback: () => removeProtection(node) },
         { content: "🔑 My installation code", callback: showInstallCode },
         { content: "📱 Two-factor setup…", callback: () => twoFactorSetup() }];
     }
@@ -1864,6 +2428,7 @@ app.registerExtension({
 
 // browser tests: protect given nodes without the dialog
 globalThis.__h2vault = { lockSelection: (profile) => lockSelection(app.canvas, profile),
-  protectNodes: (nodes, opts) => protectWithFeedback(nodes, opts), protectTransaction, protectWholeWorkflow };
+  protectNodes: (nodes, opts) => protectWithFeedback(nodes, opts), protectTransaction, protectWholeWorkflow,
+  lockNodeParameters, lockRequest, refreshLicence, LICENCE_STATE, issueLicence, addLicence, ledgerDialog, lockParameters };
 
 export { buildApi, exportUi, scrub, OPEN };

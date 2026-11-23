@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.0 - 2026-11-23
+
+- **Lock parameters**: right-click a node, a selection or a group > Lock parameters. Each node becomes a one-node vault
+  drawn like itself (title, colours, sockets); ticked values are encrypted, the others stay editable controls. Every
+  value is locked by default; the setting names and the node's kind are shown only if the author ticks it (otherwise
+  errors also name only the vault). Locked values are blanked in errors, progress text, text outputs, history and the
+  server log while the node runs. Nodes locked together unlock with one password prompt per tab. *Unlock parameters
+  (remove protection)* restores the node (password + authenticator).
+- **Licensed profile** (envelope version 2, mode 3; existing vaults unchanged): one public workflow, one offline
+  Ed25519-signed licence per installation carrying the vault's licence key wrapped to that installation. Issue, add,
+  revoke (new licence key + re-issue), *Licences issued* overview, author key backup / restore. End dates and run limits
+  are honour-system and labelled so. No licence server, no network call.
+- Encrypted workflows: *Save workflow encrypted again (same key)*; the dialogs say that images rendered from a
+  decrypted workflow carry it in their metadata.
+- Every password field warns when the page is reached over plain http from another machine.
+- *Remove protection* for any vault (it becomes an ordinary subgraph after password + authenticator).
+- Ideas from ComfyUI-NodeEncrypt and ComfyUI-XLJworkflowCipher (credited in NOTICE; no code or text taken).
+
 ## 0.1.3 - 2026-11-23
 
 - Protect dialog: *Downloads for people who run it* lists the selection's model files and takes an https:// link for each; size and SHA-256 come from the author's own file at lock time (the protect route runs off the event loop while hashing). Live-checked in both renderers.

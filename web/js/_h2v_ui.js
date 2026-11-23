@@ -22,6 +22,17 @@ export function secondsLeft(nowMs, period = 30) {
   return period - (Math.floor(nowMs / 1000) % period);
 }
 
+/** V5 (design 7.2): is this page reached over the network without encryption? A password typed here then crosses
+ *  the network in clear. Loopback hosts and https pages are fine. `loc` = window.location (or a stand-in). */
+export function isInsecurePage(loc) {
+  if (!loc || loc.protocol !== "http:") return false;
+  const host = String(loc.hostname || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return !(host === "localhost" || host === "::1" || /^127\.\d+\.\d+\.\d+$/.test(host));
+}
+
+export const INSECURE_TEXT = "This page is not on this computer and not on https: the password travels unencrypted. " +
+  "Use an SSH tunnel or https.";
+
 // ── styles ─────────────────────────────────────────────────────────────────────────────────────────────────────
 const STYLE_ID = "h2v-style";
 const CSS = `
@@ -505,6 +516,7 @@ export function passwordField({ label, autocomplete = "new-password", strength =
   const f = field({ label, hint, control: wrap });
   if (extra.length) f.append(...extra);
   f.append(genOut);
+  if (isInsecurePage(globalThis.location)) f.append(noticeEl("warn", INSECURE_TEXT));      // V5 design 7.2
   return { el: f, input, value: () => input.value, clear: () => { input.value = ""; genOut.replaceChildren();
     input.dispatchEvent(new Event("input")); }, setValue: (v) => { input.value = v; input.dispatchEvent(new Event("input")); } };
 }

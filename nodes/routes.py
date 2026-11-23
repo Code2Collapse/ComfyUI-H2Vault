@@ -221,11 +221,14 @@ def _with_lock(plain: dict, lock, *, strict: bool = True) -> Optional[dict]:
             raise VaultError("Choose at least one value to lock.")
         look_in = lock.get("look") if isinstance(lock.get("look"), dict) else {}
         look = {"title": str(look_in.get("title") or "")[:LOCK_TITLE_MAX],
-                "node_label": str(look_in.get("node_label") or "")[:LOCK_TITLE_MAX] or None}
+                "node_label": str(look_in.get("node_label") or "")[:LOCK_TITLE_MAX] or None,
+                "show_rows": look_in.get("show_rows") is True}
         for key in ("color", "bgcolor"):
             c = look_in.get(key)
             look[key] = c if isinstance(c, str) and _COLOR.match(c) else None
-        public = {"rows": list(rows), "look": look}
+        # owner 2026-11-23 ("0 information"): the setting names and the node's kind are published only when the
+        # author asks for it; otherwise the node shows its title and how many values are locked
+        public = {"rows": list(rows) if look["show_rows"] else [], "count": len(rows), "look": look}
         leaks = [inputs[r] for r in rows if isinstance(inputs[r], str) and len(inputs[r].strip()) >= 3]
         shown = json.dumps([plain.get("interface"), public], ensure_ascii=False)
         if any(v in shown for v in leaks):
@@ -761,8 +764,13 @@ def licence_status(body: dict) -> dict:
         return {"ok": True, "licensed_vault": False}
     if vault_keys.install_private_key(create=False) is None:
         return {"ok": True, "licensed_vault": True, "licensed": False, "problem": L.NEEDS_LICENCE}
+    from . import protected_subgraph as SS
     pub = vault_keys.install_public_key()
-    lic, problem = L.best_for_run(vault_id, author_pub=p["author_pub"], install_pub=pub)
+    try:                                                       # the same check as a run (this copy opens), no count
+        _plain, lic = SS.open_licensed(payload, vault_id)
+        problem = None
+    except VaultError as exc:
+        lic, problem = None, str(exc)
     out = {"ok": True, "licensed_vault": True, "licensed": lic is not None, "problem": problem,
            "install_code": vault_keys.public_text(pub)}
     if lic is not None:
