@@ -639,12 +639,7 @@ _STREAMS_WRAPPED: set = set()
 
 def install_log_redaction() -> None:
     """On the root logger (records logged there) and on every root handler (records propagated from children)."""
-    root = logging.getLogger()
-    if _LOG_FILTER not in root.filters:
-        root.addFilter(_LOG_FILTER)
-    for h in root.handlers:
-        if _LOG_FILTER not in h.filters:
-            h.addFilter(_LOG_FILTER)
+    concealment.attach_root_filter(_LOG_FILTER)
 
 
 def install_stream_redaction() -> None:

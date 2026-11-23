@@ -871,6 +871,19 @@ def metadata_guard(orig, *, concealer: "Optional[Concealer]" = None):
     return get_input_data
 
 
+def attach_root_filter(flt: logging.Filter) -> list:
+    """Attach a logging filter where every record passes: the root logger (records logged on it) and every root handler
+    (records propagated from child loggers skip the root LOGGER's filters). Shared by V5's locked-value redaction
+    (protected_subgraph.install_log_redaction) and V8's window filter. -> the objects it was attached to."""
+    root = logging.getLogger()
+    out = []
+    for t in [root, *root.handlers]:
+        if flt not in t.filters:
+            t.addFilter(flt)
+            out.append(t)
+    return out
+
+
 class WindowLogFilter(logging.Filter):
     """V8: a logging filter for handlers that write formatted records directly (core `--verbose LEVEL FILE` file
     logs, any other root handler): inside a Concealed Window a record becomes the concealed marker, without its
@@ -1059,11 +1072,7 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
 
     # V8: handlers that format records themselves (core's --verbose LEVEL FILE log files, any other root handler)
     flt = WindowLogFilter(c)
-    handlers = [h for h in logging.getLogger().handlers
-                if not any(isinstance(f, WindowLogFilter) for f in h.filters)]
-    for h in handlers:
-        h.addFilter(flt)
-    _INSTALL["log_filters"] = (flt, handlers)
+    _INSTALL["log_filters"] = (flt, attach_root_filter(flt))
 
     # V8: core computes an inner node's cache key (IS_CHANGED / fingerprint_inputs) BEFORE that node starts, and logs
     # its exception ("WARNING: [Errno 2] No such file ...: '<inner file>'", measured live): open the window for it
@@ -1135,9 +1144,9 @@ def uninstall() -> None:
         except AttributeError:
             pass
     if "log_filters" in _INSTALL:
-        flt, handlers = _INSTALL["log_filters"]
-        for h in handlers:
-            h.removeFilter(flt)
+        flt, targets = _INSTALL["log_filters"]
+        for t in targets:
+            t.removeFilter(flt)
     if "metadata" in _INSTALL:
         mod, orig = _INSTALL["metadata"]
         mod.get_input_data = orig
