@@ -14,6 +14,11 @@ Email and SMS codes need a mail / SMS provider and a server that sends them: not
 
 A vault may also need no second factor at all ("Password only", owner 2026-11-23): its method list is empty.
 
+Policies (L9.343, docs/AUTH_POLICY.md): a vault needs ANY one (OR) or ALL (AND) of its chosen factors, with an explicit
+recovery-code rule and, optionally, only particular authenticator apps. `policy_detail` reads any stored form (old
+vaults map to the equivalent policy); `verify_policy` checks every given factor WITHOUT side effects first and commits
+(time step, used-up recovery code, passkey counter) only when all of them pass.
+
 Everything lives only in the local secrets store (`store`), never in a workflow, never derived from a vault password.
 Each authenticator secret is its own store entry (`totp_auth_<id>`, index `totp_authenticators`): the Windows
 credential store keeps at most 2560 bytes per entry, so a growing list never shares one entry.
@@ -62,7 +67,13 @@ DEFAULT_POLICY = ("totp", "recovery")  # vaults locked before methods existed (n
 CHOICES = {"password": (), "totp": ("totp", "recovery"), "passkey": ("passkey", "recovery"),
            "backup_password": ("backup_password", "recovery"),
            "any": ("totp", "passkey", "backup_password", "recovery")}
-MAX_AUTHENTICATORS = 10
+MAX_AUTHENTICATORS = 10              # the default; H2VAULT_MAX_AUTHENTICATORS may raise it up to the cap
+MAX_AUTHENTICATORS_CAP, MAX_AUTHENTICATORS_ENV = 50, "H2VAULT_MAX_AUTHENTICATORS"
+FACTORS = ("totp", "passkey", "backup_password")             # what a policy chooses; recovery codes have a rule
+MODES = ("any", "all")
+# the recovery-code rule a mode allows, the default first (docs/AUTH_POLICY.md section 4)
+RECOVERY_RULES = {"any": ("fallback", "off"), "all": ("off", "replace_one", "override")}
+RECOVERY_MODES = ("auto", "new", "keep")                     # begin_enrolment: what happens to the recovery codes
 LABEL_MAX = 60
 METHOD_LABELS = {"totp": "Authenticator app", "passkey": "Passkey or security key",
                  "backup_password": "Backup password", "recovery": "Recovery code"}
@@ -77,6 +88,17 @@ MANAGE_SECONDS = 10 * 60
 # scrypt (RFC 7914) cost: N=2^14 (16 MiB, tens of ms) for 50-bit random recovery codes, N=2^15 for a chosen password
 RECOVERY_KDF = {"n": 2 ** 14, "r": 8, "p": 1}
 PASSWORD_KDF = {"n": 2 ** 15, "r": 8, "p": 1}
+
+
+def max_authenticators() -> int:
+    """How many authenticator apps one installation may have: MAX_AUTHENTICATORS, or H2VAULT_MAX_AUTHENTICATORS (1 to
+    MAX_AUTHENTICATORS_CAP). Safe for the credential store: every app is its own small entry (< 400 bytes) and the index
+    holds only ids (~15 bytes each), far below the Windows limit of 2560 bytes per entry."""
+    try:
+        n = int(os.environ.get(MAX_AUTHENTICATORS_ENV, "") or MAX_AUTHENTICATORS)
+    except ValueError:
+        n = MAX_AUTHENTICATORS
+    return max(1, min(MAX_AUTHENTICATORS_CAP, n))
 
 
 def _totp(secret: bytes):
@@ -265,20 +287,182 @@ def choice_of(methods) -> str:
 def policy_of(plain: dict) -> list:
     """The methods a vault accepts ([] = password only). Vaults locked before methods existed accept the
     authenticator + recovery codes. An H2Vault from before "Password only" reads [] as damaged and falls back to the
-    authenticator + recovery codes: stricter, never weaker."""
-    sf = plain.get("second_factor") if isinstance(plain, dict) else None
-    try:
-        if isinstance(sf, dict):
-            if sf.get("methods") == []:
-                return []
-            return normalise_policy(sf.get("methods"))
-    except ValueError:
-        pass
-    return list(DEFAULT_POLICY)
+    authenticator + recovery codes: stricter, never weaker. L9.343: the methods that can play a part under the vault's
+    policy (`policy_detail`; the same lists as before for every vault of the previous format)."""
+    return accepted_methods(policy_detail(plain))
 
 
 def labels(methods) -> str:
     return ", ".join(METHOD_LABELS[m] for m in methods if m in METHOD_LABELS)
+
+
+# ── policies: ANY / ALL of the chosen factors (L9.343, docs/AUTH_POLICY.md) ─────────────────────────────────────
+PASSWORD_ONLY = {"methods": [], "mode": "any", "recovery": "off", "authenticators": []}
+DEFAULT_DETAIL = {"methods": ["totp"], "mode": "any", "recovery": "fallback", "authenticators": []}
+STRICTEST = {"methods": list(FACTORS), "mode": "all", "recovery": "off", "authenticators": []}
+
+
+def _read_policy(sf: dict) -> dict:
+    """A stored `second_factor` record -> policy detail. Raises ValueError on anything it cannot read."""
+    if sf.get("v") is not None and sf.get("v") != 2:
+        raise ValueError("a policy format this H2Vault does not know")
+    if sf.get("v") == 2:
+        raw = sf.get("methods")
+        if not isinstance(raw, list) or {str(m) for m in raw} - set(METHODS):
+            raise ValueError("bad methods")
+        factors = [m for m in FACTORS if m in raw]
+        mode, rule = sf.get("mode"), sf.get("recovery")
+        if not factors or mode not in MODES or rule not in RECOVERY_RULES[mode]:
+            raise ValueError("bad policy")
+        auths = sf.get("authenticators") or []
+        if not isinstance(auths, list) or not all(isinstance(a, str) and a for a in auths) or (
+                auths and "totp" not in factors):
+            raise ValueError("bad authenticators")
+        return {"methods": factors, "mode": mode, "recovery": rule, "authenticators": list(auths)}
+    if sf.get("methods") == []:
+        return dict(PASSWORD_ONLY, methods=[], authenticators=[])
+    listed = normalise_policy(sf.get("methods"))               # the format before L9.343: OR, recovery as fallback
+    return {"methods": [m for m in listed if m != "recovery"], "mode": "any", "recovery": "fallback",
+            "authenticators": []}
+
+
+def policy_detail(plain: dict) -> dict:
+    """The vault's policy {"methods": [factors], "mode": "any"|"all", "recovery": rule, "authenticators": [ids]}.
+    Old vaults map to the equivalent policy (docs/AUTH_POLICY.md section 2); anything unreadable to the authenticator
+    app + recovery codes (stricter, never weaker - as policy_of always did)."""
+    sf = plain.get("second_factor") if isinstance(plain, dict) else None
+    if isinstance(sf, dict):
+        try:
+            return _read_policy(sf)
+        except (ValueError, TypeError):
+            if sf.get("v") is not None:                        # a policy record this code cannot read (damaged, or
+                return dict(STRICTEST, methods=list(FACTORS), authenticators=[])   # newer): never weaker
+    return dict(DEFAULT_DETAIL, methods=["totp"], authenticators=[])
+
+
+def accepted_methods(policy: dict) -> list:
+    """Every method that can play a part in opening the vault ([] = password only), in METHODS order."""
+    if not policy["methods"]:
+        return []
+    return [m for m in METHODS if m in policy["methods"] or (m == "recovery" and policy["recovery"] != "off")]
+
+
+def normalise_policy_choice(value) -> dict:
+    """The author's answer -> what the vault stores. The one question ({"choice": ...}) and the previous Advanced form
+    ({"methods": [...]}) store the old shape {"methods": [...]}; a policy ({"methods", "mode", "recovery",
+    "authenticators"}) stores the old shape too when it means the same (OR, recovery as fallback, every app), else a
+    `v: 2` record. Raises ValueError in plain words."""
+    if not isinstance(value, dict) or value.get("choice") not in (None, "custom") or not (
+            "mode" in value or "recovery" in value or value.get("authenticators")):
+        return {"methods": normalise_choice(value)}
+    raw = value.get("methods")
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError("Choose which second factors may open this vault.")
+    unknown = {str(m) for m in raw} - set(METHODS)
+    if unknown:
+        raise ValueError(f"Unknown second-factor method: {sorted(unknown)[0]}.")
+    factors = [m for m in FACTORS if m in {str(x) for x in raw}]
+    if not factors:
+        raise ValueError("Choose at least one second factor besides recovery codes (authenticator app, passkey or "
+                         "backup password).")
+    mode = str(value.get("mode") or "any")
+    if mode not in MODES:
+        raise ValueError("Choose whether ANY one of the factors is enough or ALL of them are needed.")
+    rule = str(value.get("recovery") or RECOVERY_RULES[mode][0])
+    if rule not in RECOVERY_RULES[mode]:
+        raise ValueError("With 'any one factor', recovery codes are either accepted or not; with 'all factors' they "
+                         "are not accepted, may replace one missing factor, or are an emergency override.")
+    if mode == "all" and rule == "replace_one" and len(factors) == 1:
+        raise ValueError("With only one factor, 'a recovery code may replace one missing factor' would let a recovery "
+                         "code alone open the vault. Choose 'Emergency override' if that is what you want, or tick "
+                         "more factors.")
+    auths = value.get("authenticators") or []
+    if not isinstance(auths, (list, tuple)):
+        raise ValueError("Choose the authenticator apps from the list.")
+    auths = list(dict.fromkeys(str(a) for a in auths if str(a or "")))
+    if auths:
+        if "totp" not in factors:
+            raise ValueError("Particular authenticator apps can be chosen only when the vault accepts an authenticator "
+                             "app.")
+        known = {a["id"] for a in _authenticators()}
+        if any(a not in known for a in auths):
+            raise ValueError("One of the chosen authenticator apps is not set up on this installation (removed in "
+                             "another tab?). Reload the list and choose again.")
+    if mode == "any" and rule == "fallback" and not auths:
+        return {"methods": factors + ["recovery"]}             # byte-for-byte the format before L9.343
+    out = {"methods": factors, "mode": mode, "recovery": rule, "v": 2}
+    if auths:
+        out["authenticators"] = auths
+    return out
+
+
+FACTOR_WORDS = {"totp": "a code from an authenticator app", "passkey": "a passkey or security key",
+                "backup_password": "the backup password"}
+RECOVERY_WORDS = {
+    ("any", "fallback"): "A recovery code can be used instead (each works once).",
+    ("any", "off"): "Recovery codes are not accepted.",
+    ("all", "off"): "Recovery codes are not accepted.",
+    ("all", "replace_one"): "A recovery code may replace ONE missing factor (each code works once).",
+    ("all", "override"): "Emergency override: the password plus a recovery code alone also opens it (each code works "
+                         "once)."}
+
+
+def policy_summary(policy: dict, app_names=None) -> str:
+    """The policy in one or two plain sentences (the same words as the lock dialog's preview)."""
+    if not policy["methods"]:
+        return "The vault password only - no second factor."
+    words = []
+    for m in policy["methods"]:
+        if m == "totp" and policy["authenticators"]:
+            names = [n for n in (app_names or []) if n]
+            words.append("a code from " + (f"one of these authenticator apps: {', '.join(names)}" if names else
+                                           "one of the authenticator apps chosen for this vault"))
+        else:
+            words.append(FACTOR_WORDS[m])
+    if len(words) == 1:
+        need = words[0]
+    elif policy["mode"] == "any":
+        need = "ONE of: " + ", ".join(words[:-1]) + " or " + words[-1]
+    else:
+        need = " AND ".join(words)
+    return f"The vault password AND {need}. {RECOVERY_WORDS[(policy['mode'], policy['recovery'])]}"
+
+
+def policy_public(policy: dict) -> dict:
+    """What an answer may say about a policy: kinds, mode, rule, the NAMES of the chosen apps - never a secret."""
+    names = []
+    if policy["authenticators"]:
+        known = {a["id"]: a.get("label") or "Authenticator app" for a in _authenticators()}
+        names = [known[i] for i in policy["authenticators"] if i in known]
+    return {"methods": list(policy["methods"]), "mode": policy["mode"], "recovery": policy["recovery"],
+            "accepted": accepted_methods(policy), "authenticators": names,
+            "restricted": bool(policy["authenticators"]), "summary": policy_summary(policy, names)}
+
+
+def satisfiable(policy: dict, have: dict, auth_ids=None) -> str:
+    """Can the policy still be met with `have` ({method: count / bool}, methods_set_up form) and the authenticator
+    app ids `auth_ids`? -> "ok", "recovery_only" (only by a recovery code) or "no"."""
+    factors = policy["methods"]
+    if not factors:
+        return "ok"
+    chosen = set(policy.get("authenticators") or [])
+
+    def available(m):
+        if m == "totp" and chosen and auth_ids is not None:
+            return bool(chosen & set(auth_ids))
+        return bool(have.get(m))
+    met = [m for m in factors if available(m)]
+    codes = bool(have.get("recovery"))
+    if policy["mode"] == "any":
+        if met:
+            return "ok"
+        return "recovery_only" if policy["recovery"] == "fallback" and codes else "no"
+    if len(met) == len(factors):
+        return "ok"
+    if codes and (policy["recovery"] == "override" or
+                  (policy["recovery"] == "replace_one" and len(factors) - len(met) == 1)):
+        return "recovery_only"
+    return "no"
 
 
 # ── failures and lockout (per scope + across scopes, exponential) ───────────────────────────────────────────────
@@ -365,36 +549,59 @@ def _recovery_code() -> str:
     return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
 
 
-def begin_enrolment(account: str = "ComfyUI vault", label: str = "", add: bool = False) -> dict:
-    """A new secret (+ a first set of recovery codes when this install has none), shown ONCE; active only after
+def _codes_for(recovery: str) -> list:
+    """The recovery codes a new enrolment brings: "auto" = a first set only when none are left (the behaviour before
+    L9.343, now named), "new" = a fresh set that REPLACES the old one when the app is confirmed, "keep" = none."""
+    if recovery == "new" or (recovery == "auto" and recovery_codes_left() == 0):
+        return [_recovery_code() for _ in range(RECOVERY_COUNT)]
+    return []
+
+
+def begin_enrolment(account: str = "ComfyUI vault", label: str = "", add: bool = False,
+                    recovery: str = "auto") -> dict:
+    """A new secret (+ recovery codes per `recovery`, see _codes_for), shown ONCE; active only after
     confirm_enrolment(first code). `add`: another app next to the ones set up (the caller checked a proof first)."""
+    if recovery not in RECOVERY_MODES:
+        raise ValueError(f"Unknown recovery-code choice: {str(recovery)[:20]}.")
     with _lock:
         auths = _authenticators()
         if auths and not add:
             raise PermissionError("An authenticator is already set up on this install. Add another under H2Vault menu "
                                   "> Second factor (needs one of your methods).")
-        if len(auths) >= MAX_AUTHENTICATORS:
+        limit = max_authenticators()
+        if len(auths) >= limit:
             raise PermissionError(f"This installation has {len(auths)} authenticator apps, at most "
-                                  f"{MAX_AUTHENTICATORS} are allowed. Remove one you no longer use first.")
+                                  f"{limit} are allowed. Remove one you no longer use first.")
         label = _clean_label(label)
         if label and _label_taken(label, auths):
             raise PermissionError(f"Another authenticator is already called '{label}'. Choose another name.")
         label = label or _default_label(auths)
         if _pending and time.time() - _pending.get("at", 0) <= 15 * 60:
-            secret, codes = _pending["secret"], _pending["codes"]   # same setup while it is pending (QR <-> key)
+            secret = _pending["secret"]                      # same setup while it is pending (QR <-> key)
+            if _pending.get("recovery_mode", "auto") != recovery:
+                _pending["codes"] = _codes_for(recovery)     # the author changed the recovery choice: new codes
+            codes = _pending["codes"]
         else:
             secret = os.urandom(20)
-            codes = [_recovery_code() for _ in range(RECOVERY_COUNT)] if recovery_codes_left() == 0 else []
+            codes = _codes_for(recovery)
             _pending.clear()
             _pending.update({"secret": secret, "codes": codes, "at": time.time()})
-        _pending["label"] = label
+        _pending["label"], _pending["recovery_mode"] = label, recovery
+    left = recovery_codes_left()
     account = label if auths else account                    # the phone shows "H2Vault: <name>": two apps stay apart
     uri = _totp(secret).get_provisioning_uri(account, "H2Vault")
     b32 = base64.b32encode(secret).decode("ascii").rstrip("=")
     return {"secret_base32": b32, "secret_grouped": " ".join(b32[i:i + 4] for i in range(0, len(b32), 4)),
             "otpauth_uri": uri, "qr_svg": qr_svg(uri), "recovery_codes": codes,
-            "recovery_kept": 0 if codes else recovery_codes_left(), "issuer": "H2Vault",
+            "recovery_kept": 0 if codes else left, "recovery_replaces": left if codes else 0,
+            "recovery_mode": recovery, "issuer": "H2Vault",
             "account": account, "label": label, "algorithm": "SHA1", "digits": DIGITS, "period": STEP}
+
+
+def pending_has_codes() -> bool:
+    """Does the waiting enrolment bring recovery codes (the page must say they were saved before it is confirmed)?"""
+    with _lock:
+        return bool(_pending.get("codes")) and time.time() - _pending.get("at", 0) <= 15 * 60
 
 
 def qr_svg(text: str, border: int = 4) -> str:
@@ -420,11 +627,15 @@ def last_enrolment_error() -> str:
     return str(_pending.get("last_error") or "")
 
 
-def confirm_enrolment(code: str, now: Optional[float] = None) -> bool:
+def confirm_enrolment(code: str, now: Optional[float] = None, recovery_saved: Optional[bool] = None) -> bool:
+    """`recovery_saved` (the page's "I saved the recovery codes"): False refuses (ValueError) an enrolment that brings
+    recovery codes; None = not asked (module callers)."""
     with _lock:
         if not _pending or time.time() - _pending.get("at", 0) > 15 * 60:
             _pending.clear()
             raise PermissionError("No enrolment is waiting (or it expired). Start the setup again.")
+        if recovery_saved is False and _pending.get("codes"):
+            raise ValueError("Confirm that you saved the recovery codes first (tick 'I saved the recovery codes').")
         step = _match(_pending["secret"], code, now)
         if step is None:
             skew = _probe_clock(_pending["secret"], code, now)
@@ -435,9 +646,9 @@ def confirm_enrolment(code: str, now: Optional[float] = None) -> bool:
                 "type the setup key again if the app shows no entry).")
             return False
         auths = _authenticators()
-        if len(auths) >= MAX_AUTHENTICATORS:
+        if len(auths) >= max_authenticators():
             _pending.clear()
-            raise PermissionError(f"At most {MAX_AUTHENTICATORS} authenticator apps per installation.")
+            raise PermissionError(f"At most {max_authenticators()} authenticator apps per installation.")
         label = _pending.get("label") or _default_label(auths)
         if _label_taken(label, auths):                       # another tab took the name meanwhile
             label = _default_label(auths)
@@ -534,8 +745,9 @@ def new_recovery_codes() -> list:
     return codes
 
 
-def _use_recovery(code: str) -> Optional[int]:
-    """Consume a matching recovery code -> codes left, or None. Every stored hash is compared (constant time)."""
+def _find_recovery(code: str):
+    """-> (stored data, index of the matching hash) or None. No side effect. Every stored hash is compared (constant
+    time)."""
     norm = _norm_recovery(code)
     if not norm or len(norm) > 32:
         return None
@@ -550,14 +762,22 @@ def _use_recovery(code: str) -> Optional[int]:
     for k, known in enumerate(data["hashes"]):
         if hmac.compare_digest(str(known), h) and hit is None:
             hit = k
-    if hit is None:
-        return None
+    return None if hit is None else (data, hit)
+
+
+def _consume_recovery(data: dict, hit: int) -> int:
     data["hashes"].pop(hit)
     if data["v"] == 1:
         vault_store.put(_RECOVERY, json.dumps(data["hashes"]))
     else:
         vault_store.put(_RECOVERY, json.dumps(data))
     return len(data["hashes"])
+
+
+def _use_recovery(code: str) -> Optional[int]:
+    """Consume a matching recovery code -> codes left, or None."""
+    found = _find_recovery(code)
+    return None if found is None else _consume_recovery(*found)
 
 
 # ── backup password ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -585,6 +805,26 @@ def _check_backup_password(secret: str) -> bool:
     rec = json.loads(raw)
     got = _scrypt(str(secret), base64.b64decode(rec["salt"]), rec.get("kdf") or PASSWORD_KDF).hex()
     return hmac.compare_digest(got, str(rec["hash"]))
+
+
+def _stamp_backup_password(t: float) -> None:
+    """Note when the backup password was last used (a date, never the password or its hash outside the store)."""
+    try:
+        rec = json.loads(vault_store.get(_BACKUP_PW) or "null")
+    except ValueError:
+        return
+    if isinstance(rec, dict):
+        rec["last_used"] = int(t)
+        vault_store.put(_BACKUP_PW, json.dumps(rec))
+
+
+def backup_password_info() -> dict:
+    """{"set": bool, "last_used": unix time or 0} - never the hash."""
+    try:
+        rec = json.loads(vault_store.get(_BACKUP_PW) or "null")
+    except ValueError:
+        rec = None
+    return {"set": isinstance(rec, dict), "last_used": int(rec.get("last_used") or 0) if isinstance(rec, dict) else 0}
 
 
 # ── passkeys (WebAuthn) ─────────────────────────────────────────────────────────────────────────────────────────
@@ -631,18 +871,29 @@ def _user_handle() -> bytes:
     return handle
 
 
-def passkey_register_begin(rp_id: str, label: str = "") -> dict:
-    """navigator.credentials.create() options (JSON-safe: binary fields are base64url)."""
+PASSKEY_KINDS = {"any": None, "platform": "platform", "security_key": "cross-platform"}   # -> authenticatorAttachment
+
+
+def passkey_register_begin(rp_id: str, label: str = "", kind: str = "any") -> dict:
+    """navigator.credentials.create() options (JSON-safe: binary fields are base64url). `kind`: "platform" (Windows
+    Hello / Touch ID on this device), "security_key" (YubiKey and other FIDO2 keys) or "any" (the browser offers
+    all)."""
     from .webauthn_min import SUPPORTED_ALGS, b64url
     rp_id = check_rp_id(rp_id)
+    kind = str(kind or "any")
+    if kind not in PASSKEY_KINDS:
+        raise PermissionError("Choose the kind of passkey: this device, a security key, or any.")
     label = str(label or "").strip()[:60] or "Passkey"
-    cid, challenge = _new_challenge("create", rp_id, label=label)
+    cid, challenge = _new_challenge("create", rp_id, label=label, pk_kind=kind)
+    selection = {"userVerification": "preferred", "residentKey": "discouraged"}
+    if PASSKEY_KINDS[kind]:
+        selection["authenticatorAttachment"] = PASSKEY_KINDS[kind]
     return {"challenge_id": cid, "publicKey": {
         "challenge": b64url(challenge), "rp": {"id": rp_id, "name": "H2Vault"},
         "user": {"id": b64url(_user_handle()), "name": "h2vault", "displayName": "H2Vault on this ComfyUI"},
         "pubKeyCredParams": [{"type": "public-key", "alg": a} for a in SUPPORTED_ALGS],
         "excludeCredentials": [{"type": "public-key", "id": c["id"]} for c in _passkeys() if c.get("rp_id") == rp_id],
-        "authenticatorSelection": {"userVerification": "preferred", "residentKey": "discouraged"},
+        "authenticatorSelection": selection,
         "attestation": "none", "timeout": CHALLENGE_SECONDS * 1000}}
 
 
@@ -658,7 +909,7 @@ def passkey_register_finish(challenge_id: str, credential: dict, origins) -> dic
         if any(hmac.compare_digest(x["id"], out["id"]) for x in creds):
             raise PermissionError("This passkey is already registered here.")
         rec = {**out, "rp_id": c["rp_id"], "label": c.get("label") or "Passkey", "created": int(time.time()),
-               "last_used": 0}
+               "last_used": 0, "kind": c.get("pk_kind") or "any"}
         creds.append(rec)
         _save_passkeys(creds)
     return _public_passkey(rec)
@@ -666,7 +917,7 @@ def passkey_register_finish(challenge_id: str, credential: dict, origins) -> dic
 
 def _public_passkey(c: dict) -> dict:
     return {"id": c["id"], "label": c.get("label", "Passkey"), "rp_id": c.get("rp_id", ""),
-            "created": c.get("created", 0), "last_used": c.get("last_used", 0)}
+            "created": c.get("created", 0), "last_used": c.get("last_used", 0), "kind": c.get("kind") or "any"}
 
 
 def passkeys_public() -> list:
@@ -698,7 +949,9 @@ def passkey_challenge(rp_id: str) -> dict:
 
 
 def _check_passkey(factor: dict, origins) -> tuple:
-    """-> (ok, message). A wrong / foreign answer is (False, message); an expired request raises PermissionError."""
+    """-> (ok, message, commit, label). A wrong / foreign answer is (False, message, None, None); an expired request
+    raises PermissionError. The challenge is used up at once (single use); the counter and date are written only by
+    commit()."""
     from .webauthn_min import WebAuthnError, unb64url, verify_assertion
     c = _take_challenge(factor.get("challenge_id"), "get")
     cred = factor.get("credential") or {}
@@ -708,17 +961,19 @@ def _check_passkey(factor: dict, origins) -> tuple:
         rec = next((x for x in creds if hmac.compare_digest(x["id"], str(cred.get("id") or ""))
                     and x.get("rp_id") == c["rp_id"]), None)
         if rec is None:
-            return False, "That passkey is not registered on this installation."
+            return False, "That passkey is not registered on this installation.", None, None
         try:
             count = verify_assertion(credential=rec, client_data_json=unb64url(resp.get("clientDataJSON")),
                                      authenticator_data=unb64url(resp.get("authenticatorData")),
                                      signature=unb64url(resp.get("signature")), challenge=c["challenge"],
                                      origins=origins, rp_id=c["rp_id"])
         except WebAuthnError as exc:
-            return False, str(exc)
+            return False, str(exc), None, None
+
+    def commit():
         rec["sign_count"], rec["last_used"] = count, int(time.time())
         _save_passkeys(creds)
-    return True, "Verified with your passkey."
+    return True, "Verified with your passkey.", commit, rec.get("label") or "Passkey"
 
 
 # ── verifying a factor ──────────────────────────────────────────────────────────────────────────────────────────
@@ -731,62 +986,178 @@ def method_of(factor) -> str:
     return "totp" if len(code) == DIGITS and code.isdigit() else "recovery"
 
 
+def _gate(now: Optional[float], scope: str) -> None:
+    """Raises PermissionError while locked out or when no method is set up at all (never counted)."""
+    if not any_enrolled():
+        raise PermissionError("No second factor is set up on this install yet. Set one up under H2Vault menu > "
+                              "Second factor.")
+    wait = locked_out(now, scope)
+    if wait > 0:
+        raise PermissionError(_lockout_message(wait))
+
+
+def _not_set_up(method: str, auth_ids=None) -> Optional[dict]:
+    """None when `method` can be checked here; else the (uncounted) "not_set_up" answer. `auth_ids`: only these
+    authenticator apps count (a vault that names particular apps)."""
+    if method == "totp":
+        n = len([a for a in _authenticators() if auth_ids is None or a["id"] in auth_ids])
+    elif method == "passkey":
+        n = len(_passkeys())
+    elif method == "backup_password":
+        n = bool(vault_store.get(_BACKUP_PW))
+    else:
+        n = recovery_codes_left()
+    if n:
+        return None
+    if method == "totp" and auth_ids is not None and _authenticators():
+        message = ("This vault accepts only particular authenticator apps (chosen when it was locked), and none of "
+                   "them is set up on this installation. Use another method it accepts.")
+    else:
+        message = (f"No {METHOD_LABELS[method].lower()} is set up on this installation" + (
+            " (no recovery codes left)" if method == "recovery" else "") +
+            ". Use another method, or set one up under H2Vault menu > Second factor.")
+    return {"ok": False, "reason": "not_set_up", "method": method, "message": message}
+
+
+def _check(method: str, factor: dict, now: Optional[float], origins, auth_ids=None) -> dict:
+    """Check ONE factor without side effects (a passkey challenge is used up - it is single use anyway). -> the answer
+    verify_factor gives, plus "commit" (a callable that writes the side effects and returns extra answer fields) and
+    "label" (what was used, never a secret) when it passed."""
+    if method == "totp":
+        return _check_totp(str(factor.get("code") or ""), now, auth_ids)
+    if method == "recovery":
+        found = _find_recovery(str(factor.get("code") or ""))
+        if found is None:
+            return {"ok": False, "reason": "wrong", "method": "recovery",
+                    "message": "That recovery code is not right or was already used (each works once)."}
+
+        def used_up():
+            left = _consume_recovery(*found)
+            return {"recovery_codes_left": left, "message": f"Recovery code used ({left} left)."}
+        return {"ok": True, "reason": "recovery", "method": "recovery", "label": METHOD_LABELS["recovery"],
+                "commit": used_up}
+    if method == "backup_password":
+        if _check_backup_password(str(factor.get("secret") or "")):
+            t = time.time() if now is None else now
+            return {"ok": True, "reason": "backup_password", "method": method, "message": "Verified.",
+                    "label": METHOD_LABELS[method], "commit": lambda: _stamp_backup_password(t) or {}}
+        return {"ok": False, "reason": "wrong", "method": method, "message": "That backup password is not right."}
+    ok, message, commit, label = _check_passkey(factor, origins)
+    if ok:
+        return {"ok": True, "reason": "passkey", "method": "passkey", "message": message, "label": label,
+                "commit": lambda: commit() or {}}
+    return {"ok": False, "reason": "wrong", "method": "passkey", "message": message}
+
+
+def _finish(results: list, scope: str, now: Optional[float], combined: Optional[dict] = None) -> dict:
+    """All checks done: any failure -> that answer (ONE counted failure when a factor was wrong, whatever the number
+    of factors); else every side effect is committed together and the answer names what was used."""
+    bad = [r for r in results if not r["ok"]]
+    if bad:
+        wrong = [r for r in bad if r["reason"] == "wrong"]
+        if wrong:
+            _fail(now, scope)
+        out = dict((wrong or bad)[0])
+        out.pop("commit", None)
+        if wrong and len(results) > 1:                         # several factors: never say which one was wrong
+            out = {"ok": False, "reason": "wrong", "method": "policy",
+                   "message": "One of the factors is not right (or a recovery code was already used). Check them "
+                              "all and try again with a fresh authenticator code."}
+        return out
+    used, extra = [], {}
+    for r in results:
+        extra.update(r["commit"]() or {})
+        used.append({"method": r["method"], "label": r.get("label") or METHOD_LABELS.get(r["method"], "")})
+    _succeeded(scope)
+    note_activity(used, scope)
+    if len(results) == 1:
+        out = {k: v for k, v in results[0].items() if k not in ("commit", "label")}
+    else:
+        out = {"ok": True, "reason": "policy", "method": results[0]["method"], "message": "Verified."}
+    out.update(extra)
+    out["used"] = used
+    if combined:
+        out.update(combined)
+    return out
+
+
 def verify_factor(factor: dict, *, allowed=None, scope: Optional[str] = None, now: Optional[float] = None,
-                  origins=()) -> dict:
-    """{"ok": bool, "reason", "method", "message", ...}. Reasons that are not guesses are never counted:
+                  origins=(), authenticators=None) -> dict:
+    """{"ok": bool, "reason", "method", "message", "used", ...}. Reasons that are not guesses are never counted:
     "method_not_allowed" (+ "allowed"), "not_set_up", "reused" (+ "next_in"), "clock" (+ "skew_seconds").
     "wrong" is counted in `scope` and across scopes. Raises PermissionError while locked out or when no method is
-    set up at all."""
+    set up at all. `authenticators`: only these app ids count as an authenticator code."""
     factor = factor if isinstance(factor, dict) else {}
     method = method_of(factor)
     scope = scope or "manage"
     with _lock:
-        if not any_enrolled():
-            raise PermissionError("No second factor is set up on this install yet. Set one up under H2Vault menu > "
-                                  "Second factor.")
-        wait = locked_out(now, scope)
-        if wait > 0:
-            raise PermissionError(_lockout_message(wait))
+        _gate(now, scope)
         allowed = list(allowed) if allowed else list(METHODS)
         if method not in allowed:
             return {"ok": False, "reason": "method_not_allowed", "method": method, "allowed": allowed,
                     "message": f"This vault does not accept a {METHOD_LABELS[method].lower()}. It accepts: "
                                f"{labels(allowed)}."}
-        have = methods_set_up()
-        if not have[method]:
-            return {"ok": False, "reason": "not_set_up", "method": method,
-                    "message": f"No {METHOD_LABELS[method].lower()} is set up on this installation" + (
-                        " (no recovery codes left)" if method == "recovery" else "") +
-                    ". Use another method, or set one up under H2Vault menu > Second factor."}
-        if method == "totp":
-            return _verify_totp(str(factor.get("code") or ""), now, scope)
-        if method == "recovery":
-            left = _use_recovery(str(factor.get("code") or ""))
-            if left is not None:
-                _succeeded(scope)
-                return {"ok": True, "reason": "recovery", "method": "recovery", "recovery_codes_left": left,
-                        "message": f"Recovery code used ({left} left)."}
-            _fail(now, scope)
-            return {"ok": False, "reason": "wrong", "method": "recovery",
-                    "message": "That recovery code is not right or was already used (each works once)."}
-        if method == "backup_password":
-            if _check_backup_password(str(factor.get("secret") or "")):
-                _succeeded(scope)
-                return {"ok": True, "reason": "backup_password", "method": method, "message": "Verified."}
-            _fail(now, scope)
-            return {"ok": False, "reason": "wrong", "method": method, "message": "That backup password is not right."}
-        ok, message = _check_passkey(factor, origins)
-        if ok:
-            _succeeded(scope)
-            return {"ok": True, "reason": "passkey", "method": "passkey", "message": message}
-        _fail(now, scope)
-        return {"ok": False, "reason": "wrong", "method": "passkey", "message": message}
+        missing = _not_set_up(method, authenticators)
+        if missing:
+            return missing
+        return _finish([_check(method, factor, now, origins, authenticators)], scope, now)
 
 
-def _verify_totp(code: str, now: Optional[float], scope: str) -> dict:
-    """Any registered app's code is accepted, once per app. Every app is checked (the time taken does not tell which
-    one matched); a wrong code is ONE failure however many apps there are."""
-    auths = _authenticators()
+def _need_words(methods) -> str:
+    return " and ".join(METHOD_LABELS[m].lower() for m in methods)
+
+
+def verify_policy(factors, policy: dict, *, scope: Optional[str] = None, now: Optional[float] = None,
+                  origins=()) -> dict:
+    """Check the second factor(s) of a request against a vault's policy (docs/AUTH_POLICY.md sections 4-5). The
+    password was checked before. `factors`: [{"method", ...}, ...] (the first of each method counts). Answers like
+    verify_factor, plus "factor_required" (+ "missing") when a factor the policy needs was not given (not counted)."""
+    scope = scope or "manage"
+    given = []
+    for f in factors or []:
+        if has_factor(f) and method_of(f) not in [m for m, _ in given]:
+            given.append((method_of(f), f))
+    accepted = accepted_methods(policy)
+    if not accepted:                                           # password only: nothing to check, nothing used up
+        return {"ok": True, "reason": "password_only", "used": []}
+    auth_ids = list(policy["authenticators"]) or None
+    with _lock:
+        _gate(now, scope)
+        if not given:
+            return {"ok": False, "reason": "factor_required", "missing": list(policy["methods"]),
+                    "message": "This vault also needs a second factor: " + labels(accepted) + "."}
+        for m, _f in given:
+            if m not in accepted:
+                return {"ok": False, "reason": "method_not_allowed", "method": m, "allowed": accepted,
+                        "message": f"This vault does not accept a {METHOD_LABELS[m].lower()}. It accepts: "
+                                   f"{labels(accepted)}."}
+        if policy["mode"] == "any":                            # a recovery code only when nothing else was given
+            use = [next((g for g in given if g[0] != "recovery"), given[0])]
+        else:
+            by = dict(given)
+            missing = [m for m in policy["methods"] if m not in by]
+            if not missing:
+                use = [(m, by[m]) for m in policy["methods"]]              # a recovery code not needed: not used up
+            elif "recovery" in by and policy["recovery"] == "override":
+                use = [("recovery", by["recovery"])]          # the author's explicit emergency override
+            elif "recovery" in by and policy["recovery"] == "replace_one" and len(missing) == 1:
+                use = [(m, by[m]) for m in policy["methods"] if m in by] + [("recovery", by["recovery"])]
+            else:
+                return {"ok": False, "reason": "factor_required", "missing": missing,
+                        "message": "This vault needs ALL of its second factors. Still missing: " +
+                                   _need_words(missing) + "."}
+        for m, _f in use:
+            absent = _not_set_up(m, auth_ids)
+            if absent:
+                return absent
+        return _finish([_check(m, f, now, origins, auth_ids) for m, f in use], scope, now)
+
+
+def _check_totp(code: str, now: Optional[float], auth_ids=None) -> dict:
+    """Any registered (or, for a vault that names apps, any named) app's code is accepted, once per app: each app has
+    its own last accepted time step. Every app is checked (the time taken does not tell which one matched). No side
+    effect: the time step and date are written by "commit"; a wrong code is counted by the caller, ONCE."""
+    auths = [a for a in _authenticators() if auth_ids is None or a["id"] in auth_ids]
     t = time.time() if now is None else now
     hits = []
     for a in auths:
@@ -796,11 +1167,14 @@ def _verify_totp(code: str, now: Optional[float], scope: str) -> dict:
     fresh = [(a, step) for a, step in hits if step > int(a.get("last_step", -1))]
     if fresh:
         a, step = fresh[0]
-        a["last_step"], a["last_used"] = step, int(t)
-        _auth_save(a)
-        _succeeded(scope)
+
+        def commit():
+            a["last_step"], a["last_used"] = step, int(t)
+            _auth_save(a)
+            return {}
         return {"ok": True, "reason": "ok", "method": "totp", "authenticator": a.get("label", ""),
-                "message": "Verified."}
+                "authenticator_id": a["id"], "label": a.get("label") or METHOD_LABELS["totp"], "message": "Verified.",
+                "commit": commit}
     if hits:
         nxt = int(STEP - (t % STEP)) + 1
         return {"ok": False, "reason": "reused", "method": "totp", "next_in": nxt,
@@ -817,10 +1191,44 @@ def _verify_totp(code: str, now: Optional[float], scope: str) -> dict:
                 "message": f"That code matches a time {abs(skew)} s away: this computer's clock is about "
                            f"{abs(skew)} s {side} your phone's. Codes depend on the clock (not the time zone): "
                            "turn on automatic time sync on both, then try a fresh code."}
-    _fail(now, scope)
     return {"ok": False, "reason": "wrong", "method": "totp",
             "message": "That code is not right. Use the current 6-digit code of the 'H2Vault' entry in your "
                        "authenticator app (codes from 30 s before or after are accepted)."}
+
+
+# ── last authentication activity (not secret: when, which method, which app's NAME) ────────────────────────────
+ACTIVITY_FILE, ACTIVITY_MAX = "second_factor_activity.json", 10
+
+
+def _activity_path():
+    from . import secrets_store
+    return secrets_store._user_dir() / ACTIVITY_FILE
+
+
+def activity() -> list:
+    """The last ACTIVITY_MAX successful second-factor checks, newest first: [{"at", "method", "label", "where"}]."""
+    try:
+        data = json.loads(_activity_path().read_text("utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [e for e in data if isinstance(e, dict)][:ACTIVITY_MAX] if isinstance(data, list) else []
+
+
+def note_activity(used: list, scope: str) -> None:
+    """Best effort: a failure here never stops an open. `where` = "vault" (opening / access) or "settings"."""
+    try:
+        where = "vault" if str(scope).startswith("v:") else "settings"
+        now = int(time.time())
+        events = [{"at": now, "method": u["method"], "label": _clean_label(u.get("label")), "where": where}
+                  for u in used]
+        with _lock:
+            path = _activity_path()
+            data = (events + activity())[:ACTIVITY_MAX]
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("[H2Vault] could not note the second-factor activity: %s", type(exc).__name__)
 
 
 def verify_detail(code: str, now: Optional[float] = None) -> dict:
@@ -842,33 +1250,121 @@ def reset(code: str, now: Optional[float] = None) -> bool:
 
 
 # ── settings tokens: one proof, then a few minutes to change methods ───────────────────────────────────────────
-def manage_begin(factor: Optional[dict] = None, *, now: Optional[float] = None, origins=()) -> dict:
+ALL_PROVEN = "*"                       # a token made while nothing was set up: the first setup session
+
+
+def _proven_of(detail: dict) -> set:
+    """What a successful check proved: method names, plus "totp:<app id>" for the authenticator app used."""
+    out = {u["method"] for u in detail.get("used") or [] if u.get("method")}
+    if detail.get("authenticator_id"):
+        out.add(f"totp:{detail['authenticator_id']}")
+    return out
+
+
+def manage_begin(factor: Optional[dict] = None, *, now: Optional[float] = None, origins=(),
+                 token: Optional[str] = None) -> dict:
     """{"ok": True, "manage_token", "expires_in"} after a proof with any method set up here (none needed while no
-    method exists), else the verify_factor answer."""
+    method exists), else the verify_factor answer. L9.343: the token remembers WHAT was proven; `token` (a live one)
+    adds this proof to it (a change a vault's policy guards may need more than one factor, see step_up_vaults)."""
     if any_enrolled():
         detail = verify_factor(factor or {}, scope="manage", now=now, origins=origins)
         if not detail["ok"]:
             return detail
+        proven = _proven_of(detail)
     else:
-        detail = {"ok": True, "reason": "none_set_up"}
-    token = secrets.token_urlsafe(24)
+        detail, proven = {"ok": True, "reason": "none_set_up"}, {ALL_PROVEN}
     t = time.monotonic()
     with _lock:
-        for k in [k for k, exp in _manage.items() if exp < t]:
+        for k in [k for k, rec in _manage.items() if rec["exp"] < t]:
             _manage.pop(k, None)
-        _manage[token] = t + MANAGE_SECONDS
-    return {**detail, "ok": True, "manage_token": token, "expires_in": MANAGE_SECONDS}
+        rec = _manage.get(str(token or "")) if token else None
+        if rec is None:
+            token = secrets.token_urlsafe(24)
+            rec = _manage[token] = {"exp": t + MANAGE_SECONDS, "proven": set()}
+        rec["proven"] |= proven
+    out = {k: v for k, v in detail.items() if k != "authenticator_id"}
+    return {**out, "ok": True, "manage_token": token, "expires_in": MANAGE_SECONDS}
 
 
-def check_manage(token: str) -> None:
-    """Raises PermissionError unless `token` is a live settings token - or nothing is set up yet (first setup)."""
+def proven_by(token: str) -> set:
+    with _lock:
+        rec = _manage.get(str(token or ""))
+        return set(rec["proven"]) if rec and rec["exp"] >= time.monotonic() else set()
+
+
+def add_proof(token: str, detail: dict) -> None:
+    """A proof made inside another request (e.g. removing the last app) counts for the token too."""
+    with _lock:
+        rec = _manage.get(str(token or ""))
+        if rec and detail.get("ok"):
+            rec["proven"] |= _proven_of(detail)
+
+
+def proof_satisfies(policy: dict, proven) -> bool:
+    """Would the factors proven in this settings session open a vault with `policy`?"""
+    proven = set(proven or ())
+    factors = policy["methods"]
+    if not factors or ALL_PROVEN in proven:
+        return True
+
+    def has(m):
+        if m == "totp" and policy.get("authenticators"):
+            return any(f"totp:{i}" in proven for i in policy["authenticators"])
+        return m in proven
+    got = [m for m in factors if has(m)]
+    rec = "recovery" in proven
+    if policy["mode"] == "any":
+        return bool(got) or (rec and policy["recovery"] == "fallback")
+    if len(got) == len(factors):
+        return True
+    return rec and (policy["recovery"] == "override" or
+                    (policy["recovery"] == "replace_one" and len(factors) - len(got) == 1))
+
+
+def step_up_vaults(kind: str, proven, *, item: Optional[str] = None, adding: bool = False) -> list:
+    """The vaults this installation knows that accept `kind`, can be opened here today, and would NOT be opened by
+    what this settings session proved. Changing `kind` (adding, replacing or removing it) then needs more proof:
+    otherwise one factor could replace another and open an AND vault (L9.343 review). Vaults that cannot be opened
+    here today are not guarded - their missing factor is set up by whoever owns this installation. A vault bound to
+    particular apps is not touched by a NEW app (`adding`) or by removing an app it does not name (`item`)."""
+    have = methods_set_up()
+    ids = [a["id"] for a in _authenticators()]
+
+    def touched(pol):
+        if kind == "totp" and pol["authenticators"]:
+            return not adding and (item is None or item in pol["authenticators"])
+        return True
+    return [v for v in known_vaults() if kind in accepted_methods(v["policy"]) and touched(v["policy"])
+            and satisfiable(v["policy"], have, ids) != "no" and not proof_satisfies(v["policy"], proven)]
+
+
+class StepUpRequired(PermissionError):
+    """A change guarded by a vault's policy: the settings session must prove more (`vaults`)."""
+
+    def __init__(self, kind: str, vaults: list):
+        self.kind, self.vaults = kind, vaults
+        names = _vault_names(vaults)
+        super().__init__(f"To change your {METHOD_LABELS.get(kind, kind).lower()}s, confirm once more with what "
+                         f"{names} need{'s' if len(vaults) == 1 else ''} to open: "
+                         f"{policy_summary(vaults[0]['policy'])}")
+
+
+def check_manage(token: str, change: Optional[str] = None, *, item: Optional[str] = None,
+                 adding: bool = False) -> None:
+    """Raises PermissionError unless `token` is a live settings token - or nothing is set up yet (first setup).
+    `change` (a method kind being added, replaced or removed): StepUpRequired unless the token's proofs would open
+    every known vault that accepts that kind (step_up_vaults)."""
     if not any_enrolled():
         return
     with _lock:
-        exp = _manage.get(str(token or ""))
-    if exp is None or exp < time.monotonic():
+        rec = _manage.get(str(token or ""))
+    if rec is None or rec["exp"] < time.monotonic():
         raise PermissionError("Confirm it is you first (one of your second-factor methods); the confirmation lasts "
                               "10 minutes.")
+    if change:
+        need = step_up_vaults(change, rec["proven"], item=item, adding=adding)
+        if need:
+            raise StepUpRequired(change, need)
 
 
 # ── which vaults need which method (for "removing this would lock you out of ...") ─────────────────────────────
@@ -891,12 +1387,22 @@ def known_vaults() -> list:
         return []
     if not isinstance(data, dict):
         return []
-    return [{"vault_id": str(k), "title": str(v.get("title") or ""), "methods": list(v.get("methods") or [])}
-            for k, v in data.items() if isinstance(v, dict)]
+    return [{"vault_id": str(k), "title": str(v.get("title") or ""), "methods": list(v.get("methods") or []),
+             "policy": _noted_policy(v)} for k, v in data.items() if isinstance(v, dict)]
 
 
-def note_vault(vault_id: str, methods, title: str = "") -> None:
-    """Remember (or refresh) a vault's methods. Best effort: a failure here never stops a lock or an open."""
+def _noted_policy(note: dict) -> dict:
+    """A note -> the vault's policy. Notes from before L9.343 carry only the method list (OR, recovery as fallback)."""
+    rec = {"methods": list(note.get("methods") or [])}
+    if note.get("mode"):
+        rec.update(mode=note.get("mode"), recovery=note.get("recovery"),
+                   authenticators=list(note.get("authenticators") or []), v=2)
+    return policy_detail({"second_factor": rec})
+
+
+def note_vault(vault_id: str, methods, title: str = "", policy: Optional[dict] = None) -> None:
+    """Remember (or refresh) a vault's methods (and, L9.343, its policy). Best effort: a failure here never stops a
+    lock or an open."""
     vault_id = str(vault_id or "")
     if not vault_id:
         return
@@ -911,6 +1417,9 @@ def note_vault(vault_id: str, methods, title: str = "") -> None:
             old = data.get(vault_id) if isinstance(data.get(vault_id), dict) else {}
             data[vault_id] = {"title": _clean_label(title)[:80] or old.get("title", ""), "methods": list(methods),
                               "seen": int(time.time())}
+            if policy and policy.get("methods"):
+                data[vault_id].update(methods=list(policy["methods"]), mode=policy["mode"],
+                                      recovery=policy["recovery"], authenticators=list(policy["authenticators"]))
             if len(data) > KNOWN_VAULTS_MAX:
                 keep = sorted(data.items(), key=lambda kv: kv[1].get("seen", 0), reverse=True)[:KNOWN_VAULTS_MAX]
                 data = dict(keep)
@@ -934,19 +1443,22 @@ def removal_impact(method: str, item_id: Optional[str] = None) -> dict:
     installation has not locked or opened since 2026-11-23 are not known; the warning says so."""
     have = methods_set_up()
     after = dict(have)
+    ids = [a["id"] for a in _authenticators()]
+    ids_after = ids
     if method in ("totp", "passkey"):
         after[method] = max(0, int(have[method]) - (1 if item_id else int(have[method])))
+        if method == "totp":
+            ids_after = [i for i in ids if item_id and i != str(item_id)]
     elif method == "backup_password":
         after[method] = False
     last = bool(have.get(method)) and not after.get(method)
+    rank = {"ok": 2, "recovery_only": 1, "no": 0}
     unopenable, recovery_only = [], []
-    for v in known_vaults():
-        pol = v["methods"]
-        if not pol or method not in pol:
+    for v in known_vaults():                                   # only vaults this removal makes WORSE are named
+        before, now_ = satisfiable(v["policy"], have, ids), satisfiable(v["policy"], after, ids_after)
+        if rank[now_] >= rank[before]:
             continue
-        if any(m != "recovery" and after.get(m) for m in pol):
-            continue
-        (recovery_only if "recovery" in pol and after["recovery"] else unopenable).append(v)
+        (recovery_only if now_ == "recovery_only" else unopenable).append(v)
     words = []
     if last:
         words.append({"totp": "This is your last authenticator app on this installation.",
@@ -967,7 +1479,8 @@ def refusal_text(method: str, unopenable: list) -> str:
     return (f"Not removed: {_vault_names(unopenable)} would no longer open for editing on this installation - "
             f"{'it accepts' if one else 'they accept'} no other method set up here and no recovery codes are left. "
             f"Fix: first set up another method {'that vault' if one else 'those vaults'} accept"
-            f"{'s' if one else ''} (H2Vault menu > Second factor), generate recovery codes, or change "
+            f"{'s' if one else ''} (H2Vault menu > Second factor), generate recovery codes if "
+            f"{'it accepts' if one else 'they accept'} them, or change "
             f"{'its' if one else 'their'} protection (vault menu > Manage access).")
 
 

@@ -25,8 +25,8 @@ import { exposeStep } from "./_h2v_expose_ui.js";
 import { lockRequest, lockableRows, reopenParams, whitelistLock } from "./_h2v_lockparams.js";
 import { EXPIRY_CHOICES, HONOUR_NOTE, fmtDate, ledgerState, licenceLine, licenceTerms } from "./_h2v_licence.js";
 // second-factor methods (owner 2026-11-23): authenticator, passkey, backup password, recovery codes - per vault
-import { METHOD_LABELS, factorErrorText } from "./_h2v_factor.js";
-import { factorPicker, protectionChoice, secondFactorDialog } from "./_h2v_factor_ui.js";
+import { METHOD_LABELS, factorErrorText, usedText } from "./_h2v_factor.js";
+import { allFactorsPrompt, factorPicker, protectionChoice, secondFactorDialog } from "./_h2v_factor_ui.js";
 // previews from inside shown on the vault (owner 2026-11-23); the panel itself: h2vault_previews.js
 import { previewItems, previewSection } from "./_h2v_previews_ui.js";
 
@@ -955,7 +955,7 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, conceal, downloads, dropOutputs, secondFactor: { choice: sf.choice, methods: sf.methods }, previews: pvSec.value(),
+        title: name.input.value, conceal, downloads, dropOutputs, secondFactor: sf.secondFactor, previews: pvSec.value(),
         onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
@@ -973,6 +973,7 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
 // vault id -> the method list its last answer named, in this tab ([] = password only): the dialog then asks for the
 // second factor at once (or never). Unknown vaults ask for the password first; the server says what else it needs.
 const VAULT_METHODS = new Map();
+const VAULT_POLICY = new Map();        // L9.343: vault id -> its policy (server policy_public) as last answered
 
 /**
  * Password (+ second factor) dialog that STAYS OPEN until `submit` succeeds (spec 4.2 / 4.3 / 4.5).
@@ -987,14 +988,16 @@ async function credentialDialog({ title, subtitle, needCode = true, primary = "O
   const pw = passwordField({ label: "Vault password" });
   const pickerHost = vel("div");
   let picker = null;
-  const showPicker = (methods) => {
+  const showPicker = (methods, policy = null) => {
     picker?.destroy();
-    picker = factorPicker({ status: st, post, allowed: methods?.length ? methods : null });
+    // L9.343: a vault that needs ALL of several factors gets one input per factor
+    picker = policy?.mode === "all" ? allFactorsPrompt({ status: st, policy, post })
+      : factorPicker({ status: st, post, allowed: methods?.length ? methods : null });
     pickerHost.replaceChildren(picker.el);
   };
   const known = needCode && vaultId ? VAULT_METHODS.get(vaultId) : undefined;
   let fromMemory = false;              // shown from this tab's memory: the vault may have changed since (another tab)
-  if (known?.length) { showPicker(known); fromMemory = true; }
+  if (known?.length) { showPicker(known, VAULT_POLICY.get(vaultId)); fromMemory = true; }
   d.onCleanup(() => picker?.destroy());
   d.body.append(pw.el, pickerHost);
   d.addAction("Cancel", { onClick: () => d.close(null) });
@@ -1002,18 +1005,20 @@ async function credentialDialog({ title, subtitle, needCode = true, primary = "O
     if (d.busy) return;
     d.notice(null);
     if (!pw.value()) { d.notice("danger", "Type the vault password."); pw.input.focus(); return; }
-    let factor = null;
+    let factor = null, factors = null;
     if (picker && !(fromMemory && picker.isEmpty())) {      // remembered + left empty: the server says what it needs
       const got = await picker.collect();
       if (got.error) { d.notice("danger", got.error); if (got.focus) picker.focus(); return; }
-      factor = got.factor;
+      factor = got.factor ?? null;
+      factors = got.factors ?? null;
     }
     d.setBusy(true, "Checking…");
     let out;
-    try { out = await submit({ password: pw.value(), factor }); }
+    try { out = await submit({ password: pw.value(), factor, factors }); }
     catch (e) { out = { error: String(e?.message || e) }; }
     const data = out?.data || {};
     if (vaultId && Array.isArray(data.methods)) VAULT_METHODS.set(vaultId, data.methods);
+    if (vaultId && data.policy) VAULT_POLICY.set(vaultId, data.policy);
     if (out?.ok || out?.enrol) {
       picker?.succeeded();
       d.close(out);
@@ -1022,13 +1027,17 @@ async function credentialDialog({ title, subtitle, needCode = true, primary = "O
     }
     d.setBusy(false);
     if (needCode && data.reason === "factor_required") {        // the password was right: now the second factor
-      showPicker(data.methods);
+      const same = picker && data.policy?.mode === "all" && picker.method() === "all";
+      if (!same) showPicker(data.methods, data.policy);
       fromMemory = false;
       d.notice("info", data.error || "Password accepted. This vault also needs a second factor.");
       picker.focus();
       return;
     }
-    if (picker && data.reason === "method_not_allowed") picker.restrict(data.allowed || data.methods);
+    if (picker && data.reason === "method_not_allowed") {
+      if (picker.method() === "all" && data.policy?.mode !== "all") showPicker(data.allowed || data.methods, data.policy);
+      else picker.restrict(data.allowed || data.methods);
+    }
     d.notice("danger", out?.error || "That did not work. Check the password and try again.");
     if (picker && ["wrong", "reused", "clock", "not_set_up"].includes(data.reason)) picker.failed();
     else if (!picker || !data.reason) pw.input.select();
@@ -1041,10 +1050,12 @@ async function credentialDialog({ title, subtitle, needCode = true, primary = "O
 /** "How should this vault be opened for editing?" in a lock / access dialog: a host now, the choice once the status
  *  arrived. `current` = the vault's method list (null: a new vault). ready() -> {ok, choice, methods} | {ok: false,
  *  error}. */
-function secondFactorChoice(current = null) {
+function secondFactorChoice(current = null, currentPolicy = null) {
   const host = vel("div");
   const editor = twoFactorStatus().then((st) => {
-    const e = protectionChoice({ status: st, current });
+    const e = protectionChoice({ status: st, current, currentPolicy,
+      // B6: another app goes through the Second factor dialog (a proof first); no new QR code per vault otherwise
+      onAddAuthenticator: async () => { await twoFactorSetup(); return twoFactorStatus(); } });
     host.replaceChildren(e.el);
     return e;
   });
@@ -1053,6 +1064,8 @@ function secondFactorChoice(current = null) {
 
 /** After a recovery code: say how many are left, and offer a new set when few remain. */
 function afterFactor(out) {
+  const used = usedText(out?.data?.used ?? out?.used);
+  if (used) toast(used, "info", "Second factor");             // names only, never a secret (L9.343)
   const left = out?.data?.recovery_codes_left ?? out?.recovery_codes_left;
   if (left == null) return;
   toast(left <= 2 ? `Recovery code used - ${left} left. Generate a new set under H2Vault menu › Second factor.`
@@ -1127,7 +1140,7 @@ async function enrolDialog(manageToken = null, label = "") {
     if (codes.length && !saved.checked) { d.notice("danger", "Confirm that you saved the recovery codes first."); saved.focus(); return; }
     if (!/^\d{6}$/.test(code.value())) { d.notice("danger", "Type the 6-digit code your app shows now."); code.input.focus(); return; }
     d.setBusy(true, "Confirming…");
-    const r = await post("/h2vault/2fa/enrol/confirm", { code: code.value() });
+    const r = await post("/h2vault/2fa/enrol/confirm", { code: code.value(), recovery_saved: !codes.length || saved.checked });
     if (r.ok) {
       d.close(true);
       toast(`"${data.label || "Authenticator app"}" is set up. A code works once: the next sign-in needs the next code.`,
@@ -1160,9 +1173,9 @@ async function openVault(v) {
   let opened = null;
   const out = await credentialDialog({ title: `Open "${title}"`, primary: "Open vault", vaultId,
     subtitle: "Type the vault password. If this vault also needs a second factor, you are asked for it here.",
-    submit: async ({ password, factor }) => {
-      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, factor, client_id: api.clientId,
-        vault_title: v.title || "" });
+    submit: async ({ password, factor, factors }) => {
+      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, factor,
+        ...(factors ? { factors } : {}), client_id: api.clientId, vault_title: v.title || "" });
       if (r.ok) { opened = r.data; return { ok: true, data: r.data }; }
       if (r.data.needs_enrolment) return { enrol: true };
       return { data: r.data, error: authError(r, "Could not open the vault.") };
@@ -1787,7 +1800,7 @@ function accessDialog(v, res, focus, apply) {
     onChange: (on) => { pwBox.style.display = on ? "" : "none"; if (on) pw.input.focus(); } });
   pwBox.style.display = change.checked() ? "" : "none";
   d.body.append(vel("div", { class: "h2v-block" }, [change.el, pwBox]));
-  const sfAccess = secondFactorChoice(res.methods);
+  const sfAccess = secondFactorChoice(res.methods, res.policy);
   d.body.append(sfAccess.el);
   d.body.append(noticeEl("info", (sealed ? "Removing an installation protects new copies only: a copy it already has " +
     "still runs there. " : "") + "Applying re-encrypts the vault with fresh keys; save the workflow afterwards so the " +
@@ -1809,7 +1822,7 @@ function accessDialog(v, res, focus, apply) {
     d.setBusy(true, "Applying…");
     d.status("Re-encrypting the vault…");
     const out = await apply({ editors: lists.editors.map((r) => r.code), recipients: lists.recipients.map((r) => r.code),
-      labels, new_password: newPassword, second_factor: { choice: sf.choice, methods: sf.methods } });
+      labels, new_password: newPassword, second_factor: sf.secondFactor });
     if (out?.error) { d.setBusy(false); d.status(""); d.notice("danger", out.error); return; }
     d.close(out);
   };
@@ -1971,9 +1984,9 @@ async function manageAccess(v, focus) {
   const verb = focus === "password" ? "Change the password of" : "Manage access to";
   const ok = await credentialDialog({ title: `${verb} "${v.title || "vault"}"`, primary: "Continue", vaultId,
     subtitle: "Confirm with the vault password (and its second factor, if it has one). The inside stays closed.",
-    submit: async ({ password, factor }) => {
+    submit: async ({ password, factor, factors }) => {
       const r = await post("/h2vault/vault/access/open", { payload, vault_id: vaultId, password, factor,
-        client_id: api.clientId, vault_title: v.title || "" });
+        ...(factors ? { factors } : {}), client_id: api.clientId, vault_title: v.title || "" });
       if (r.ok) { res = r.data; return { ok: true, data: r.data }; }
       if (r.data.needs_enrolment) return { enrol: true };
       return { data: r.data, error: authError(r, "Could not unlock the vault's access.") };
@@ -1988,7 +2001,8 @@ async function manageAccess(v, focus) {
       vault_title: v.title || "" });
     if (!r.ok) return { error: r.data.error || `Could not apply the change (${r.status}).` };
     W("vault_payload").value = r.data.payload;                  // swapped only now: a failure left the old vault
-    if (Array.isArray(choice.second_factor?.methods)) VAULT_METHODS.set(vaultId, choice.second_factor.methods);
+    VAULT_METHODS.delete(vaultId);                              // the new policy is asked for on the next open
+    VAULT_POLICY.delete(vaultId);
     if (res.profile === "locked") markRunUnlocked(vaultId);
     v.setDirtyCanvas?.(true, true);
     try { app.extensionManager?.workflow?.activeWorkflow?.changeTracker?.checkState?.(); } catch (_) {}
@@ -2112,7 +2126,7 @@ async function lockParameters(items) {
         d.status(`Locking "${x.title || node.title}"…`);
         await lockNodeParameters(node, x.locked, { profile: choice.value(), password: pw.value(), title: x.title,
           recipients: splitCodes(recip.input.value), showRows: showRows.checked(), showKind: showKind.checked(), lockSet,
-          secondFactor: { choice: sf.choice, methods: sf.methods } });
+          secondFactor: sf.secondFactor });
         done.push(x.id);
       } catch (e) {
         d.setBusy(false);
@@ -2148,8 +2162,8 @@ async function removeProtection(v) {
   let opened = null;
   const out = await credentialDialog({ title: `Remove the protection of "${v.title || "vault"}"`, primary: "Remove",
     vaultId, subtitle: "Type the password (and the vault's second factor, if it has one).",
-    submit: async ({ password, factor }) => {
-      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, factor, client_id: api.clientId });
+    submit: async ({ password, factor, factors }) => {
+      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, factor, ...(factors ? { factors } : {}), client_id: api.clientId });
       if (r.ok) { opened = r.data; return { ok: true, data: r.data }; }
       if (r.data.needs_enrolment) return { enrol: true };
       return { data: r.data, error: authError(r, "Could not open the vault.") };
@@ -2295,8 +2309,8 @@ async function issueLicence(v) {
   let issued = null;
   const out = await credentialDialog({ title: "Sign the licence", primary: "Issue licence",
     subtitle: "Type this workflow's password (and its second factor, if it has one).",
-    submit: async ({ password, factor }) => {
-      const r = await post("/h2vault/licence/issue", { ...vaultRefs(v), password, factor, title: v.title || "", ...terms });
+    submit: async ({ password, factor, factors }) => {
+      const r = await post("/h2vault/licence/issue", { ...vaultRefs(v), password, factor, ...(factors ? { factors } : {}), title: v.title || "", ...terms });
       if (r.ok && r.data.licence_text) { issued = r.data; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
       return { data: r.data, error: authError(r, "The licence could not be issued.") };
@@ -2342,8 +2356,8 @@ async function rotateLicences(v) {
   let res = null;
   const out = await credentialDialog({ title: "Revoke licences", primary: "Revoke and re-seal",
     subtitle: "Type this workflow's password (and its second factor, if it has one).",
-    submit: async ({ password, factor }) => {
-      const r = await post("/h2vault/licence/rotate", { ...refs, password, factor, reissue });
+    submit: async ({ password, factor, factors }) => {
+      const r = await post("/h2vault/licence/rotate", { ...refs, password, factor, ...(factors ? { factors } : {}), reissue });
       if (r.ok && r.data.payload) { res = r.data; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
       return { data: r.data, error: authError(r, "The licences could not be revoked.") };
@@ -2427,8 +2441,8 @@ async function exportAuthorKey(node) {
   let file = null;
   const out = await credentialDialog({ title: "Prove it is your key", primary: "Download backup",
     subtitle: `Type the password of "${v.title || "this vault"}" (and its second factor, if it has one).`,
-    submit: async ({ password, factor }) => {
-      const r = await post("/h2vault/licence/author/export", { ...vaultRefs(v), password, factor,
+    submit: async ({ password, factor, factors }) => {
+      const r = await post("/h2vault/licence/author/export", { ...vaultRefs(v), password, factor, ...(factors ? { factors } : {}),
         file_password: filePassword });
       if (r.ok && r.data.file) { file = r.data.file; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
@@ -2462,8 +2476,8 @@ async function importAuthorKey(node) {
   let done = null;
   const out = await credentialDialog({ title: "Prove it is your workflow", primary: "Restore",
     subtitle: `Type the password of "${v.title || "this vault"}" (and its second factor, if it has one).`,
-    submit: async ({ password, factor }) => {
-      const r = await post("/h2vault/licence/author/import", { ...vaultRefs(v), password, factor, file: f.text,
+    submit: async ({ password, factor, factors }) => {
+      const r = await post("/h2vault/licence/author/import", { ...vaultRefs(v), password, factor, ...(factors ? { factors } : {}), file: f.text,
         file_password: opts.file_password, ...(opts.replace ? { replace: true, confirm: "replace" } : {}) });
       if (r.ok) { done = r.data; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };

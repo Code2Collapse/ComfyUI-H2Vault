@@ -60,9 +60,19 @@ access*:
 | Password + passkey | a passkey, security key or Windows Hello |
 | Password + backup password | the editor's backup password |
 | Password + any second factor (most flexible, the default) | any of the three, whatever each editor set up |
-| Advanced: pick methods | exactly the ticked ones (e.g. authenticator app or passkey) |
+| Advanced: build a policy | ANY one or ALL of the ticked factors, the recovery-code rule, and (per vault) particular authenticator apps |
 
-Recovery codes are always accepted whenever a second factor is required. Vaults locked before this question existed
+With the five one-click answers, recovery codes are always accepted whenever a second factor is required. **Advanced:
+build a policy** covers every combination (authenticator AND passkey, passkey OR backup password, all three ...): tick
+the factors, choose *Any one of them (OR)* or *All of them (AND)*, choose what a recovery code may do, and optionally
+*Only particular authenticator apps* of this computer. The dialog lists the authenticator apps already registered
+here (reused by every vault - no new QR code per vault, with an *Add another authenticator* button), says which
+factors are not set up yet, and shows the final policy in plain words before you lock. A recovery code never replaces
+the vault password. Under AND it is **not accepted** unless the author chose *May replace ONE missing factor* or
+*Emergency override* (a recovery code alone, with the password). The policy is stored inside the vault's encryption;
+see [docs/AUTH_POLICY.md](docs/AUTH_POLICY.md). When a vault needs all of several factors, the open dialog asks for
+each of them at once; after any successful check H2Vault says which one was used ("Used: Backup phone"), never a
+secret. Vaults locked before this question existed
 accept the authenticator app and recovery codes (they show as "Password + authenticator app"). **Password only is
 weaker**: whoever learns the password can open the vault for editing on any editor installation, and its licence and
 author-key actions need only the password too; running is not affected. Switching a vault to Password only (Manage
@@ -78,7 +88,15 @@ set up / not possible here and why) and one **Add** button each:
 - **passkeys / security keys / Windows Hello** (WebAuthn; browsers allow them only on a name, so open ComfyUI as
   `http://localhost:<port>`, not `http://127.0.0.1:<port>`; a passkey belongs to the address it was made on),
 - a **backup password** (a second secret, different from your vault passwords),
-- **recovery codes** (8 single-use codes, shown once with a .txt download; "Generate a new set" replaces them).
+- **recovery codes** (8 single-use codes, shown once with a .txt download; *New set* first says how many working
+  codes will stop working, and the dialog waits for "I saved the recovery codes"). The first authenticator setup
+  shows the QR code and setup key, asks for a current code, and is confirmed only after you tick that you saved the
+  recovery codes (the server checks this too). Adding another app keeps your recovery codes.
+Each app and passkey shows when it was added and last used; after one proof the dialog also shows the last
+authentication activity and what each vault this computer knows accepts. Up to 10 authenticator apps per
+installation (`H2VAULT_MAX_AUTHENTICATORS` raises it, at most 50; each app is its own small credential-store entry).
+Passkeys can be registered as *This device (Windows Hello, Touch ID)*, *Security key (YubiKey...)* or *Any*; why
+these and not email / SMS / key files: [docs/AUTH_OPTIONS_EVALUATION.md](docs/AUTH_OPTIONS_EVALUATION.md).
 Changing them needs one of your methods first. Removing the last authenticator app warns and asks for one more
 proof. Removing a method that a vault needs is refused while that vault would then have no accepted method left on
 this installation (not even a recovery code) - the answer names the vault and the fix; with recovery codes left it is

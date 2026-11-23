@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Authentication policies (L9.343, owner 2026-11-24)** - a vault can need ANY one or ALL of its chosen second factors
+(all 14 combinations, docs/AUTH_POLICY.md), stored inside its encryption; vaults locked before keep exactly their
+behaviour (an OR policy is still written in the old format). Recovery codes never replace the vault password; under
+AND they are refused unless the author chose "may replace ONE missing factor" or "emergency override". Every factor
+of a request is checked before anything is used up (a failed AND never burns a code), a wrong request counts once.
+Opening says which authenticator / passkey was used. Policy builder with a plain-words preview and the registered
+apps (+ *Add another authenticator*); per-vault "only particular authenticator apps". Enrolment: the server waits for
+"I saved the recovery codes"; recovery codes are managed explicitly (`begin_enrolment(recovery=auto|new|keep)`, *New
+set* warns first). Second factor dialog: added / last-used dates, last activity, which vault accepts what, backup
+password last use, passkey kind (this device / security key). `H2VAULT_MAX_AUTHENTICATORS` (up to 50). Evaluation of
+further methods: docs/AUTH_OPTIONS_EVALUATION.md.
+
 **Previews from inside a vault (owner 2026-11-23)** - every preview an inner node produces shows on the vault node:
 images through ComfyUI's own preview (merged, all preview nodes together), videos / audio / text in a new *Previews from
 inside* panel, live sampler frames (also KJNodes Model Preview Override), the running step's progress, and the previews
