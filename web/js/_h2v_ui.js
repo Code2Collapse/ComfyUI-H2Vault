@@ -44,6 +44,10 @@ const CSS = `
   --h2v-accent: var(--p-primary-color, #5b8def); --h2v-accent-hover: color-mix(in srgb, var(--h2v-accent) 85%, #ffffff);
   --h2v-on-accent: var(--p-primary-contrast-color, #0b0d10); --h2v-ok: #3fb68b; --h2v-warn: #e0a43a;
   --h2v-danger: var(--error-text, #ff6b6b); }
+/* core's light palette (no .dark-theme on <html>): the amber warn was 1.2:1 and the 54 % ink 2.97:1 on the light card
+   (L9.321, matrix D8). Darker tones for light grounds: warn 5.5:1, ok 5.2:1, dim ink 5.4:1 (computed on 191,190,201). */
+:root:not(.dark-theme) .h2v { --h2v-warn: #5c3b00; --h2v-ok: #0f4d38;
+  --h2v-ink-dim: color-mix(in srgb, var(--h2v-ink) 80%, transparent); }
 .h2v { --h2v-r-dialog: 10px; --h2v-r-card: 8px; --h2v-r-ctl: 6px; font-family: inherit; color: var(--h2v-ink);
   font-size: 13px; line-height: 1.45; }
 .h2v *, .h2v *::before, .h2v *::after { box-sizing: border-box; }
