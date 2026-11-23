@@ -937,12 +937,19 @@ def scrub_hash_names(obj):
     return new, removed
 
 
-def hash_folder_middleware():
+# Per-node routes of co-installed packs that list / describe nodes by id (CNP Tensor Inspector: an index of node ids and
+# each node's output shapes and types). Inner vault ids are dropped from the index; a query naming one is refused.
+_NODE_ID_INDEXES = {"/mec/tensor_snapshot/index": ("data", "node_ids")}
+_NODE_ID_QUERY_KEYS = ("node_id", "node", "id", "unique_id")
+
+
+def hash_folder_middleware(*, concealer: "Optional[Concealer]" = None):
     """aiohttp middleware (every profile, not only Hosted): model listings never show the hash-named copies a vault
-    downloaded, and their safetensors metadata / previews are not served. Vault runs are unaffected - the server
-    resolves those names itself."""
+    downloaded, and their safetensors metadata / previews are not served; per-node routes of other packs never list or
+    describe a node inside a vault. Vault runs are unaffected - the server resolves those names itself."""
     from aiohttp import web
     import json as _json
+    c = concealer or CONCEALER
 
     def not_found():
         return web.json_response({"error": "Not found."}, status=404)
@@ -957,7 +964,11 @@ def hash_folder_middleware():
             return not_found()
         if p.startswith("/experiment/models/preview/") and re.search(r"/\d+/h2v[\\/]", p):
             return not_found()
+        if any(c.protected_vault_of(request.query.get(k)) is not None for k in _NODE_ID_QUERY_KEYS):
+            return not_found()                               # V8: a node inside a vault is not described by id
         resp = await handler(request)
+        if p in _NODE_ID_INDEXES:
+            return _scrub_node_index(resp, _NODE_ID_INDEXES[p], c, web, _json)
         if not (p in _HASH_SCRUB_EXACT or p.startswith(_HASH_SCRUB_PREFIX)):
             return resp
         body = getattr(resp, "body", None)
@@ -973,6 +984,24 @@ def hash_folder_middleware():
         return web.json_response(data, status=resp.status)
 
     return h2vault_hash_folder_guard
+
+
+def _scrub_node_index(resp, keys, c, web, _json):
+    body = getattr(resp, "body", None)
+    if not isinstance(body, (bytes, bytearray)):
+        return resp
+    try:
+        data = _json.loads(bytes(body))
+        holder = data
+        for k in keys[:-1]:
+            holder = holder[k]
+        ids = holder[keys[-1]]
+        if not isinstance(ids, list):
+            return resp
+    except Exception:  # noqa: BLE001 - not the shape this guard knows: leave it
+        return resp
+    holder[keys[-1]] = [i for i in ids if c.protected_vault_of(str(i)) is None]
+    return web.json_response(data, status=resp.status)
 
 
 # ── server adapters ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1114,7 +1143,7 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
     app = getattr(server, "app", None)
     if app is not None:
         try:
-            app.middlewares.append(hash_folder_middleware())
+            app.middlewares.append(hash_folder_middleware(concealer=c))
         except Exception as exc:  # noqa: BLE001
             log.warning("H2Vault: model-listing guard not attached (downloaded vault models may be listed): %s", exc)
 

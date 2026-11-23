@@ -195,6 +195,9 @@ receives an empty `PROMPT` and no `EXTRA_PNGINFO` (no workflow in files written 
 FILE`) inside a Concealed Window; `hash_folder_middleware` (every profile) drops V7 hash-named copies
 (`h2v/<sha256 prefix>.<ext>`) from model listings and refuses their `/view_metadata` and previews. `h2vault.phase`
 counts distinct functional labels (one event per label change), and a concealed error carries the failing step's label.
+`IsChangedCache.get` opens the Concealed Window while core computes an inner node's cache key (its IS_CHANGED warning
+named inner files); `attach_root_filter` is the one root-logger attachment for V5's value redaction and V8's window
+filter; the middleware also drops inner vault ids from per-node routes of co-installed packs (CNP Tensor Inspector).
 
 ## 8. Plug-and-play
 

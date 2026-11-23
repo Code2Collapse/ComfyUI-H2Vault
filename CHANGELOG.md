@@ -9,6 +9,7 @@
 - Installing a vault's missing extensions never repeats git's error text or a folder path (both name the extension).
 - A warning core prints while it prepares an inner node of a concealed vault (for example a missing file found while checking whether the node changed) becomes `[H2Vault] concealed output` too.
 - A plain vault that reuses the node id of an earlier concealed vault is no longer half-treated as concealed.
+- Per-node routes of a co-installed pack (the Tensor Inspector of ComfyUI-CustomNodePacks) no longer list or describe nodes inside a vault.
 - Lock parameters: without *Show what kind of node*, a node whose title is still its kind ("Load Checkpoint") is shown as *Locked node*.
 
 ## 0.2.0 - 2026-11-23
