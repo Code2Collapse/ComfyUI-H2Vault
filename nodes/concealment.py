@@ -15,6 +15,8 @@ Interface (everything else here is implementation):
     resolve_params(plain, params) / after_expansion(vault_id, plain, graph, prefix)   the vault node's run
     public_node_type(vault_id, inner_type)
     install(server) / uninstall()                                           server adapters
+    CAPABILITIES / run_selftest() / capability_refusal()                    L9.341 security capability registry:
+                                                                            every hook self-tested; fail closed
     hosted_enabled() / hosted_middleware()                                  Hosted profile guard
     metadata_guard / WindowLogFilter / hash_folder_middleware               V8 zero-information guards (every
                                                                             vault / every profile; install() wires them)
@@ -561,6 +563,9 @@ def resolve_params(plain, params: dict) -> dict:
     """Control values from the Recipient -> the values the inside receives. Aliases resolve here, server-side."""
     if not is_concealed(plain):
         return params
+    refused = capability_refusal()             # L9.341: fail closed when a critical protection is not working
+    if refused:
+        raise ConcealError(refused)
     out_types = [o.get("type") for o in (_api(plain).get("outputs") or []) if isinstance(o, dict)]
     out_types += [s.get("type") for s in (_iface(plain).get("out") or []) if isinstance(s, dict)]
     # what sealing has always refused (a vault sealed before 2026-11-23 keeps running as it did); everything else -
@@ -902,7 +907,7 @@ class Concealer:
         if not isinstance(node_id, str) or "." not in node_id:
             return None
         best = None
-        for v, info in table.items():
+        for v, info in list(table.items()):              # a copy: another thread may register meanwhile
             if not node_id.startswith(v + "."):
                 continue
             inner = inner_of(info)
@@ -941,7 +946,7 @@ class Concealer:
                         info["seen"].append(label)
                     event = {"vault": self._window, "label": label, "step": len(info["seen"]),
                              "total": max(info["total"], len(info["seen"]))}
-        if event is not None:
+        if event is not None and _probing() is None:       # the security self-test never reaches a client
             _send_phase(event)
 
     def current_label(self, vault_id) -> Optional[str]:
@@ -1268,7 +1273,7 @@ def metadata_guard(orig, *, concealer: "Optional[Concealer]" = None):
 
     def get_input_data(inputs, class_def, unique_id, *a, **k):
         result = orig(inputs, class_def, unique_id, *a, **k)
-        if c.protected_vault_of(None if unique_id is None else str(unique_id)) is None:
+        if _cur(c).protected_vault_of(None if unique_id is None else str(unique_id)) is None:
             return result
         try:
             return strip_metadata(class_def, result)
@@ -1304,7 +1309,8 @@ class WindowLogFilter(logging.Filter):
 
     def filter(self, record):
         try:
-            if self.c.window is not None and self.c.rules.get("logs", True):
+            cc = _cur(self.c)                       # the self-test's own concealer while it probes
+            if cc.window is not None and cc.rules.get("logs", True):
                 record.msg, record.args = CONCEALED_LOG_LINE, None
                 record.exc_info = record.exc_text = record.stack_info = None
         except Exception:  # noqa: BLE001 - never break logging
@@ -1373,7 +1379,7 @@ def hash_folder_middleware(*, concealer: "Optional[Concealer]" = None):
             return not_found()
         if p.startswith("/experiment/models/preview/") and re.search(r"/\d+/h2v[\\/]", p):
             return not_found()
-        if any(c.protected_vault_of(request.query.get(k)) is not None for k in _NODE_ID_QUERY_KEYS):
+        if any(_cur(c).protected_vault_of(request.query.get(k)) is not None for k in _NODE_ID_QUERY_KEYS):
             return not_found()                               # V8: a node inside a vault is not described by id
         resp = await handler(request)
         if p in _NODE_ID_INDEXES:
@@ -1409,8 +1415,564 @@ def _scrub_node_index(resp, keys, c, web, _json):
             return resp
     except Exception:  # noqa: BLE001 - not the shape this guard knows: leave it
         return resp
-    holder[keys[-1]] = [i for i in ids if c.protected_vault_of(str(i)) is None]
+    holder[keys[-1]] = [i for i in ids if _cur(c).protected_vault_of(str(i)) is None]
     return web.json_response(data, status=resp.status)
+
+
+# ── security capability registry (L9.341, roadmap item 1): fail closed ──────────────────────────────────────
+# Every protection install() puts in place is a capability: installed, then EXERCISED by a self-test that sends a
+# synthetic probe through the real hook (never to a client), and re-checked cheaply before each concealed run. A
+# concealed vault does not run while a critical capability is not working; Hosted mode does not start.
+
+ACTIVE, FAILED, UNAVAILABLE, NOT_NEEDED, OFF, NOT_CHECKED = (
+    "active", "failed", "unavailable", "not_needed", "off", "not_checked")
+_OK_STATES = frozenset({ACTIVE, NOT_NEEDED, OFF})
+
+# (id, label, critical, what it protects - plain words for the diagnostics panel)
+CAPABILITY_SPEC = (
+    ("vault_filter", "Vault message filter", True,
+     "inner node ids, types and locked values of every vault in messages and history"),
+    ("messages", "Concealed message filter", True,
+     "what the inner steps of a concealed vault say over the websocket"),
+    ("previews", "Preview concealment", True,
+     "file paths and inner ids of previews shown from inside a concealed vault"),
+    ("history", "History filter", True, "inner outputs and ids kept in the queue history"),
+    ("progress", "Concealed step window", True,
+     "knowing which concealed step runs (console and log concealment depend on it)"),
+    ("log_streams", "Console and log-feed filter", True,
+     "print output of inner steps (console, /internal/logs, the logs feed)"),
+    ("log_records", "Log record filter", True, "log records of inner steps, log files included"),
+    ("cache_keys", "Cache-key window", True,
+     "warnings ComfyUI writes while it computes an inner step's cache key"),
+    ("metadata", "File metadata guard", True,
+     "the prompt and workflow that save and preview nodes embed in their files"),
+    ("listings", "Model listing guard", True,
+     "hash-named model copies in model lists, and per-node routes of other packs"),
+    ("hosted", "Hosted mode restrictions", True,
+     "model lists, logs and model routes withheld from every client; only allowed node types run"),
+    ("preview_replay", "Cached preview replay", False,
+     "previews of a vault that ComfyUI served from its cache (display only)"),
+)
+_SPEC = {s[0]: s for s in CAPABILITY_SPEC}
+ACTION_UPDATE = ("Update H2Vault and ComfyUI, restart ComfyUI, then run this check again. If it still fails, "
+                 "report this ComfyUI version to H2Vault.")
+_ACTIONS = {
+    "vault_filter": "Restart ComfyUI. If it still fails, check the console for the H2Vault start-up message.",
+    "hosted": "Hosted mode cannot start without these restrictions: fix the problem shown, or turn hosted mode off "
+              "(H2VAULT_HOSTED).",
+    "preview_replay": "Optional: only cached runs lose their previews. Updating H2Vault may restore it.",
+}
+
+
+class HostedStartRefused(SystemExit):
+    """Hosted mode was asked for but a mandatory restriction is not working: ComfyUI must not start (it would serve
+    protected workflows without their protection). SystemExit passes core's `except Exception` in load_custom_node."""
+
+
+class Capabilities:
+    """The registry: per capability a status (ACTIVE, FAILED, UNAVAILABLE, NOT_NEEDED, OFF, NOT_CHECKED) and a short
+    detail in plain words (never a name from inside a vault)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.attempted = False                 # install() ran against a real server
+            self.hosted = False
+            self.checked_at: Optional[float] = None
+            self._state = {cid: {"status": NOT_CHECKED, "detail": ""} for cid in _SPEC}
+
+    def set(self, cid: str, status: str, detail: str = "") -> None:
+        with self._lock:
+            self._state[cid] = {"status": status, "detail": str(detail or "")[:300]}
+
+    def status(self, cid: str) -> str:
+        return self._state[cid]["status"]
+
+    def detail(self, cid: str) -> str:
+        return self._state[cid]["detail"]
+
+    def is_critical(self, cid: str) -> bool:
+        return bool(_SPEC[cid][2]) and (cid != "hosted" or self.hosted)
+
+    def missing(self) -> list:
+        """Critical capabilities that are not working, in registry order."""
+        return [cid for cid in _SPEC if self.is_critical(cid) and self._state[cid]["status"] not in _OK_STATES]
+
+    def refusal(self) -> Optional[str]:
+        """Plain-English reason + next step when concealed execution must be refused; None when it may run."""
+        if not self.attempted:
+            return None                            # no server: nothing can reach a client
+        miss = self.missing()
+        if not miss:
+            return None
+        cid = miss[0]
+        why = self.detail(cid) or "it did not pass its start-up check"
+        more = f" ({len(miss) - 1} more protection{'s' if len(miss) > 2 else ''} also failed)" if len(miss) > 1 else ""
+        return (f"H2Vault did not run this protected workflow: its protection \"{_SPEC[cid][1]}\" is not working on "
+                f"this ComfyUI ({why}){more}. Running it could reveal what is inside. Next step: update H2Vault, "
+                "restart ComfyUI, then open the H2Vault menu > Security check to see what is missing.")
+
+    def report(self) -> dict:
+        with self._lock:
+            state = {k: dict(v) for k, v in self._state.items()}
+        caps = []
+        for cid, label, critical, protects in CAPABILITY_SPEC:
+            st = state[cid]
+            crit = bool(critical) and (cid != "hosted" or self.hosted)
+            ok = st["status"] in _OK_STATES
+            caps.append({"id": cid, "label": label, "critical": crit, "status": st["status"], "ok": ok,
+                         "detail": st["detail"], "protects": protects,
+                         "action": "" if ok else _ACTIONS.get(cid, ACTION_UPDATE)})
+        return {"attempted": self.attempted, "hosted": self.hosted, "checked_at": self.checked_at,
+                "refusal": self.refusal(), "capabilities": caps}
+
+
+CAPABILITIES = Capabilities()
+
+# The self-test's probe: a synthetic vault that exists only while a probe runs, in THIS thread's probe mode.
+PROBE_SID = "h2vault-selftest"
+PROBE_VAULT = "h2vault-selftest"
+PROBE_INNER = PROBE_VAULT + ".0.0.1"
+PROBE_PREVIEW = PROBE_VAULT + ".0.0.2"
+PROBE_TERM = "h2vault-selftest-secret-term"
+PROBE_ITEM = "h2vault-selftest-item"
+PROBE_FILE = "h2vault-selftest.png"
+PROBE_LOG_LINE = "H2Vault security self-test line"
+_PROBE = threading.local()
+
+
+def _probing() -> Optional[list]:
+    """The probe sink of this thread while a self-test runs, else None."""
+    return getattr(_PROBE, "sink", None)
+
+
+class _ProbeScope:
+    """Probe mode for THIS thread: the wrappers use a private Concealer that knows only the probe vault (`_cur`), so
+    the real concealer's vaults, window and executing state are never read or written by a probe - a prompt running
+    in another thread meanwhile is not affected, and two probes in two threads do not see each other."""
+
+    def __init__(self, c: "Concealer"):
+        self.c = c
+
+    def __enter__(self) -> list:
+        pc = Concealer()
+        pc.rules = dict(self.c.rules)
+        pc._vaults[PROBE_VAULT] = {"inner": {PROBE_INNER, PROBE_PREVIEW}, "previews": {PROBE_PREVIEW},
+                                   "low_terms": [PROBE_TERM], "phases": {PROBE_INNER: "Processing",
+                                                                         PROBE_PREVIEW: "Saving results"},
+                                   "started": [], "seen": [], "last_label": None, "total": 1}
+        pc._active.add(PROBE_VAULT)
+        _PROBE.concealer, _PROBE.sink = pc, []
+        return _PROBE.sink
+
+    def __exit__(self, *exc):
+        _PROBE.sink = _PROBE.concealer = None
+        return False
+
+
+def _cur(c: "Concealer") -> "Concealer":
+    """The concealer a wrapper uses now: the self-test's private one while this thread probes, else `c`."""
+    pc = getattr(_PROBE, "concealer", None)
+    return pc if pc is not None else c
+
+
+def _pc() -> "Concealer":
+    return _PROBE.concealer
+
+
+class _ProbeStop(Exception):
+    pass
+
+
+class _ProbeObj:
+    """Stands in for a core object (`self` of a wrapped method): the first attribute the ORIGINAL method reads calls
+    `hit` and stops it, so the original never acts on anything real."""
+
+    def __init__(self, hit: Optional[Callable[[], None]] = None):
+        object.__setattr__(self, "_h2v_hit", hit)
+
+    def __getattr__(self, name):
+        hit = object.__getattribute__(self, "_h2v_hit")
+        if hit is not None:
+            hit()
+        raise _ProbeStop(name)
+
+
+def _drive(coro):
+    """Run a coroutine that must not wait on I/O (the guards under test answer at once) without an event loop."""
+    try:
+        coro.send(None)
+    except StopIteration as stop:
+        return stop.value
+    coro.close()
+    raise RuntimeError("the guard waited on I/O during the self-test")
+
+
+class _ProbeRequest:
+    def __init__(self, method: str, path: str, query: Optional[dict] = None, body=None):
+        self.method, self.path, self.query, self._body = method, path, dict(query or {}), body
+
+    async def json(self):
+        return self._body
+
+
+def _why(exc: BaseException) -> str:
+    return f"its check raised {type(exc).__name__}"
+
+
+# ── the probes (each returns (status, detail)) ────────────────────────────────────────────────────────────
+
+OUTER_TEXT = ("works; note: another extension wraps this hook outside H2Vault and sees what passes through it before H2Vault filters it (code in the same process is outside any filter)")
+_PROBE_LOCK = threading.RLock()            # one self-test / re-check at a time (the registry is shared)
+
+
+def _probe_messages(server, c) -> dict:
+    """Send synthetic messages through the server's REAL send_sync chain with the probe session id (core would send
+    them to no client: no such socket). Our wrapper records what it would forward instead of forwarding it."""
+    nid = PROBE_INNER.encode("utf-8")
+    sends = [
+        ("executing", {"node": PROBE_INNER, "display_node": PROBE_INNER, "prompt_id": PROBE_ITEM}),
+        ("executed", {"node": PROBE_INNER, "display_node": PROBE_INNER, "prompt_id": PROBE_ITEM,
+                      "output": {"text": [PROBE_TERM]}}),
+        (3, struct.pack(">I", len(nid)) + nid + PROBE_TERM.encode("utf-8")),
+        ("h2vault.selftest", {"node_id": PROBE_INNER, "text": PROBE_TERM}),
+        ("executed", {"node": PROBE_PREVIEW, "display_node": PROBE_PREVIEW, "prompt_id": PROBE_ITEM,
+                      "output": {"images": [{"filename": PROBE_FILE, "subfolder": "", "type": "temp",
+                                             "fullpath": f"/{PROBE_TERM}/{PROBE_FILE}"}]}}),
+    ]
+    with _ProbeScope(c) as sink:
+        for ev, data in sends:
+            try:
+                server.send_sync(ev, data, PROBE_SID)
+            except Exception as exc:  # noqa: BLE001
+                sink.append(("error", ev, _why(exc)))
+    got = [r for r in sink if r[0] == "send"]
+    out = {}
+    if len(got) != len(sends):
+        detail = "the message hook is no longer in place" if not got else "a message took another path"
+        return {"messages": (FAILED, detail), "previews": (FAILED, detail)}
+    first, *dropped, preview = [r[2] for r in got]
+    ok_exec = isinstance(first, dict) and first.get("node") == PROBE_VAULT and PROBE_INNER not in repr(first)
+    ok_drop = all(d is DROP for d in dropped)
+    outer = "" if getattr(server, "send_sync", None) is _INSTALL.get("send_fn") else OUTER_TEXT
+    out["messages"] = (ACTIVE, outer) if ok_exec and ok_drop else (
+        FAILED, "an inner step's message was not re-addressed or withheld")
+    text = repr(preview)
+    ok_prev = (isinstance(preview, dict) and preview.get("node") == PROBE_VAULT and PROBE_TERM not in text
+               and PROBE_INNER not in text and PROBE_PREVIEW not in text and PROBE_FILE in text)
+    out["previews"] = (ACTIVE, "") if ok_prev else (FAILED, "a preview kept an inner id or a file path")
+    return out
+
+
+def _probe_history(server, c):
+    q = getattr(server, "prompt_queue", None)
+    if q is None or not hasattr(q, "task_done"):
+        return UNAVAILABLE, "this ComfyUI has no prompt queue H2Vault can filter"
+    hist = {"outputs": {PROBE_INNER: {"text": [PROBE_TERM]},
+                        PROBE_PREVIEW: {"images": [{"filename": PROBE_FILE, "subfolder": "", "type": "temp"}]}},
+            "meta": {PROBE_INNER: {"node_id": PROBE_INNER, "display_node": PROBE_INNER}}}
+    status = {"status_str": "success", "messages": [("executing", {"node": PROBE_INNER, "prompt_id": PROBE_ITEM})]}
+    with _ProbeScope(c) as sink:
+        try:
+            q.task_done(PROBE_ITEM, hist, status)
+        except Exception as exc:  # noqa: BLE001 - core's own task_done refuses an unknown item: hook not reached
+            sink.append(("error", _why(exc)))
+    got = [r for r in sink if r[0] == "history"]
+    if not got:
+        return FAILED, "the history hook is no longer in place"
+    _, h, st = got[0]
+    text = repr((h, st))
+    ok = (isinstance(h, dict) and list((h.get("outputs") or {})) == [PROBE_VAULT]
+          and PROBE_INNER not in text and PROBE_PREVIEW not in text and PROBE_TERM not in text)
+    outer = "" if getattr(q, "task_done", None) is _INSTALL.get("queue_fn") else OUTER_TEXT
+    return (ACTIVE, outer) if ok else (FAILED, "the history kept an inner output or id")
+
+
+def _probe_progress(c):
+    try:
+        from comfy_execution.progress import ProgressRegistry
+    except Exception:  # noqa: BLE001
+        return UNAVAILABLE, "this ComfyUI has no progress registry"
+    with _ProbeScope(c) as sink:
+        try:
+            ProgressRegistry.start_progress(_ProbeObj(), PROBE_INNER)
+        except Exception:  # noqa: BLE001 - the original method stopped by the probe object: hook not reached
+            pass
+    got = [r for r in sink if r[0] == "progress"]
+    return (ACTIVE, "") if got and got[0][1] == PROBE_VAULT else (
+        FAILED, "the step-start hook is no longer in place")
+
+
+def _probe_cache_keys(c):
+    try:
+        import execution as core_execution
+        icc = core_execution.IsChangedCache
+    except Exception:  # noqa: BLE001
+        return UNAVAILABLE, "this ComfyUI has no cache-key step H2Vault knows"
+    with _ProbeScope(c) as sink:
+        pc = _pc()
+        before = pc.window
+        obj = _ProbeObj(lambda: sink.append(("cache_key", pc.window)))
+        try:
+            _drive(icc.get(obj, PROBE_INNER))
+        except Exception:  # noqa: BLE001 - _ProbeStop from the original method, or a changed core
+            pass
+        after = pc.window
+    seen = [r[1] for r in sink if r[0] == "cache_key"]
+    if not seen:
+        return FAILED, "the cache-key step changed in this ComfyUI"
+    return (ACTIVE, "") if seen[0] == PROBE_VAULT and after == before else (
+        FAILED, "the cache-key hook is no longer in place")
+
+
+class _ProbeNode:
+    """A V1 class with the hidden inputs save / preview nodes use."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}, "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"}}
+
+
+class _ProbeDyn:
+    def get_original_prompt(self):
+        return {PROBE_VAULT: {"class_type": PROBE_TERM, "inputs": {}}}
+
+
+def _probe_metadata(c):
+    try:
+        import execution as core_execution
+        gid = core_execution.get_input_data
+    except Exception:  # noqa: BLE001
+        return UNAVAILABLE, "this ComfyUI has no input step H2Vault knows"
+    with _ProbeScope(c):
+        try:
+            out = gid({}, _ProbeNode, PROBE_INNER, None, dynprompt=_ProbeDyn(),
+                      extra_data={"extra_pnginfo": {"workflow": PROBE_TERM}})
+        except Exception as exc:  # noqa: BLE001
+            return FAILED, _why(exc)
+    data = out[0] if isinstance(out, tuple) and out else None
+    ok = isinstance(data, dict) and data.get("prompt") == [{}] and data.get("extra_pnginfo") == [None]
+    return (ACTIVE, "") if ok else (FAILED, "a protected step would still receive the workflow to embed")
+
+
+def _interceptors() -> Optional[list]:
+    try:
+        import app.logger as core_logger
+    except Exception:  # noqa: BLE001
+        return None
+    return [s for s in (getattr(core_logger, "stdout_interceptor", None),
+                        getattr(core_logger, "stderr_interceptor", None)) if s is not None]
+
+
+def _probe_log_streams(c):
+    streams = _interceptors()
+    if not streams:
+        return NOT_NEEDED, "this ComfyUI has no console log feed"
+    with _ProbeScope(c) as sink:
+        for s in streams:
+            pc = _pc()
+            with pc._lock:
+                pc._window, pc._marker_open = PROBE_VAULT, False
+            try:
+                s.write(PROBE_LOG_LINE + "\n")
+            except Exception as exc:  # noqa: BLE001
+                sink.append(("error", _why(exc)))
+    got = [r[1] for r in sink if r[0] == "log"]
+    if len(got) != len(streams):
+        return FAILED, "the console hook is no longer in place"
+    ok = all(g == CONCEALED_LOG_LINE + "\n" for g in got)
+    return (ACTIVE, "") if ok else (FAILED, "a console line was not concealed")
+
+
+def _probe_log_records(c):
+    got = _INSTALL.get("log_filters")
+    if not got:
+        return FAILED, "the log filter was not attached"
+    flt = got[0]
+    _INSTALL["log_filters"] = (flt, list(got[1]) + attach_root_filter(flt))     # handlers added since start-up
+    root = logging.getLogger()
+    bad = 0
+    with _ProbeScope(c):
+        pc = _pc()
+        with pc._lock:
+            pc._window = PROBE_VAULT
+        for t in [root, *root.handlers]:
+            rec = logging.LogRecord("h2vault.selftest", logging.WARNING, __file__, 0, PROBE_LOG_LINE + " %s",
+                                    (PROBE_TERM,), None)
+            kept = t.filter(rec)
+            if kept and rec.msg != CONCEALED_LOG_LINE:
+                bad += 1
+    return (ACTIVE, "") if not bad else (FAILED, f"{bad} log destination(s) would print an inner step's record")
+
+
+def _probe_middleware(server, key: str, hosted: bool):
+    app = getattr(server, "app", None)
+    mw = _INSTALL.get(key)
+    if app is None:
+        return (FAILED, "this server has no web app to restrict") if hosted else (
+            NOT_NEEDED, "this server has no web routes")
+    try:
+        present = mw is not None and any(m is mw for m in list(app.middlewares))
+    except Exception as exc:  # noqa: BLE001
+        return FAILED, _why(exc)
+    if not present:
+        return FAILED, "the web guard is not in the server's request chain"
+    try:
+        from aiohttp import web
+    except Exception:  # noqa: BLE001
+        return FAILED, "aiohttp is not available"
+    import json as _json
+    try:
+        if hosted:
+            async def ok_handler(request):
+                return web.json_response({"ok": True})
+            r1 = _drive(mw(_ProbeRequest("GET", "/internal/logs"), ok_handler))
+            r2 = _drive(mw(_ProbeRequest("POST", "/prompt", body={"prompt": {"1": {"class_type": PROBE_TERM}}}),
+                           ok_handler))
+            return (ACTIVE, "") if (r1.status, r2.status) == (403, 403) else (
+                FAILED, "a restricted route or node type was let through")
+        name = f"{HASH_DIR_NAME}/{'0' * 64}.safetensors"
+
+        async def listing(request):
+            return web.json_response({"Probe": {"input": {"required": {"ckpt_name": [[name, PROBE_FILE]]}}}})
+
+        r = _drive(mw(_ProbeRequest("GET", "/object_info"), listing))
+        text = _json.dumps(_json.loads(r.body))
+        with _ProbeScope(_concealer()):
+            r2 = _drive(mw(_ProbeRequest("GET", "/h2vault-selftest/node", {"node_id": PROBE_INNER}), listing))
+        ok = name not in text and PROBE_FILE in text and r2.status == 404
+        return (ACTIVE, "") if ok else (FAILED, "a hash-named model copy or an inner node would be listed")
+    except Exception as exc:  # noqa: BLE001
+        return FAILED, _why(exc)
+
+
+HASH_DIR_NAME = "h2v"                      # provision.HASH_DIR (this module imports with the stdlib only)
+
+
+def _concealer() -> "Concealer":
+    return _INSTALL.get("concealer") or CONCEALER
+
+
+def _vault_filter_state():
+    try:
+        from . import protected_subgraph as ps
+    except Exception:  # noqa: BLE001 - this module loaded on its own (tests): the vault filter is not part of it
+        return NOT_NEEDED, "not part of this module copy"
+    return (ACTIVE, "") if getattr(ps, "_installed", False) else (FAILED, "it was not installed at start-up")
+
+
+def _preview_replay_state():
+    try:
+        import execution as core_execution
+    except Exception:  # noqa: BLE001
+        return NOT_NEEDED, "outside ComfyUI"
+    return (ACTIVE, "") if getattr(getattr(core_execution, "execute", None), "__h2vault_previews__", False) else (
+        UNAVAILABLE, "ComfyUI's executor could not be wrapped")
+
+
+def run_selftest(server=None, c: Optional["Concealer"] = None) -> dict:
+    """Exercise every installed hook with the probe and record the results. -> CAPABILITIES.report()."""
+    with _PROBE_LOCK:
+        return _run_selftest(server, c)
+
+
+def _run_selftest(server=None, c: Optional["Concealer"] = None) -> dict:
+    server = server if server is not None else _INSTALL.get("server")
+    c = c or _concealer()
+    if server is None or not CAPABILITIES.attempted:
+        return CAPABILITIES.report()
+    _record("vault_filter", _vault_filter_state)
+    try:
+        for cid, res in _probe_messages(server, c).items():
+            CAPABILITIES.set(cid, *res)
+    except Exception as exc:  # noqa: BLE001
+        CAPABILITIES.set("messages", FAILED, _why(exc))
+        CAPABILITIES.set("previews", FAILED, _why(exc))
+    _record("history", lambda: _probe_history(server, c))
+    _record("progress", lambda: _probe_progress(c))
+    _wrap_streams(c)                                  # a console feed created since start-up is covered too
+    _record("log_streams", lambda: _probe_log_streams(c))
+    _record("log_records", lambda: _probe_log_records(c))
+    _record("cache_keys", lambda: _probe_cache_keys(c))
+    _record("metadata", lambda: _probe_metadata(c))
+    _record("listings", lambda: _probe_middleware(server, "listing_mw", hosted=False))
+    if CAPABILITIES.hosted:
+        _record("hosted", lambda: _probe_middleware(server, "hosted_mw", hosted=True))
+    else:
+        CAPABILITIES.set("hosted", OFF, "hosted mode is off")
+    _record("preview_replay", _preview_replay_state)
+    CAPABILITIES.checked_at = time.time()
+    return CAPABILITIES.report()
+
+
+def _record(cid: str, probe: Callable[[], tuple]) -> None:
+    try:
+        CAPABILITIES.set(cid, *probe())
+    except Exception as exc:  # noqa: BLE001 - a probe that breaks fails its capability (fail closed)
+        CAPABILITIES.set(cid, FAILED, _why(exc))
+
+
+def check_liveness() -> None:
+    """Cheap re-check before a concealed run (and for the diagnostics panel): a hook that is no longer the one
+    install() put in place is probed again; log handlers / console feeds added since start-up are covered now."""
+    with _PROBE_LOCK:
+        _check_liveness()
+
+
+def _check_liveness() -> None:
+    server = _INSTALL.get("server")
+    if server is None or not CAPABILITIES.attempted:
+        return
+    c = _concealer()
+    if "send" in _INSTALL and getattr(server, "send_sync", None) is not _INSTALL.get("send_fn"):
+        try:
+            for cid, res in _probe_messages(server, c).items():
+                CAPABILITIES.set(cid, *res)
+        except Exception as exc:  # noqa: BLE001
+            CAPABILITIES.set("messages", FAILED, _why(exc))
+    q = getattr(server, "prompt_queue", None)
+    if "queue" in _INSTALL and getattr(q, "task_done", None) is not _INSTALL.get("queue_fn"):
+        _record("history", lambda: _probe_history(server, c))
+    if "progress" in _INSTALL:
+        cls = _INSTALL["progress"][0]
+        if getattr(cls, "start_progress", None) is not _INSTALL.get("progress_fn"):
+            _record("progress", lambda: _probe_progress(c))
+    if "is_changed" in _INSTALL:
+        cls = _INSTALL["is_changed"][0]
+        if getattr(cls, "get", None) is not _INSTALL.get("is_changed_fn"):
+            _record("cache_keys", lambda: _probe_cache_keys(c))
+    if "metadata" in _INSTALL:
+        mod = _INSTALL["metadata"][0]
+        if getattr(mod, "get_input_data", None) is not _INSTALL.get("metadata_fn"):
+            _record("metadata", lambda: _probe_metadata(c))
+    streams = _interceptors() or []
+    if any(s.__dict__.get("write") not in _INSTALL.get("log_writers", ()) for s in streams):
+        _wrap_streams(c)                           # ComfyUI replaced its console feed: cover the new one
+        _record("log_streams", lambda: _probe_log_streams(c))
+    got = _INSTALL.get("log_filters")
+    if got:
+        added = attach_root_filter(got[0])
+        if added:
+            _INSTALL["log_filters"] = (got[0], list(got[1]) + added)
+    app = getattr(server, "app", None)
+    for cid, key in (("listings", "listing_mw"), ("hosted", "hosted_mw")):
+        mw = _INSTALL.get(key)
+        if app is not None and mw is not None and not any(m is mw for m in list(app.middlewares)):
+            CAPABILITIES.set(cid, FAILED, "the web guard was removed from the server's request chain")
+
+
+def capability_refusal() -> Optional[str]:
+    """None when concealed execution may run; else the plain-English reason and next step."""
+    if not CAPABILITIES.attempted:
+        return None
+    try:
+        check_liveness()
+    except Exception as exc:  # noqa: BLE001 - a broken re-check refuses (fail closed)
+        CAPABILITIES.set("messages", FAILED, _why(exc))
+    return CAPABILITIES.refusal()
 
 
 # ── server adapters ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1418,11 +1980,41 @@ def _scrub_node_index(resp, keys, c, web, _json):
 _INSTALL: dict = {}
 
 
+def _wrap_streams(c: "Concealer") -> None:
+    """Wrap core's console feeds (app.logger LogInterceptor write, on the instance) that are not wrapped yet."""
+    streams = _INSTALL.setdefault("logs", [])
+    writers = _INSTALL.setdefault("log_writers", [])
+    for s in _interceptors() or []:
+        if s.__dict__.get("write") in writers:
+            continue
+        orig_write = s.write                              # the bound method (instance shadowing below)
+
+        def write(data, _orig=orig_write):
+            cc = _cur(c)
+            try:
+                data = cc.filter_log_text(data)
+            except Exception:  # noqa: BLE001
+                if cc.window is not None:
+                    data = CONCEALED_LOG_LINE + "\n"
+            probe = _probing()
+            if probe is not None and cc.window == PROBE_VAULT:
+                probe.append(("log", data))               # the self-test: recorded, never printed
+                return 0
+            return _orig(data)
+
+        s.write = write
+        if s not in streams:
+            streams.append(s)
+        writers.append(write)
+
+
 def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
-    """Wrap the server's outbound paths. Must run AFTER the vault's own message filter so that this one is the
-    outermost wrapper and sees core's raw inner ids first."""
+    """Wrap the server's outbound paths, then self-test every protection (CAPABILITIES). Must run AFTER the vault's
+    own message filter so that this one is the outermost wrapper and sees core's raw inner ids first.
+    -> True only when every critical protection works; False otherwise (concealed vaults then refuse to run).
+    Hosted mode with a critical protection missing raises HostedStartRefused (ComfyUI does not start)."""
     if _INSTALL:
-        return True
+        return CAPABILITIES.refusal() is None
     c = concealer or CONCEALER
     try:
         if server is None:
@@ -1431,36 +2023,70 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("H2Vault concealment not installed (no server): %s", exc)
         return False
+    CAPABILITIES.reset()
+    CAPABILITIES.attempted = True
+    CAPABILITIES.hosted = hosted_enabled()
+    _INSTALL["server"], _INSTALL["concealer"] = server, c
+    try:
+        return _install_hooks(server, c)
+    except HostedStartRefused:
+        raise
+    except Exception as exc:  # noqa: BLE001 - unexpected: every capability not yet checked stays "not checked"
+        log.error("[H2Vault] security set-up failed (%s): concealed vaults will refuse to run", type(exc).__name__)
+        if CAPABILITIES.hosted:
+            raise HostedStartRefused("[H2Vault] Hosted mode refused to start: the security set-up failed "
+                                     f"({type(exc).__name__}). Fix it, or turn hosted mode off "
+                                     "(H2VAULT_HOSTED).") from None
+        return False
 
-    orig_send = server.send_sync
 
-    def send_sync(event, data, sid=None, _orig=orig_send):
-        try:
-            data = c.filter_message(event, data)
-        except Exception:  # noqa: BLE001 - fail closed while a concealed vault is known
-            log.error("H2Vault concealment: message filter failed (message %s)",
-                      "dropped" if c.any_registered() else "passed")
-            if c.any_registered():
+def _install_hooks(server, c: Concealer) -> bool:
+    """install()'s body: every hook, then the self-test. Raises HostedStartRefused (hosted mode, a critical
+    protection not working)."""
+    try:
+        orig_send = server.send_sync
+
+        def send_sync(event, data, sid=None, _orig=orig_send):
+            probe = _probing() if sid == PROBE_SID else None
+            cc = _cur(c)
+            try:
+                data = cc.filter_message(event, data)
+            except Exception:  # noqa: BLE001 - fail closed while a concealed vault is known
+                log.error("H2Vault concealment: message filter failed (message %s)",
+                          "dropped" if cc.any_registered() else "passed")
+                if cc.any_registered():
+                    data = DROP
+            if probe is not None:
+                probe.append(("send", event, data))       # the self-test: recorded, never sent
                 return None
-        if data is DROP:
-            return None
-        return _orig(event, data, sid)
+            if data is DROP:
+                return None
+            return _orig(event, data, sid)
 
-    server.send_sync = send_sync
-    _INSTALL["send"] = (server, orig_send)
+        server.send_sync = send_sync
+        _INSTALL["send"] = (server, orig_send)
+        _INSTALL["send_fn"] = send_sync
+    except Exception as exc:  # noqa: BLE001
+        CAPABILITIES.set("messages", FAILED, f"the message hook could not be installed ({type(exc).__name__})")
+        CAPABILITIES.set("previews", FAILED, "the message hook could not be installed")
 
     q = getattr(server, "prompt_queue", None)
     if q is not None and hasattr(q, "task_done"):
         orig_done = q.task_done
 
         def task_done(item_id, history_result, status=None, *a, _orig=orig_done, **k):
+            probe = _probing() if item_id == PROBE_ITEM else None
+            cc = _cur(c)
             try:
-                history_result = c.filter_history(history_result)
-                status = c.filter_status(status)
+                history_result = cc.filter_history(history_result)
+                status = cc.filter_status(status)
             except Exception:  # noqa: BLE001
                 log.error("H2Vault concealment: history filter failed (history of this run withheld)")
-                if c.any_registered():
+                if cc.any_registered():
                     history_result, status = {"outputs": {}, "meta": {}}, None
+            if probe is not None:
+                probe.append(("history", history_result, status))
+                return None
             try:
                 return _orig(item_id, history_result, status, *a, **k)
             finally:
@@ -1468,45 +2094,41 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
 
         q.task_done = task_done
         _INSTALL["queue"] = (q, orig_done)
+        _INSTALL["queue_fn"] = task_done
+    else:
+        CAPABILITIES.set("history", UNAVAILABLE, "this ComfyUI has no prompt queue H2Vault can filter")
 
     try:
         from comfy_execution.progress import ProgressRegistry
         orig_start = ProgressRegistry.start_progress
 
         def start_progress(self, node_id, _orig=orig_start):
+            cc = _cur(c)
             try:
-                c.on_node_start(node_id)
+                cc.on_node_start(node_id)
             except Exception:  # noqa: BLE001
                 pass
+            probe = _probing()
+            if probe is not None and str(node_id).startswith(PROBE_VAULT + "."):
+                probe.append(("progress", cc.window))
+                return None
             return _orig(self, node_id)
 
         ProgressRegistry.start_progress = start_progress
         _INSTALL["progress"] = (ProgressRegistry, orig_start)
+        _INSTALL["progress_fn"] = start_progress
     except Exception as exc:  # noqa: BLE001
         log.warning("H2Vault concealment: no progress registry (log concealment off): %s", exc)
+        CAPABILITIES.set("progress", UNAVAILABLE, "this ComfyUI has no progress registry")
 
     try:
-        import app.logger as core_logger
-        streams = []
-        for attr in ("stdout_interceptor", "stderr_interceptor"):
-            s = getattr(core_logger, attr, None)
-            if s is None:
-                continue
-            orig_write = s.write                              # the bound method (instance shadowing below)
-
-            def write(data, _orig=orig_write):
-                try:
-                    data = c.filter_log_text(data)
-                except Exception:  # noqa: BLE001
-                    if c.window is not None:
-                        data = CONCEALED_LOG_LINE + "\n"
-                return _orig(data)
-
-            s.write = write
-            streams.append(s)
-        _INSTALL["logs"] = streams
+        if _interceptors() is None:
+            CAPABILITIES.set("log_streams", NOT_NEEDED, "this ComfyUI has no console log feed")
+        else:
+            _wrap_streams(c)
     except Exception as exc:  # noqa: BLE001
         log.warning("H2Vault concealment: no log interceptor (log concealment off): %s", exc)
+        CAPABILITIES.set("log_streams", FAILED, f"the console hook could not be installed ({type(exc).__name__})")
 
     # V8: handlers that format records themselves (core's --verbose LEVEL FILE log files, any other root handler)
     flt = WindowLogFilter(c)
@@ -1517,52 +2139,82 @@ def install(server=None, *, concealer: Optional[Concealer] = None) -> bool:
     try:
         import execution as core_execution
         icc = getattr(core_execution, "IsChangedCache", None)
-        if icc is not None and not getattr(icc.get, "__h2vault_guard__", False):
+        if icc is None:
+            CAPABILITIES.set("cache_keys", UNAVAILABLE, "this ComfyUI has no cache-key step H2Vault knows")
+        elif not getattr(icc.get, "__h2vault_guard__", False):
             orig_icc_get = icc.get
 
             async def is_changed_get(self, node_id, _orig=orig_icc_get):
-                v = c.vault_of(None if node_id is None else str(node_id))
+                cc = _cur(c)
+                v = cc.vault_of(None if node_id is None else str(node_id))
                 if v is None:
                     return await _orig(self, node_id)
-                with c._lock:
-                    prev, c._window = c._window, v
+                with cc._lock:
+                    prev, cc._window = cc._window, v
                 try:
                     return await _orig(self, node_id)
                 finally:
-                    with c._lock:
-                        c._window = prev
+                    with cc._lock:
+                        cc._window = prev
 
             is_changed_get.__h2vault_guard__ = True
             icc.get = is_changed_get
             _INSTALL["is_changed"] = (icc, orig_icc_get)
+            _INSTALL["is_changed_fn"] = is_changed_get
+        else:
+            CAPABILITIES.set("cache_keys", FAILED, "another copy of H2Vault already holds this hook")
     except Exception as exc:  # noqa: BLE001
         log.warning("H2Vault: cache-key window not installed (an inner node's cache-key warning may name it): %s", exc)
+        CAPABILITIES.set("cache_keys", UNAVAILABLE, "this ComfyUI has no cache-key step H2Vault knows")
 
     # V8: nodes inside a vault embed no prompt / workflow in the files they write
     try:
         import execution as core_execution
         orig_gid = core_execution.get_input_data
         if not getattr(orig_gid, "__h2vault_guard__", False):
-            core_execution.get_input_data = metadata_guard(orig_gid, concealer=c)
+            guard = metadata_guard(orig_gid, concealer=c)
+            core_execution.get_input_data = guard
             _INSTALL["metadata"] = (core_execution, orig_gid)
+            _INSTALL["metadata_fn"] = guard
+        # else: another copy holds the hook - the probe below tells whether it protects THIS copy's vaults
     except Exception as exc:  # noqa: BLE001
         log.warning("H2Vault: output metadata guard not installed (outputs made inside a vault may embed the "
                     "workflow): %s", exc)
+        CAPABILITIES.set("metadata", UNAVAILABLE, "this ComfyUI has no input step H2Vault knows")
 
     app = getattr(server, "app", None)
     if app is not None:
         try:
-            app.middlewares.append(hash_folder_middleware(concealer=c))
+            mw = hash_folder_middleware(concealer=c)
+            app.middlewares.append(mw)
+            _INSTALL["listing_mw"] = mw
         except Exception as exc:  # noqa: BLE001
             log.warning("H2Vault: model-listing guard not attached (downloaded vault models may be listed): %s", exc)
 
-    if hosted_enabled():
+    if CAPABILITIES.hosted:
         try:
-            app.middlewares.append(hosted_middleware())
+            hmw = hosted_middleware()
+            app.middlewares.append(hmw)
+            _INSTALL["hosted_mw"] = hmw
             log.info("H2Vault hosted mode: model lists, logs and model routes are withheld from every client")
         except Exception as exc:  # noqa: BLE001
             log.error("H2Vault hosted mode requested but the guard could not be attached: %s", exc)
-    return True
+
+    report = run_selftest(server, c)
+    missing = CAPABILITIES.missing()
+    if missing:
+        log.error("[H2Vault] security check: %s not working - concealed vaults will refuse to run. H2Vault menu > "
+                  "Security check shows the details.",
+                  ", ".join(_SPEC[m][1] for m in missing))
+        if CAPABILITIES.hosted:
+            raise HostedStartRefused(
+                "[H2Vault] Hosted mode refused to start: these protections are not working: "
+                + "; ".join(f"{_SPEC[m][1]} ({CAPABILITIES.detail(m) or 'failed its check'})" for m in missing)
+                + ". Fix them, or turn hosted mode off (H2VAULT_HOSTED). H2Vault menu > Security check shows details.")
+    else:
+        log.info("[H2Vault] security check passed (%d protections active)",
+                 sum(1 for x in report["capabilities"] if x["status"] == ACTIVE))
+    return not missing
 
 
 def uninstall() -> None:
@@ -1591,7 +2243,16 @@ def uninstall() -> None:
     if "is_changed" in _INSTALL:
         cls, orig = _INSTALL["is_changed"]
         cls.get = orig
+    app = getattr(_INSTALL.get("server"), "app", None)
+    for key in ("listing_mw", "hosted_mw"):
+        mw = _INSTALL.get(key)
+        if mw is not None and app is not None:
+            try:
+                app.middlewares.remove(mw)
+            except Exception:  # noqa: BLE001 - a started app's middleware list is frozen
+                pass
     _INSTALL.clear()
+    CAPABILITIES.reset()
 
 
 # ── Hosted profile ──────────────────────────────────────────────────────────────────────────────────────────
