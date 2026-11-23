@@ -438,6 +438,8 @@ class H2Vault_ProtectedSubgraph:
         from comfy_execution.graph_utils import GraphBuilder
         prefix = GraphBuilder.alloc_prefix()
         graph, result = build_expansion(api, my_inputs, params, prefix, str(unique_id))
+        from . import provision                                # V7: hash-named model copies, server side
+        graph = provision.remap(graph, plain)
         graph = concealment.after_expansion(str(unique_id), plain, graph, prefix)   # V3: registers a concealed run
         _ACTIVE_VAULTS.add(str(unique_id))
         _INNER_TYPES[str(unique_id)] = {k: str(n["class_type"]) for k, n in graph.items()}

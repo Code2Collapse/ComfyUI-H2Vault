@@ -277,6 +277,16 @@ def protect(body: dict) -> dict:
     plain = {"exec": boundary_exec(interface), "api": api, "ui": body.get("ui"), "interface": interface,
              "editors": editors, "profile": profile, "packs": vault_packs.record_safely(api),          # L9.50
              "created": int(time.time())}
+    if body.get("models") or body.get("downloads"):         # V7: model downloads, kept INSIDE the encryption
+        from . import provision
+        try:
+            manifest = provision.validate_manifest(body.get("models") or [])
+            known = {e["file"] for e in manifest}
+            manifest += [e for e in provision.describe_downloads(body.get("downloads") or []) if e["file"] not in known]
+            if manifest:
+                plain["models"] = manifest
+        except provision.ProvisionError as exc:
+            raise VaultError(str(exc)) from None
     public = _with_conceal(plain, body.get("conceal"))
     public_lock = _with_lock(plain, body.get("lock"))
     licensing = None
@@ -568,6 +578,36 @@ def missing(body: dict) -> dict:
     plain, vault_id = _open_like_a_run(body)
     classes = SS.missing_classes(SS.api_of(plain))
     return {"ok": True, "missing": bool(classes), **SS._note_missing(vault_id, classes, plain.get("packs") or [])}
+
+
+def provision_plan(body: dict) -> dict:
+    """V7: what this install lacks to run the vault - model COUNT and bytes, plus the node count (never names)."""
+    from . import protected_subgraph as SS
+    from . import provision
+    plain, vault_id = _open_like_a_run(body)
+    nodes_missing = len(vault_packs.needed(SS.missing_classes(SS.api_of(plain)), plain.get("packs") or [])[0])
+    return {"ok": True, **provision.plan(plain), "nodes_missing": nodes_missing}
+
+
+def provision_start(body: dict) -> dict:
+    """V7: download the vault's missing model files (hash names, verified); progress as numbers only."""
+    from . import provision
+    if body.get("consent") is not True:
+        raise VaultError("Downloading needs your consent (or the automatic setting).")
+    plain, vault_id = _open_like_a_run(body)
+    token = "p" + secrets.token_hex(8)
+    return {"ok": True, "token": token, **provision.start(plain, token)}
+
+
+def provision_status(body: dict) -> dict:
+    from . import provision
+    return {"ok": True, **provision.status(str(body.get("token") or ""))}
+
+
+def provision_cancel(body: dict) -> dict:
+    from . import provision
+    provision.cancel(str(body.get("token") or ""))
+    return {"ok": True}
 
 
 def install_missing(body: dict) -> dict:
@@ -924,7 +964,7 @@ def register_routes(server) -> None:
                 return web.json_response({"ok": False, "error": str(exc)}, status=429)
         return handler
 
-    routes.post("/h2vault/vault/protect")(wrap(protect, 400))
+    routes.post("/h2vault/vault/protect")(wrap(protect, 400, offload=True))   # V7: hashing model files is slow
     routes.post("/h2vault/vault/conceal/check")(wrap(conceal_check, 400))
     routes.post("/h2vault/vault/protect/abort")(wrap(protect_abort))
     routes.post("/h2vault/vault/unlock_run")(wrap(unlock_run, offload=True))
@@ -950,6 +990,10 @@ def register_routes(server) -> None:
             return web.json_response({"ok": False, "error": str(exc)}, status=403)
 
     routes.post("/h2vault/vault/missing")(wrap(missing))
+    routes.post("/h2vault/vault/provision/plan")(wrap(provision_plan, local_only="Preparing a vault"))
+    routes.post("/h2vault/vault/provision/start")(wrap(provision_start, local_only="Preparing a vault"))
+    routes.post("/h2vault/vault/provision/status")(wrap(provision_status, local_only="Preparing a vault"))
+    routes.post("/h2vault/vault/provision/cancel")(wrap(provision_cancel, local_only="Preparing a vault"))
     routes.post("/h2vault/vault/install_missing")(install_handler)
     routes.post("/h2vault/vault/access/open")(wrap(access_open, offload=True))
     routes.post("/h2vault/vault/access/apply")(wrap(access_apply, 409))

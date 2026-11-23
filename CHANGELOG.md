@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.1.3 - 2026-11-23
+
+- Protect dialog: *Downloads for people who run it* lists the selection's model files and takes an https:// link for each; size and SHA-256 come from the author's own file at lock time (the protect route runs off the event loop while hashing). Live-checked in both renderers.
+
+## 0.1.2 - 2026-11-23
+
+- A vault prepares itself: missing model files download in the background under hash names (HTTPS only, resumable, size-capped, SHA-256 verified; public addresses only), missing extensions install from pinned commits; the browser sees counts and percentages only. Setting: Install automatically / Ask first / Never. Live-checked end to end on the testbed.
+
+## 0.1.1 - 2026-11-23
+
+- Concealed vaults show the current step in simple functional words ("Sampling", "Decoding", ...) and a step count on the vault node while they run; node names stay hidden (live-checked in both renderers and inside a subgraph).
+
 ## 0.1.0 - unreleased
 
 First version of H2Vault as its own package.

@@ -3,7 +3,7 @@
 # name, so a git clone and a registry install create the same folder. Fixed for ever once first published
 # (workstream V4, docs/h2vault/V4_registry_naming.md section 5).
 name = "ComfyUI-H2Vault"
-version = "0.1.0"
+version = "0.1.3"
 description = "H2Vault for ComfyUI: turn a selection or a subgraph into one encrypted node that ComfyUI's own scheduler runs, and save whole workflows encrypted."
 license = { file = "LICENSE" }
 requires-python = ">=3.10"

@@ -74,6 +74,7 @@ encrypted payload:
 - While a concealed vault runs, the server rewrites progress, results, history, job list and errors so they name only
   the vault (errors become a plain sentence without a traceback), and console lines printed by its inner nodes become
   `[H2Vault] concealed output`.
+- While it runs, the vault node shows **what the current step does in simple words** - "Loading models", "Preparing prompts", "Sampling", "Decoding", "Upscaling", "Saving results" - and "step 3 of 7". The words come from the kind of data a step takes and makes, never from its name, so they cannot reveal a node pack or a model.
 - **Hosted mode** (`H2VAULT_HOSTED=1`, for a render server you operate): model lists are emptied, the log and model-list
   routes are refused and only vault prompts are accepted.
 
@@ -95,6 +96,21 @@ What concealment cannot hide on the recipient's own machine: code running in the
 node, a debugger) can read the decrypted inside; the model files must be on their disk, and a file hash identifies a
 public model; run time, step counts and comparing many outputs hint at the model. For real secrecy run the vault in
 Hosted mode on a server you operate, behind your own login.
+
+## A vault prepares itself: missing models and extensions arrive by themselves
+
+A vault can carry, inside its encryption, where to download each model file it uses (URL, size, SHA-256). When
+someone opens the workflow on a ComfyUI that lacks a model, H2Vault downloads it in the background - over HTTPS only,
+resumable, capped at the declared size and checked against the SHA-256 before use - and stores it under a hash name
+(`models/<folder>/h2v/<hash>.<ext>`), so the file name on disk reveals nothing. The vault node shows only
+"Preparing this vault · 42 %"; the browser never learns a file name, URL or folder. Missing extensions install from
+the commits pinned inside the vault (they are code: ComfyUI needs a restart). Setting *H2Vault > Run > Install what a
+vault needs*: Install automatically (default) / Ask first / Never.
+
+**For authors:** the protect dialog lists the model files your selection uses under *Downloads for people who run
+it*; paste an https:// link for each. H2Vault reads the size and SHA-256 from your own copy when it locks the vault.
+Someone watching the machine's network or disk can still see download
+hosts and sizes, and a public model can be recognised by its hash.
 
 ## Encrypted workflow files
 

@@ -204,6 +204,7 @@ function promotedWidget(node, p) {
 }
 
 function applyInterface(node) {
+  setTimeout(() => { try { autoProvision(node); } catch (_) { /* best effort */ } }, 800);
   const info = vaultInfo(node);
   const iface = info.interface || {};
   hideWidget(node.widgets?.find((w) => w.name === "vault_id"));
@@ -275,11 +276,47 @@ function ensureStatusCard(node) {
   updateStatusCard(node);
 }
 
+// Concealed vaults report WHAT the current step does in simple words ("Sampling", "Decoding" ...) and a step count -
+// never a node name or type (server: concealment.functional_label). Keyed by the vault node's id in the prompt.
+const PHASES = new Map();
+
+function phaseText(node) {
+  const p = PHASES.get(String(node?.id));
+  return p ? `${p.label} · step ${p.step} of ${p.total}` : "";
+}
+
+function onPhase(e) {
+  const d = e?.detail || {};
+  if (!d.vault || typeof d.label !== "string") return;
+  PHASES.set(String(d.vault).split(":").pop(), { label: d.label.slice(0, 40), step: Number(d.step) || 1,
+    total: Number(d.total) || 1 });
+  refreshCards();
+}
+
+function clearPhases() {
+  if (!PHASES.size) return;
+  PHASES.clear();
+  refreshCards();
+}
+
 function updateStatusCard(node) {
   const card = node?.widgets?.find((x) => x.name === STATUS_WIDGET)?.__vaultCard;
   if (!card) return;
   const info = vaultInfo(node);
   const vid = node.widgets?.find((x) => x.name === "vault_id")?.value;
+  const prep = PREPARING.get(vid);
+  if (prep && vid) {
+    card.update({ tone: prep.failed ? "warn" : "accent", title: prep.failed ? "Could not prepare this vault"
+      : `Preparing this vault · ${prep.pct} %`, detail: prep.failed ? prep.failed : "Downloading what it needs",
+      meta: "What it downloads stays private", action: null });
+    return;
+  }
+  const running = phaseText(node);
+  if (running && vid) {
+    card.update({ tone: "ok", title: running, detail: "Running", meta: "Inside steps stay private",
+      action: null });
+    return;
+  }
   const n = info.interface?.concealed ? 0 : (Number(info.node_count) || 0);     // V3: a concealed vault hides it
   const detail = n ? `${n} node${n === 1 ? "" : "s"} inside` : "Protected subgraph";
   if (!vid) {
@@ -525,7 +562,8 @@ async function protectTransaction(nodes, opts) {
       ["ENCRYPTION_AND_SEALING", async () => {
         const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
           recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui: exportUi(sg),
-          outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}) });
+          outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}) });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
         built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
@@ -596,7 +634,8 @@ async function protectSubgraphNode(sg, opts) {
   const ui = exportUi(sg);
   const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
     recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui,
-    outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}) });
+    outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}) });
   if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
   const v = makeVaultNode(sg.graph, r.data, built, sg);
   removeDefinitionIfUnused(sg);
@@ -728,6 +767,22 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
       text: "The recipient sees only the controls you choose - never model, node or custom-node names." })]), stepHost);
     exposure.on = () => concealSw.checked();
   }
+  // V7: "Downloads for people who run it" - one HTTPS link per model file; kept inside the encryption
+  const links = [];
+  if (exposure?.models?.length) {
+    const dl = disclosure(`Downloads for people who run it (optional, ${exposure.models.length} model file` +
+      `${exposure.models.length === 1 ? "" : "s"})`);
+    dl.body.append(vel("p", { class: "h2v-dim", text: "Give a download link (https://) for each model file. When " +
+      "someone runs this vault on a ComfyUI without the file, it downloads by itself under a private name and is " +
+      "checked against your file. The links and file names stay inside the vault." }));
+    for (const file of exposure.models) {
+      const f = textField({ label: file, value: "", maxLength: 2000, hint: "" });
+      f.input.placeholder = "https://...";
+      links.push({ file, input: f.input });
+      dl.body.append(f.el);
+    }
+    d.body.append(dl.el);
+  }
   render();
   d.status(PROTECT_FOOT);
   d.addAction("Cancel", { onClick: () => d.close(null) });
@@ -746,11 +801,14 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
       }
       conceal = r.conceal;
     }
-    d.setBusy(true, "Locking…");
+    const downloads = links.map((l) => ({ file: l.file, url: l.input.value.trim() })).filter((l) => l.url);
+    const badLink = downloads.find((l) => !/^https:\/\//i.test(l.url));
+    if (badLink) { d.notice("danger", "Download links must start with https://."); return; }
+    d.setBusy(true, downloads.length ? "Locking (checking model files)…" : "Locking…");
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, conceal,
+        title: name.input.value, conceal, downloads,
         onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
@@ -1291,6 +1349,23 @@ async function confirmRemoveConceal(sess) {
 
 /** V3: what the "Choose what to expose" step offers for this selection (the nodes about to be locked, or the inside
  *  of the subgraph), and how it asks the server to check a choice (same rules as sealing). */
+// V7: model files the selection uses (widget values that look like model files) - offered in the protect dialog so
+// the author can give a download link for each; size and SHA-256 are computed on the author's machine at lock time.
+const MODEL_EXT = /\.(safetensors|ckpt|pt|pth|bin|gguf|sft|onnx|pkl|pb|engine)$/i;
+function modelFilesOf(nodes) {
+  const seen = new Set();
+  const walk = (list) => {
+    for (const n of list || []) {
+      for (const w of n.widgets || []) {
+        if (typeof w.value === "string" && MODEL_EXT.test(w.value) && !w.value.includes("..")) seen.add(w.value);
+      }
+      if (n.subgraph) walk(n.subgraph.nodes || n.subgraph._nodes);
+    }
+  };
+  walk(nodes);
+  return [...seen].sort();
+}
+
 function exposureOf(r, boundary) {
   const defOf = (type) => globalThis.LiteGraph?.registered_node_types?.[type]?.nodeData ?? null;
   const sg = r.kind === "subgraph" ? r.nodes[0] : null;
@@ -1300,6 +1375,7 @@ function exposureOf(r, boundary) {
   return {
     controls: inventory(nodes, { defOf, promoted: sg ? promotedValues(sg) : null }), sockets,
     previews: previewsOf(nodes, { defOf }),
+    models: modelFilesOf(nodes),
     check: async (conceal) => {
       const c = cand();
       const res = await post("/h2vault/vault/conceal/check", { api: c.api, interface: c.interface, ui: c.ui, conceal });
@@ -1469,6 +1545,74 @@ function accessDialog(v, res, focus, apply) {
   d.addAction("Apply", { primary: true, onClick: go });
   if (focus === "password") setTimeout(() => pw.input.focus(), 0);
   return d.result;
+}
+
+// ── V7 concealed provisioning: what a vault needs arrives by itself, names never shown (owner 2026-11-23) ──────
+const PROVISION_SETTING = "h2vault.provision.mode";
+const PREPARING = new Map();           // vault id -> {pct, failed}
+const PROVISIONED = new Set();         // vault ids handled in this tab
+
+function provisionMode() {
+  try {
+    const v = app.extensionManager?.setting?.get?.(PROVISION_SETTING);
+    return v === "ask" || v === "never" ? v : "auto";
+  } catch (_) { return "auto"; }
+}
+
+async function autoProvision(v) {
+  const W = (name) => v.widgets?.find((w) => w.name === name);
+  const vid = W("vault_id")?.value, payload = W("vault_payload")?.value;
+  const mode = provisionMode();
+  if (!vid || !payload || mode === "never" || PROVISIONED.has(vid)) return;
+  PROVISIONED.add(vid);
+  const body = { payload, vault_id: vid, client_id: api.clientId };
+  const plan = await post("/h2vault/vault/provision/plan", body);
+  if (!plan.ok) return;                               // e.g. a Locked vault before its password: the run asks
+  const s = plan.data;
+  if (s.nodes_missing) {
+    if (mode === "auto") {
+      const r = await post("/h2vault/vault/install_missing", { ...body, consent: true });
+      if (r.ok && r.data?.installed) toast(`Installed what this workflow needs (${r.data.installed} extension` +
+        `${r.data.installed !== 1 ? "s" : ""}). Restart ComfyUI to load ${r.data.installed !== 1 ? "them" : "it"}.`);
+    } else installMissing(v, { auto: true });
+  }
+  if (!s.models_missing) return;
+  if (!s.downloadable) {
+    toast("This workflow needs model files its vault cannot download. Ask the vault's author.", true);
+    return;
+  }
+  const gb = (s.bytes / 1e9).toFixed(s.bytes > 1e10 ? 0 : 1);
+  if (mode === "ask") {
+    const ask = vaultDialog({ title: "Prepare this workflow", width: 460 });
+    ask.body.append(vel("p", { style: { margin: "0" }, text: `It needs ${s.models_missing} model file` +
+      `${s.models_missing !== 1 ? "s" : ""} (${gb} GB) that this ComfyUI does not have. They download in the background ` +
+      "and are checked before use; what they are stays private." }));
+    ask.addAction("Not now", { onClick: () => ask.close(false) });
+    ask.addAction("Download", { primary: true, onClick: () => ask.close(true) });
+    if (!(await ask.result)) return;
+  }
+  const st = await post("/h2vault/vault/provision/start", { ...body, consent: true });
+  if (!st.ok) { toast(st.data?.error || "Could not prepare this vault.", true); return; }
+  const token = st.data.token;
+  PREPARING.set(vid, { pct: 0 });
+  refreshCards(vid);
+  const tick = async () => {
+    const r = await post("/h2vault/vault/provision/status", { token });
+    const d = r.data || {};
+    const pct = d.total_bytes ? Math.min(100, Math.floor((100 * d.done_bytes) / d.total_bytes)) : 0;
+    if (d.state === "running") {
+      PREPARING.set(vid, { pct });
+      refreshCards(vid);
+      setTimeout(tick, 2000);
+      return;
+    }
+    if (d.state === "done") {
+      PREPARING.delete(vid);
+      toast("This workflow is ready: everything it needs is downloaded and checked.");
+    } else PREPARING.set(vid, { pct, failed: d.error || "A download failed; try again later." });
+    refreshCards(vid);
+  };
+  setTimeout(tick, 1500);
 }
 
 // ── missing custom nodes (L9.50): one click, names never shown (owner A18) ─────────────────────────────────
@@ -1650,11 +1794,20 @@ app.registerExtension({
   settings: [{ id: DEFAULT_PROFILE_SETTING, category: ["H2Vault", "Protect", "Default profile"],
     name: "Profile chosen first when protecting a subgraph", type: "combo", defaultValue: "sealed_installs",
     options: [{ text: "Sealed - authorized installations", value: "sealed_installs" },
-      { text: "Locked - password to run", value: "locked" }] }],
+      { text: "Locked - password to run", value: "locked" }] },
+    { id: PROVISION_SETTING, category: ["H2Vault", "Run", "Install what a vault needs"],
+      name: "When a workflow's vault needs model files or extensions this ComfyUI lacks", type: "combo",
+      defaultValue: "auto",
+      tooltip: "Automatically: download them in the background (checked before use; what they are stays private). "
+        + "Extensions are code and need a ComfyUI restart.",
+      options: [{ text: "Install automatically", value: "auto" }, { text: "Ask first", value: "ask" },
+        { text: "Never", value: "never" }] }],
   setup() {
     installGuards();
     app.canvas?.canvas?.addEventListener("litegraph:set-graph", onSetGraph);
     api.addEventListener("execution_error", onExecutionError);      // offer the install on every failed attempt
+    api.addEventListener("h2vault.phase", onPhase);
+    for (const ev of ["execution_success", "execution_error", "execution_interrupted"]) api.addEventListener(ev, clearPhases);
   },
   async beforeRegisterNodeDef(nodeType, nodeData) {
     if (VAULT_TYPES.has(nodeData.name)) {
