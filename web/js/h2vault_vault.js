@@ -654,6 +654,7 @@ async function protectTransaction(nodes, opts) {
         if ((sg.outputs || []).length > MAX_VAULT_OUTPUTS) {
           throw new ProtectError("SUBGRAPH_INTERFACE_VALIDATION", `A vault can have at most ${MAX_VAULT_OUTPUTS} outputs.`);
         }
+        removeVaultOutputs(sg, opts.dropOutputs);
       }],
       ["INNER_GRAPH_EXTRACTION", async () => { built = await buildApi(sg, opts.extraParams || []); }],
       ["VAULT_PAYLOAD_VALIDATION", () => validateBuilt(built)],
@@ -856,13 +857,21 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
   }
   d.body.append(vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), others.el);
   // V3: "Conceal models and nodes" -> the "Choose what to expose" step (docs/h2vault/V3_concealment_design.md)
-  let step = null;
+  let step = null, refusedNotice = false;
   const stepHost = vel("div");
   if (exposure) {
     const concealSw = switchRow("Conceal models and nodes", { checked: false, onChange: (on) => {
       if (on && !step) {
         step = exposeStep({ controls: exposure.controls, sockets: exposure.sockets, previews: exposure.previews,
-          title: () => name.input.value, check: exposure.check });
+          title: () => name.input.value, check: exposure.check,
+          // a refusal notice goes as soon as the listed problems are fixed (it must not contradict the step)
+          onChecked: (r) => { if (r.ok && refusedNotice) { d.notice(null); refusedNotice = false; } },
+          onUnconceal: () => {
+            refusedNotice = false;
+            if (concealSw.checked()) concealSw.el.click();                 // the switch's own handler hides the step
+            d.notice("info", "Concealment is off: the vault is locked as an ordinary vault. Its outputs are kept, " +
+              "and whoever runs it sees inner node types in error messages and the real file names in its controls.");
+          } });
         name.input.addEventListener("input", () => step?.refresh());
       }
       stepHost.replaceChildren(...(on && step ? [vel("p", { class: "h2v-dim", text: "Tick what the person who runs " +
@@ -898,15 +907,19 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.notice(null);
     if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the vault password."); pw.input.focus(); return; }
     if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); pw2.input.focus(); return; }
-    let conceal = null;
+    let conceal = null, dropOutputs = [];
     if (exposure?.on?.() && step) {
       const r = await step.ready();
       if (!r.ok) {
-        d.notice("danger", "Fix what is listed under \"Choose what to expose\" before locking.");
+        const n = r.problems?.length || 1;
+        d.notice("danger", `${n} thing${n === 1 ? "" : "s"} to fix under "Choose what to expose" before locking - ` +
+          "each one is marked on its row with a way to fix it.");
+        refusedNotice = true;
         step.focusProblem();
         return;
       }
       conceal = r.conceal;
+      dropOutputs = r.dropped || [];
     }
     const downloads = links.map((l) => ({ file: l.file, url: l.input.value.trim() })).filter((l) => l.url);
     const badLink = downloads.find((l) => !/^https:\/\//i.test(l.url));
@@ -915,7 +928,7 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, conceal, downloads,
+        title: name.input.value, conceal, downloads, dropOutputs,
         onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
@@ -1485,11 +1498,49 @@ function modelFilesOf(nodes) {
   return [...seen].sort();
 }
 
+/** How many OTHER subgraph nodes (root + every definition) use the same definition as `sg`. */
+function otherUsesOf(sg) {
+  const root = app.rootGraph ?? app.graph;
+  const id = sg?.subgraph?.id;
+  if (!id || !root) return 0;
+  let n = 0;
+  for (const g of [root, ...(root.subgraphs?.values?.() ?? [])]) {
+    for (const x of g?.nodes || g?._nodes || []) if (x !== sg && isSubgraphNode(x) && x.subgraph?.id === id) n++;
+  }
+  return n;
+}
+
+/** Owner 2026-11-23 "Remove this output from the vault": take the chosen outputs (by inner source "<node>#<slot>",
+ *  the key the dialog and the server use) out of the subgraph before it is extracted. The inner graph is untouched
+ *  (only the wire to the output node goes); the outer wires from those outputs are dropped with them. A definition
+ *  used elsewhere is never changed (the dialog says so first). Runs inside the transaction: any failure restores. */
+function removeVaultOutputs(sg, keys) {
+  if (!keys?.length) return;
+  const sub = sg?.subgraph;
+  if (otherUsesOf(sg) > 0) {
+    throw new ProtectError("SUBGRAPH_INTERFACE_VALIDATION", "This subgraph is also used elsewhere in the workflow, " +
+      "so an output cannot be removed from it without changing the other copies. Remove the output inside the " +
+      "subgraph yourself, or lock without concealment.");
+  }
+  const want = new Set(keys.map(String));
+  const doomed = (sub?.outputs || []).filter((so) => {
+    const l = linkOf(sub, (so.linkIds || [])[0]);
+    return l && want.has(`${l.origin_id}#${l.origin_slot}`);
+  });
+  if (!doomed.length || typeof sub.removeOutput !== "function") {
+    throw new ProtectError("SUBGRAPH_INTERFACE_VALIDATION", "An output chosen for removal is no longer in the " +
+      "subgraph. Close this dialog and lock again.");
+  }
+  for (const so of doomed) sub.removeOutput(so);
+}
+
 function exposureOf(r, boundary) {
   const defOf = (type) => globalThis.LiteGraph?.registered_node_types?.[type]?.nodeData ?? null;
   const sg = r.kind === "subgraph" ? r.nodes[0] : null;
   const nodes = sg ? [...(sg.subgraph?.nodes || sg.subgraph?._nodes || [])] : r.nodes;
   const sockets = socketsOf({ kind: r.kind, nodes, boundary, sg });
+  const shared = sg ? otherUsesOf(sg) : 0;
+  for (const s of sockets) if (s.kind === "out") s.shared = shared;
   const cand = () => candidate(nodes, sockets);
   return {
     controls: inventory(nodes, { defOf, promoted: sg ? promotedValues(sg) : null }), sockets,

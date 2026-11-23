@@ -270,7 +270,9 @@ def conceal_check(body: dict) -> dict:
     api, interface = _expose(body.get("api") or {}, body.get("interface") or {}, conceal)
     plain = {"api": api, "interface": interface, "ui": body.get("ui"), "conceal": conceal}
     problems = concealment.check_public(plain)
+    # owner 2026-11-23: per output what it carries, why it blocks and which in-dialog fixes apply (public names only)
     return {"ok": True, "problems": problems,
+            "outputs": concealment.review_outputs(plain), "inputs": concealment.review_inputs(plain),
             "public_interface": None if problems else concealment.public_interface(plain)}
 
 
