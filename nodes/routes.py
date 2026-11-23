@@ -20,6 +20,11 @@
   POST /h2vault/2fa/enrol/begin  a new TOTP secret + recovery codes, shown once        (this machine's page only)
   POST /h2vault/2fa/enrol/confirm  the first code activates it                        (this machine's page only)
   POST /h2vault/2fa/reset        remove it, with a current code or a recovery code     (this machine's page only)
+  POST /h2vault/2fa/manage/begin   one proof (any method) -> a 10-minute settings token  (this machine's page only)
+  POST /h2vault/2fa/totp/remove | recovery/new | backup_password/set|remove | passkey/register/begin|finish |
+       passkey/remove            change the methods set up here (settings token)        (this machine's page only)
+  POST /h2vault/2fa/passkey/challenge  WebAuthn options to open a vault with a passkey
+  POST /h2vault/vault/run_status  which Locked vaults this tab has unlocked (a reloaded tab keeps them)
   POST /h2vault/licence/status   V5: may this installation run a Licensed vault now (this machine's page only)
   POST /h2vault/licence/add      V5: keep a licence the author sent (verified first)    (this machine's page only)
   POST /h2vault/licence/remove   V5: forget a stored licence                              (this machine's page only)
@@ -56,6 +61,7 @@ _lock = threading.Lock()
 _KDF_GATE = threading.Semaphore(1)     # every password route derives one Argon2id key at a time (RAM; see unlock_run)
 MAX_FAILED_ATTEMPTS = 5                # per vault id: the guesser already has the file, so cap guesses per blob
 LOCKOUT_SECONDS = 5 * 60
+MAX_LOCKOUT_SECONDS = 60 * 60
 _EDITS: dict[str, dict] = {}
 # L9.249 V6: vaults this server just sealed, vault_id -> (client_id, time). A protect that fails in the browser AFTER
 # sealing (node insertion, wiring, final check) restores the graph; /protect/abort then drops the run key protect()
@@ -73,9 +79,13 @@ class _Guesses:
         self._fails: dict[str, tuple[int, float]] = {}
 
     def note_failure(self, vault_id: str) -> None:
+        """5 failures lock the vault id for LOCKOUT_SECONDS; each further failure after a lockout doubles it (capped
+        at MAX_LOCKOUT_SECONDS). The count survives the end of a lockout; a correct password clears it."""
         with self._lock:
             count, _ = self._fails.get(vault_id, (0, 0.0))
-            self._fails[vault_id] = (count + 1, time.monotonic() + LOCKOUT_SECONDS)
+            count += 1
+            wait = LOCKOUT_SECONDS * (2 ** min(max(0, count - MAX_FAILED_ATTEMPTS), 12))
+            self._fails[vault_id] = (count, time.monotonic() + min(wait, MAX_LOCKOUT_SECONDS))
 
     def clear_failures(self, vault_id: str) -> None:
         with self._lock:
@@ -87,11 +97,7 @@ class _Guesses:
             count, until = self._fails.get(vault_id, (0, 0.0))
             if count < MAX_FAILED_ATTEMPTS:
                 return 0.0
-            remaining = until - time.monotonic()
-            if remaining <= 0:
-                self._fails.pop(vault_id, None)
-                return 0.0
-            return remaining
+            return max(0.0, until - time.monotonic())
 
 
 GUESSES = _Guesses()
@@ -300,6 +306,8 @@ def protect(body: dict) -> dict:
     plain = {"exec": boundary_exec(interface), "api": api, "ui": body.get("ui"), "interface": interface,
              "editors": editors, "profile": profile, "packs": vault_packs.record_safely(api),          # L9.50
              "created": int(time.time())}
+    if body.get("second_factor") is not None:                 # 2026-11-23: which methods may open it for editing
+        plain["second_factor"] = _second_factor_choice(body.get("second_factor"))
     if body.get("models") or body.get("downloads"):         # V7: model downloads, kept INSIDE the encryption
         from . import provision
         try:
@@ -398,9 +406,35 @@ def unlock_run(body: dict) -> dict:
 
 
 def forget_run(body: dict) -> dict:
+    """The tab is unloading - closed OR reloaded (the browser does not say which). Its run keys are dropped after
+    RunSessions.RELOAD_GRACE_SECONDS unless the same tab comes back (run_status) - a reload no longer asks again."""
     from . import protected_subgraph as SS
-    SS.RUN_SESSIONS.drop_client(str(body.get("client_id") or ""))
+    SS.RUN_SESSIONS.forget_later(str(body.get("client_id") or ""))
     return {"ok": True}
+
+
+def run_status(body: dict) -> dict:
+    """The Locked vaults THIS tab may run without asking (never another tab's), and cancel a pending drop."""
+    from . import protected_subgraph as SS
+    client_id = str(body.get("client_id") or "")
+    if not client_id:
+        return {"ok": True, "unlocked": []}
+    return {"ok": True, "unlocked": SS.RUN_SESSIONS.touch(client_id)}
+
+
+def _second_factor_choice(value) -> dict:
+    from . import twofactor
+    methods = value.get("methods") if isinstance(value, dict) else value
+    try:
+        return {"methods": twofactor.normalise_policy(methods)}
+    except ValueError as exc:
+        raise VaultError(str(exc)) from None
+
+
+def _factor_of(body: dict) -> dict:
+    """The second factor a request carries: {"factor": {...}} (methods) or the first release's {"code": ...}."""
+    f = body.get("factor")
+    return dict(f) if isinstance(f, dict) else {"code": str(body.get("code") or "")}
 
 
 def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
@@ -412,11 +446,11 @@ def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
 
     payload, vault_id = str(body.get("payload") or ""), str(body.get("vault_id") or "")
     password = str(body.get("password") or "")
-    if not vault_2fa.enrolled():
+    if not vault_2fa.any_enrolled():
         return None, None, None, {
             "ok": False, "needs_enrolment": True,
-            "error": "Opening a vault needs a second factor on this installation. Set up an authenticator app first "
-                     "(H2Vault menu > Two-factor setup)."}
+            "error": "Opening a vault needs a second factor on this installation. Set one up first (H2Vault menu > "
+                     "Second factor): an authenticator app, a passkey or a backup password."}
     try:                                                       # a damaged / foreign payload is a bad request, never a
         v2.parse(payload)                                      # counted password guess (it would lock the vault id)
     except VaultError as err:
@@ -425,17 +459,20 @@ def _authorize(body: dict, *, require_editor: bool = True) -> tuple:
     plain, kek, parsed = _password_attempt(vault_id, lambda: v2.open_with_password(payload, password,
                                                                                     vault_id=vault_id))
     k = {"kek": kek, "salt": parsed["salt"], "kdf": parsed["kdf"]}
-    detail = vault_2fa.verify_detail(str(body.get("code") or ""))
+    allowed = vault_2fa.policy_of(plain)                       # checked BEFORE the factor: a refused method is never
+    detail = vault_2fa.verify_factor(_factor_of(body), allowed=allowed,      # consumed and never counted
+                                     scope=f"v:{vault_id}", origins=body.get("_req_origins") or ())
     if not detail["ok"]:
-        return None, None, None, {"ok": False, "reason": detail["reason"], "error": detail["message"],
-                                  **({"next_in": detail["next_in"]} if "next_in" in detail else {})}
+        return None, None, None, {
+            "ok": False, "reason": detail["reason"], "error": detail["message"], "methods": allowed,
+            **{key: detail[key] for key in ("next_in", "allowed", "method") if key in detail}}
     editors = plain.get("editors")
     if require_editor and editors and _this_install_code() not in editors:
         return None, None, None, {
             "ok": False, "reason": "not_editor",
             "error": "This installation is not an editor of this vault. Ask its author to add your installation code "
                      "(H2Vault menu > My installation code)."}
-    return plain, k, detail["reason"], None
+    return plain, k, {**detail, "methods": allowed}, None
 
 
 def _holds_author_key(p: dict) -> bool:
@@ -453,10 +490,9 @@ def _holds_author_key(p: dict) -> bool:
 def open_for_edit(body: dict) -> dict:
     """Password -> second factor -> editor list. Returns the inner graph for native editing + an edit token."""
     payload, vault_id = str(body.get("payload") or ""), str(body.get("vault_id") or "")
-    plain, k, factor, refused = _authorize(body)
+    plain, k, detail, refused = _authorize(body)
     if refused:
         return refused
-    detail = {"reason": factor}
     editors = plain.get("editors")
     me = _this_install_code()
     token = secrets.token_urlsafe(24)
@@ -468,9 +504,10 @@ def open_for_edit(body: dict) -> dict:
                          "conceal": plain.get("conceal"),
                          "lock": plain.get("lock"),                        # V5
                          "licensing": v2_licensing(plain),                 # V5: an edit keeps the licence key
+                         "second_factor": plain.get("second_factor"),      # an edit keeps the author's methods
                          "client_id": str(body.get("client_id") or "")}
     out = {"ok": True, "edit_token": token, "interface": plain.get("interface"), "profile": _EDITS[token]["profile"],
-           "second_factor": detail["reason"]}
+           **_factor_answer(detail)}
     if isinstance(plain.get("conceal"), dict):
         out["conceal"] = plain["conceal"]                      # the author may change what the recipient sees
     if not isinstance(plain.get("ui"), dict):
@@ -529,7 +566,7 @@ def access_open(body: dict) -> dict:
     from . import crypto as v2, keys as vault_keys
 
     payload, vault_id = str(body.get("payload") or ""), str(body.get("vault_id") or "")
-    plain, k, factor, refused = _authorize(body)
+    plain, k, detail, refused = _authorize(body)
     if refused:
         return refused
     me = _this_install_code()
@@ -545,7 +582,17 @@ def access_open(body: dict) -> dict:
     def row(c):
         return {"code": c, "label": labels.get(c, ""), "me": c == me}
     return {"ok": True, "access_token": token, "profile": profile, "editors": [row(c) for c in editors],
-            "recipients": [row(c) for c in recipients], "second_factor": factor}
+            "recipients": [row(c) for c in recipients], **_factor_answer(detail),
+            "methods_explicit": isinstance(plain.get("second_factor"), dict)}
+
+
+def _factor_answer(detail: dict) -> dict:
+    """What an open / access answer says about the second factor: the method used, the vault's methods and, after a
+    recovery code, how many are left."""
+    out = {"second_factor": detail.get("reason"), "methods": detail.get("methods") or []}
+    if "recovery_codes_left" in detail:
+        out["recovery_codes_left"] = detail["recovery_codes_left"]
+    return out
 
 
 def access_apply(body: dict) -> dict:
@@ -583,11 +630,13 @@ def access_apply(body: dict) -> dict:
         k = s["k"]
     inner = {key: v for key, v in plain.items() if key not in ("recipients", "format")}
     inner.update(editors=editors, access_labels=labels, updated=int(time.time()))
+    if body.get("second_factor") is not None:                 # the author changes which methods may open it
+        inner["second_factor"] = _second_factor_choice(body.get("second_factor"))
     raw = [vault_keys.parse_public_text(c) for c in recipients] if sealed else None
     new_payload = v2.lock_with(inner, k, vault_id=s["vault_id"], mode=PROFILES[s["profile"]],
                                iface=_iface(plain.get("interface") or {}), recipients=raw)
     check = v2.open_with_kek(new_payload, k["kek"], vault_id=s["vault_id"])       # it opens, or nothing changes
-    if check.get("editors") != editors:
+    if check.get("editors") != editors or check.get("second_factor") != inner.get("second_factor"):
         raise VaultError("The re-encrypted vault did not read back correctly; nothing was changed.")
     with _lock:
         for t in [t for t, x in _EDITS.items() if x.get("vault_id") == s["vault_id"]]:
@@ -704,6 +753,8 @@ def commit(body: dict) -> dict:
              "editors": s["editors"], "profile": s["profile"],
              "packs": vault_packs.record_safely(api, s["packs"]),                                    # L9.50
              "updated": int(time.time())}
+    if isinstance(s.get("second_factor"), dict):
+        plain["second_factor"] = s["second_factor"]
     public = _with_conceal(plain, conceal)
     # V5: an explicit `lock` is checked strictly; the session's lock is kept only while it still fits the inside
     public_lock = (_with_lock(plain, body["lock"]) if "lock" in body
@@ -977,17 +1028,109 @@ def author_import(body: dict) -> dict:
 
 # ── second factor (CNP vault_node /c2c_vault/2fa/*) ──────────────────────────────────────────────────────────────
 def tfa_status(_body: dict) -> dict:
+    """What is set up on this installation - counts and labels, never a secret. `enrolled` = some method exists (an
+    install with only a passkey opens vaults without an authenticator app); `totp` = the authenticator app."""
     from . import twofactor
-    return {"ok": True, "enrolled": twofactor.enrolled(), "locked_out_seconds": int(twofactor.locked_out()),
-            "recovery_codes_left": twofactor.recovery_codes_left()}
+    m = twofactor.methods_set_up()
+    return {"ok": True, "enrolled": twofactor.any_enrolled(), "totp": m["totp"], "methods": m,
+            "usable": twofactor.usable_methods(), "passkeys": twofactor.passkeys_public(),
+            "backup_password": m["backup_password"], "recovery_codes_left": m["recovery"],
+            "locked_out_seconds": int(twofactor.locked_out()), "labels": twofactor.METHOD_LABELS,
+            "default_methods": list(twofactor.DEFAULT_POLICY), "not_offline": twofactor.NOT_OFFLINE}
 
 
-def tfa_begin(_body: dict) -> dict:
+def _manage(body: dict) -> None:
     from . import twofactor
+    try:
+        twofactor.check_manage(str(body.get("manage_token") or ""))
+    except PermissionError as exc:
+        raise _Forbidden(str(exc)) from None
+
+
+def tfa_begin(body: dict) -> dict:
+    from . import twofactor
+    if twofactor.any_enrolled() and not twofactor.enrolled():
+        _manage(body)                                          # adding an app next to a passkey / backup password
     try:
         return {"ok": True, **twofactor.begin_enrolment()}
     except PermissionError as exc:                            # already enrolled: a conflict, not a rate limit
         raise _Conflict(str(exc)) from None
+
+
+def tfa_manage_begin(body: dict) -> dict:
+    from . import twofactor
+    out = twofactor.manage_begin(_factor_of(body), origins=body.get("_req_origins") or ())
+    if not out["ok"]:
+        return {"ok": False, "reason": out["reason"], "error": out["message"],
+                **{k: out[k] for k in ("next_in",) if k in out}}
+    return {"ok": True, "manage_token": out["manage_token"], "expires_in": out["expires_in"],
+            **({"recovery_codes_left": out["recovery_codes_left"]} if "recovery_codes_left" in out else {})}
+
+
+def tfa_totp_remove(body: dict) -> dict:
+    from . import twofactor
+    _manage(body)
+    twofactor.remove_totp()
+    return {"ok": True}
+
+
+def tfa_recovery_new(body: dict) -> dict:
+    """A new set of recovery codes, returned ONCE (the old set stops working). Never logged."""
+    from . import twofactor
+    _manage(body)
+    return {"ok": True, "recovery_codes": twofactor.new_recovery_codes()}
+
+
+def tfa_backup_password_set(body: dict) -> dict:
+    from . import twofactor
+    _manage(body)
+    try:
+        twofactor.set_backup_password(str(body.get("secret") or ""))
+    except ValueError as exc:
+        raise _BadRequest(str(exc)) from None
+    return {"ok": True}
+
+
+def tfa_backup_password_remove(body: dict) -> dict:
+    from . import twofactor
+    _manage(body)
+    twofactor.remove_backup_password()
+    return {"ok": True}
+
+
+def tfa_passkey_register_begin(body: dict) -> dict:
+    from . import twofactor
+    _manage(body)
+    try:
+        return {"ok": True, **twofactor.passkey_register_begin(body.get("_req_host") or "", body.get("label") or "")}
+    except PermissionError as exc:
+        raise _BadRequest(str(exc)) from None
+
+
+def tfa_passkey_register_finish(body: dict) -> dict:
+    from . import twofactor
+    from .webauthn_min import WebAuthnError
+    _manage(body)
+    try:
+        cred = twofactor.passkey_register_finish(str(body.get("challenge_id") or ""), body.get("credential") or {},
+                                                 body.get("_req_origins") or ())
+    except (WebAuthnError, PermissionError) as exc:
+        raise _BadRequest(str(exc)) from None
+    return {"ok": True, "passkey": cred}
+
+
+def tfa_passkey_remove(body: dict) -> dict:
+    from . import twofactor
+    _manage(body)
+    return {"ok": twofactor.remove_passkey(str(body.get("id") or ""))}
+
+
+def tfa_passkey_challenge(body: dict) -> dict:
+    from . import twofactor
+    try:
+        return {"ok": True, **twofactor.passkey_challenge(body.get("_req_host") or "")}
+    except PermissionError as exc:
+        raise _BadRequest(str(exc)) from None
 
 
 def tfa_confirm(body: dict) -> dict:
@@ -1000,19 +1143,51 @@ def tfa_confirm(body: dict) -> dict:
 
 
 def tfa_reset(body: dict) -> dict:
+    """Remove the authenticator app: with a settings token, or (first release) a current code / recovery code. A
+    success also returns a settings token, so setting the app up again needs no second proof."""
     from . import twofactor
-    return {"ok": twofactor.reset(str(body.get("code") or ""))}
+    if body.get("manage_token"):
+        _manage(body)
+        twofactor.remove_totp()
+        return {"ok": True}
+    out = twofactor.manage_begin(_factor_of(body), origins=body.get("_req_origins") or ())
+    if not out["ok"]:
+        return {"ok": False, "reason": out["reason"], "error": out["message"]}
+    twofactor.remove_totp()
+    return {"ok": True, "manage_token": out["manage_token"]}
 
 
 class _Conflict(VaultError):
     status = 409
 
 
+class _Forbidden(VaultError):
+    status = 403
+
+
+def _request_origin(body: dict, request) -> None:
+    """Passkey answers are bound to the page's origin. Put the origins this request may come from into the body
+    (`_req_origins`, `_req_host`) - from the Host header, after removing anything the client sent under those
+    names."""
+    from .local_guard import _hostname_from_host_header
+    for key in [k for k in body if str(k).startswith("_req_")]:
+        body.pop(key, None)
+    try:
+        host = str(request.headers.get("Host") or "").strip()
+    except Exception:  # noqa: BLE001
+        host = ""
+    if host:
+        body["_req_origins"] = [f"http://{host}", f"https://{host}"]
+        body["_req_host"] = _hostname_from_host_header(host)
+
+
 def register_routes(server) -> None:
     from aiohttp import web
 
+    from . import twofactor
     from .local_guard import refuse_remote
 
+    twofactor.admin_reset_from_env()
     routes = server.routes
 
     def wrap(fn, status_on_error=403, offload=False, local_only=None, local_when=None):
@@ -1027,6 +1202,8 @@ def register_routes(server) -> None:
                 body = await request.json() if request.method == "POST" else {}
             except Exception:  # noqa: BLE001
                 body = {}
+            if isinstance(body, dict):
+                _request_origin(body, request)
             phrase = local_when(body) if local_when and isinstance(body, dict) else None
             if phrase:
                 refused = refuse_remote(request, phrase)
@@ -1053,6 +1230,7 @@ def register_routes(server) -> None:
     routes.post("/h2vault/vault/protect/abort")(wrap(protect_abort))
     routes.post("/h2vault/vault/unlock_run")(wrap(unlock_run, offload=True))
     routes.post("/h2vault/vault/forget_run")(wrap(forget_run))
+    routes.post("/h2vault/vault/run_status")(wrap(run_status))
     routes.post("/h2vault/vault/open")(wrap(open_for_edit, offload=True))           # password KDF off the loop
     routes.post("/h2vault/vault/commit")(wrap(commit, 409))
     routes.post("/h2vault/vault/snapshot")(wrap(snapshot, 409))
@@ -1099,6 +1277,17 @@ def register_routes(server) -> None:
     routes.post("/h2vault/2fa/enrol/begin")(wrap(tfa_begin, 409, local_only="Setting up the authenticator"))
     routes.post("/h2vault/2fa/enrol/confirm")(wrap(tfa_confirm, 403, local_only="Setting up the authenticator"))
     routes.post("/h2vault/2fa/reset")(wrap(tfa_reset, 403, local_only="Resetting the authenticator"))
+    settings = "Changing the second factor"
+    routes.post("/h2vault/2fa/manage/begin")(wrap(tfa_manage_begin, 403, offload=True, local_only=settings))
+    routes.post("/h2vault/2fa/totp/remove")(wrap(tfa_totp_remove, 403, local_only=settings))
+    routes.post("/h2vault/2fa/recovery/new")(wrap(tfa_recovery_new, 403, offload=True, local_only=settings))
+    routes.post("/h2vault/2fa/backup_password/set")(wrap(tfa_backup_password_set, 403, offload=True,
+                                                         local_only=settings))
+    routes.post("/h2vault/2fa/backup_password/remove")(wrap(tfa_backup_password_remove, 403, local_only=settings))
+    routes.post("/h2vault/2fa/passkey/register/begin")(wrap(tfa_passkey_register_begin, 403, local_only=settings))
+    routes.post("/h2vault/2fa/passkey/register/finish")(wrap(tfa_passkey_register_finish, 403, local_only=settings))
+    routes.post("/h2vault/2fa/passkey/remove")(wrap(tfa_passkey_remove, 403, local_only=settings))
+    routes.post("/h2vault/2fa/passkey/challenge")(wrap(tfa_passkey_challenge, 400))
     # V5 licences
     routes.post("/h2vault/licence/status")(wrap(licence_status, 400, local_only="Licence status"))
     routes.post("/h2vault/licence/add")(wrap(licence_add, 400, local_only="Adding a licence"))

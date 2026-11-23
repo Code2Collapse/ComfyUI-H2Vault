@@ -82,7 +82,8 @@ nodes/
   secrets_store.py       keyring / encrypted-file backends        <- store, workflow_encrypt
   store.py               scope "vault" facade (tests: BACKEND)    <- keys, twofactor
   keys.py                install X25519 identity                  <- routes, protected_subgraph
-  twofactor.py           TOTP + recovery codes                    <- routes
+  twofactor.py           second-factor methods + lockouts         <- routes
+  webauthn_min.py        passkey (WebAuthn) verification          <- twofactor
   packs.py               record / summarise / consent install     <- protected_subgraph, routes
   protected_subgraph.py  the two nodes, expansion, leak filter    <- routes, __init__
   routes.py              /h2vault/vault/*, /h2vault/2fa/*         <- __init__
@@ -135,14 +136,23 @@ folder. A vault made by one pack is not openable by the other (different magic) 
 
 ## 6. Security notes (threat model delta vs CNP)
 
-Assets: vault inner graphs, the vault password, the install private key, the TOTP secret + recovery hashes,
+Assets: vault inner graphs, the vault password, the install private key, the TOTP secret, recovery-code and backup
+password scrypt hashes, passkey public keys,
 remembered workflow keys. Boundaries: browser page <-> ComfyUI server (HTTP), server <-> secrets store, workflow
 files leaving the machine.
 
 - Same honest limit as CNP: a machine that runs a vault can read its inside (it must be plaintext to execute).
 - Passwords / keys travel only over the routes, never in a widget, prompt, workflow, log or history.
-- Password guessing: per-vault lockout (5 failures -> 5 min) and a single KDF gate on EVERY password route
-  (`unlock_run`, `open`, `access/open`); the KDF runs off the event loop.
+- Password guessing: per-vault lockout (5 failures -> 5 min, then doubling up to 1 h) and a single KDF gate on EVERY
+  password route (`unlock_run`, `open`, `access/open`); the KDF runs off the event loop.
+- Second factor (2026-11-23): methods per installation (`twofactor.py`): TOTP, passkeys (`webauthn_min.py`: ES256 /
+  EdDSA / RS256 assertions over authenticatorData || SHA-256(clientDataJSON), origin from the request's Host header,
+  rpIdHash, user presence, counter; attestation not verified), backup password and recovery codes (scrypt, constant-time
+  compare). A vault's accepted methods live INSIDE the ciphertext (`second_factor.methods`; default TOTP + recovery) and
+  are checked after the password and BEFORE the factor, so a refused method is neither consumed nor counted. Wrong
+  factors are counted per vault and across vaults (exponential, persisted). Changing methods needs a 10-minute settings
+  token from one proof (local page only). `H2VAULT_RESET_SECOND_FACTOR=remove-all` at start removes every method (the
+  administrator's way back; whoever can set it can already read the secret store).
 - Routes that create or read local secrets without a vault password (2FA enrol begin / confirm / reset, the workflow
   key store) answer only the ComfyUI page on this machine (loopback peer + loopback Host + no cross-site
   Origin / Sec-Fetch-Site). Through an SSH tunnel the page still counts as local.
@@ -205,7 +215,7 @@ filter; the middleware also drops inner vault ids from per-node routes of co-ins
   a plain message), `keyring` optional. No torch pins.
 - Entry points without hunting: right-click a selection (Protect), right-click a subgraph, the top menu "H2Vault",
   the command palette, and drag-and-drop of an encrypted workflow file.
-- First vault: a fresh install has no authenticator; opening a vault walks through enrolment in the same dialog.
+- First vault: a fresh install has no second factor; opening a vault opens the Second factor dialog first.
 
 ## 9. Backlog (not in V2)
 

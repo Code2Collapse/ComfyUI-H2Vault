@@ -150,8 +150,8 @@ async function saveSameKey() {
   if (LAST_OPENED.scheme !== "fernet") {
     const d = vaultDialog({ title: "Save again with the same password", width: 480,
       subtitle: `"${fileName}" was protected with a password. Type it again (it is never kept).` });
-    const pw = passwordField({ label: "Password", autocomplete: "current-password" });
-    const pw2 = passwordField({ label: "Repeat the password", autocomplete: "current-password" });
+    const pw = passwordField({ label: "Password" });
+    const pw2 = passwordField({ label: "Repeat the password" });
     d.body.append(pw.el, pw2.el, noticeEl("info", METADATA_NOTE));
     d.addAction("Cancel", { onClick: () => d.close(null) });
     const go = async () => {
@@ -217,7 +217,7 @@ async function decryptFile(file, fileName) {
       : "This workflow is encrypted with a key. It was shown once to whoever saved it." });
   let workflow = null;
   const secret = needs === "password"
-    ? passwordField({ label: "Password", autocomplete: "current-password" })
+    ? passwordField({ label: "Password" })
     : textField({ label: "Workflow key", placeholder: "44 characters ending in =", autocomplete: "off" });
   d.body.append(secret.el);
   let remember = null;

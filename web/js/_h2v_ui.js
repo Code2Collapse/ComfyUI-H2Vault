@@ -6,6 +6,8 @@
 // and the vault node's status card. Rules: no import of the ComfyUI frontend (a wrong relative depth 404s the pack's
 // whole front end); side-effect free at import (tests import it under node); never innerHTML - elements and text only.
 
+import { NO_SAVE_ATTRS, hardenSecret, maskingSupported, secretInputSpec } from "./_h2v_factor.js";
+
 // ── pure helpers (unit-tested) ─────────────────────────────────────────────────────────────────────────────────
 /** Password strength for the meter. Under 8 characters is never accepted (the server rule). */
 export function passwordStrength(pw) {
@@ -118,6 +120,7 @@ const CSS = `
 .h2v-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 560px) { .h2v-grid2 { grid-template-columns: 1fr; } }
 
+.h2v-masked { -webkit-text-security: disc; text-security: disc; }
 .h2v-code { height: 44px; text-align: center; font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
   font-size: 18px; letter-spacing: 0.3em; }
 .h2v-clock { display: flex; align-items: center; gap: 8px; font-size: 11.5px; color: var(--h2v-ink-dim); }
@@ -452,6 +455,10 @@ export function field({ label, hint, control, id }) {
 export function textField({ label, value = "", placeholder = "", autocomplete = "off", hint, maxLength } = {}) {
   const input = el("input", { type: "text", class: "h2v-input", value, placeholder, autocomplete,
     spellcheck: false, maxLength: maxLength || null });
+  // never a "username" for a password manager (the vault name sits next to the password boxes)
+  for (const k of ["data-1p-ignore", "data-lpignore", "data-bwignore", "data-form-type"]) {
+    input.setAttribute(k, NO_SAVE_ATTRS[k]);
+  }
   return { el: field({ label, hint, control: input }), input };
 }
 
@@ -469,17 +476,30 @@ function generatePassword(len = 20) {
   return out;
 }
 
-/** Password input with Show / Hide, an optional strength meter and an optional Generate. */
-export function passwordField({ label, autocomplete = "new-password", strength = false, generate = false, hint,
+/**
+ * Password input with Show / Hide, an optional strength meter and an optional Generate. The browser never offers to
+ * SAVE what is typed here (owner 2026-11-23; root cause in _h2v_factor.js NO_SAVE_ATTRS): a masked text input where
+ * the browser can mask one, else type=password with autocomplete=new-password. `autocomplete` is accepted for old
+ * callers and ignored.
+ */
+export function passwordField({ label, autocomplete: _ignored, strength = false, generate = false, hint,
   placeholder = "", onGenerate } = {}) {
   ensureVaultStyles();
-  const input = el("input", { type: "password", class: "h2v-input", autocomplete, placeholder, spellcheck: false });
+  const spec = secretInputSpec(maskingSupported(globalThis.CSS));
+  const input = hardenSecret(el("input", { type: spec.type, class: `h2v-input h2v-secret${spec.masked ? " h2v-masked" : ""}`,
+    placeholder }));
+  input.setAttribute("autocomplete", spec.autocomplete);
+  let hidden = true;
+  if (spec.masked) {                       // a masked text input would let the secret be copied out: not while hidden
+    for (const ev of ["copy", "cut", "dragstart"]) input.addEventListener(ev, (e) => { if (hidden) e.preventDefault(); });
+  }
   const toggle = vbutton("Show", { kind: "text", small: true, ariaLabel: `Show ${label.toLowerCase()}` });
   toggle.setAttribute("aria-pressed", "false");
   toggle.addEventListener("click", () => {
-    const show = input.type === "password";
-    input.type = show ? "text" : "password";
-    if (show) input.classList.add("h2v-secret"); else input.classList.remove("h2v-secret");
+    const show = hidden;
+    hidden = !show;
+    if (spec.masked) input.classList.toggle("h2v-masked", !show);
+    else input.type = show ? "text" : "password";
     toggle.setAttribute("aria-pressed", show ? "true" : "false");
     toggle.querySelector(".h2v-btn__label").textContent = show ? "Hide" : "Show";
     toggle.setAttribute("aria-label", `${show ? "Hide" : "Show"} ${label.toLowerCase()}`);

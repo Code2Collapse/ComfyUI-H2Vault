@@ -16,6 +16,27 @@
   vault*, *Lock without concealment*, *Show it as MASK* (for a traced `*` output). Locking with problems left scrolls
   to and highlights the row; the notice goes away once the problems are fixed. A `*` socket is no longer called "*".
 
+**Second-factor methods (owner 2026-11-23)**
+
+- **No more "save password?" prompts**: vault password boxes are masked text inputs with the opt-out attributes of the
+  common password managers (Chromium offered to save after every lock, open, run unlock and licence step because a
+  password field disappeared after a successful request). Browsers that cannot mask text keep type=password.
+- **Locked vaults ask once per tab, also across a reload**: the server keeps a tab's run keys for 2 minutes after the
+  tab unloads and the reloaded tab (same client id) takes them back; after a ComfyUI restart the run asks again instead
+  of failing.
+- **Recovery codes can be entered**: "Recovery code" is a method of its own in every second-factor prompt; the answer
+  says how many are left and offers a new set when few remain. H2Vault menu › Second factor › Generate a new set (shown
+  once, .txt download). Stored as salted scrypt hashes now (older SHA-256 sets keep working until replaced).
+- **More second factors, chosen per vault**: passkeys / security keys / Windows Hello (WebAuthn, verified with the
+  `cryptography` package - no new dependency), a backup password, recovery codes, next to the authenticator app. The
+  lock dialog, Lock parameters and Manage access have "Second factor for editing"; recovery codes are always accepted.
+  Vaults locked before keep accepting the authenticator app + recovery codes. The prompt offers only what the vault
+  accepts and is set up here, starting with the method used last. Email / SMS are not offered (they need an online
+  provider).
+- Lockouts grow: wrong passwords and wrong second factors wait 5 minutes after 5 failures, then twice as long each time
+  (max 1 hour); second-factor failures count per vault and across vaults.
+- Lost every method: `H2VAULT_RESET_SECOND_FACTOR=remove-all` at start removes the methods (nothing else).
+
 ## 0.2.0 - 2026-11-23
 
 **Zero information (V8)** - a concealed vault tells nobody (and no AI reading the page, the logs, the history or the

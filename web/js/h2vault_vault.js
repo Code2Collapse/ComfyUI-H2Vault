@@ -24,6 +24,9 @@ import { exposeStep } from "./_h2v_expose_ui.js";
 // V5 (docs/h2vault/V5_enhancements_design.md): Lock parameters and offline licences
 import { lockRequest, lockableRows, reopenParams, whitelistLock } from "./_h2v_lockparams.js";
 import { EXPIRY_CHOICES, HONOUR_NOTE, fmtDate, ledgerState, licenceLine, licenceTerms } from "./_h2v_licence.js";
+// second-factor methods (owner 2026-11-23): authenticator, passkey, backup password, recovery codes - per vault
+import { METHOD_LABELS, factorErrorText } from "./_h2v_factor.js";
+import { factorPicker, policyEditor, secondFactorDialog } from "./_h2v_factor_ui.js";
 
 const VAULT_TYPES = new Set(["H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput"]);
 const PACK_AUX_ID = "Code2Collapse/ComfyUI-H2Vault";
@@ -35,14 +38,14 @@ const LOG = (...a) => console.info("[H2Vault]", ...a);
 const PROFILES = [
   { id: "sealed_installs", title: "Sealed — authorized installations", tag: "Recommended",
     run: "Without a password, only on ComfyUI installations you authorize (yours is always included).",
-    edit: "Vault password + your authenticator code + editor list.",
+    edit: "Vault password + your second factor + editor list.",
     net: "None - runs offline.", where: "On each authorized installation's GPU.",
     custody: "A per-vault key, wrapped for each authorized installation's own key pair.",
     security: "Encrypted. Other installations cannot run or read it, even with this pack.", risk: "" },
   { id: "sealed_licensed", title: "Licensed — one licence per installation", tag: "Share widely",
     run: "Only on installations you send a licence to (yours gets one automatically). Everyone gets the same " +
       "workflow; each person adds the small licence you send them.",
-    edit: "Vault password + your authenticator code + editor list.",
+    edit: "Vault password + your second factor + editor list.",
     net: "None - licences are checked offline, nothing is sent anywhere.", where: "On each licensed installation's GPU.",
     custody: "A per-vault licence key, wrapped inside each licence for that installation's own key pair; licences " +
       "are signed with your author key.",
@@ -51,13 +54,13 @@ const PROFILES = [
       "End dates and run limits are kept by H2Vault on their computer. Revoking = a new licence key.", risk: "" },
   { id: "locked", title: "Locked — password to run", tag: "",
     run: "Anyone with the vault password; asked once per browser tab.",
-    edit: "Vault password + your authenticator code + editor list.",
+    edit: "Vault password + your second factor + editor list.",
     net: "None - runs offline.", where: "On the GPU of whoever runs it.",
     custody: "A per-vault key, unlocked by the password (Argon2id).",
     security: "Encrypted. Without the password nothing runs or opens.", risk: "" },
   { id: "sealed_portable", title: "Portable — obfuscation only", tag: "Not secure",
     run: "Anyone, anywhere, without a password.",
-    edit: "Vault password + your authenticator code + editor list.",
+    edit: "Vault password + your second factor + editor list.",
     net: "None.", where: "On the GPU of whoever runs it.",
     custody: "A key every copy of this pack can derive.",
     security: "OBFUSCATION ONLY: a knowledgeable recipient can extract the graph. Use only when a vault must run " +
@@ -455,6 +458,19 @@ function markRunUnlocked(vaultId) {
   refreshCards(vaultId);
 }
 
+/** The server is the truth for "unlocked in this tab" (owner 2026-11-23: no asking again and again): a reloaded tab
+ *  keeps its unlocks (same client id; the server waits RELOAD_GRACE before dropping them), and after a ComfyUI restart
+ *  the tab asks again instead of failing the run. Also cancels the server's pending drop for this tab. */
+async function syncRunKeys() {
+  if (!api.clientId) return;
+  let r;
+  try { r = await post("/h2vault/vault/run_status", { client_id: api.clientId }); } catch (_) { return; }
+  if (!r.ok) return;
+  const have = new Set(r.data.unlocked || []);
+  for (const vid of [...RUN_UNLOCKED]) if (!have.has(vid)) { RUN_UNLOCKED.delete(vid); refreshCards(vid); }
+  for (const vid of have) if (!RUN_UNLOCKED.has(vid)) markRunUnlocked(vid);
+}
+
 // ── API form from the frontend's own graphToPrompt (exact widget / primitive / nested-subgraph conversion) ──
 // A26 L9.203: the subgraph node's exact execution path (the frontend's own algorithm, see _vault_protect_tx.js) -
 // never "a key whose last two segments look right", which matched the wrong instance of a shared definition.
@@ -662,7 +678,8 @@ async function protectTransaction(nodes, opts) {
         const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
           recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui: exportUi(sg),
           outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
-          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.lock ? { lock: opts.lock } : {}) });
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.lock ? { lock: opts.lock } : {}),
+          ...(opts.secondFactor ? { second_factor: { methods: opts.secondFactor } } : {}), });
         if (!r.ok) throw new ProtectError("ENCRYPTION_AND_SEALING", r.data?.error || `Locking failed (${r.status}).`);
         res = r.data;
         built.public = serverPublic(res);                  // V3: a concealed vault publishes the server's whitelist
@@ -735,7 +752,7 @@ async function protectSubgraphNode(sg, opts) {
   const r = await post("/h2vault/vault/protect", { password: opts.password, profile: opts.profile,
     recipients: opts.recipients, editors: opts.editors, interface: built.interface, api: built.api, ui,
     outputs_node: built.outputsNode, client_id: api.clientId, ...(opts.conceal ? { conceal: opts.conceal } : {}),
-          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}) });
+          ...(opts.downloads?.length ? { downloads: opts.downloads } : {}), ...(opts.secondFactor ? { second_factor: { methods: opts.secondFactor } } : {}), });
   if (!r.ok) throw new Error(r.data.error || `Locking failed (${r.status}).`);
   const v = makeVaultNode(sg.graph, r.data, built, sg);
   removeDefinitionIfUnused(sg);
@@ -834,7 +851,7 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
   const hosted = PROFILES.find((p) => p.id === "owner_hosted");
   const pw2 = passwordField({ label: "Repeat the password" });
   const pw = passwordField({ label: "Vault password", strength: true, generate: true,
-    hint: "Opens the vault for editing, together with your authenticator app.", onGenerate: (v) => pw2.setValue(v) });
+    hint: "Opens the vault for editing, together with your second factor.", onGenerate: (v) => pw2.setValue(v) });
   const recip = textArea({ label: "Installation codes, one per line", placeholder: "h2vk1:...", rows: 3,
     hint: "Each person finds theirs under right-click on a vault › My installation code. Yours is always included." });
   const others = disclosure("Other installations that may run it (optional)");
@@ -855,7 +872,8 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.body.append(vel("p", { class: "h2v-dim", text: "Owner-hosted vaults (recipients send inputs to your " +
       "server and never receive the graph) are planned." }));
   }
-  d.body.append(vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), others.el);
+  const sfChoice = secondFactorChoice();                    // second-factor methods (owner 2026-11-23)
+  d.body.append(vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), sfChoice.el, others.el);
   // V3: "Conceal models and nodes" -> the "Choose what to expose" step (docs/h2vault/V3_concealment_design.md)
   let step = null, refusedNotice = false;
   const stepHost = vel("div");
@@ -907,6 +925,8 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.notice(null);
     if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the vault password."); pw.input.focus(); return; }
     if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); pw2.input.focus(); return; }
+    const sf = await sfChoice.ready();
+    if (!sf.ok) { d.notice("danger", sf.error); return; }
     let conceal = null, dropOutputs = [];
     if (exposure?.on?.() && step) {
       const r = await step.ready();
@@ -928,7 +948,7 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
     d.status(`${stageLabel("SELECTION_VALIDATION")}…`);
     try {
       const vault = await run({ profile: choice.value(), password: pw.value(), recipients: splitCodes(recip.input.value),
-        title: name.input.value, conceal, downloads, dropOutputs,
+        title: name.input.value, conceal, downloads, dropOutputs, secondFactor: sf.methods,
         onStage: (s) => d.status(s === "COMMIT" ? "Locked." : `${stageLabel(s)}…`) });
       d.close(vault);
     } catch (e) {
@@ -944,48 +964,92 @@ function protectDialog({ count, kind, summary, title, defaultProfile, run, expos
 }
 
 /**
- * Password (+ authenticator code) dialog that STAYS OPEN until `submit` succeeds (spec 4.2 / 4.3 / 4.5).
- * submit({password, code}) -> {ok: true, ...} | {enrol: true} | {error: string}. Resolves with that result or null.
+ * Password (+ second factor) dialog that STAYS OPEN until `submit` succeeds (spec 4.2 / 4.3 / 4.5).
+ * submit({password, factor}) -> {ok: true, ...} | {enrol: true} | {error: string, data?: server answer}. The method
+ * picker offers the methods set up on this installation; when the server names the vault's methods
+ * (method_not_allowed) the picker shows only those. Resolves with submit's result or null.
  */
-function credentialDialog({ title, subtitle, needCode = true, primary = "Open vault", submit }) {
-  const d = vaultDialog({ title, subtitle, width: 440 });
-  const pw = passwordField({ label: "Vault password", autocomplete: "current-password" });
-  const code = needCode ? codeField({ allowRecovery: true, hint: "Or one of your recovery codes. A code works once: " +
-    "if you just used one, wait for the next." }) : null;
-  if (code) d.onCleanup(code.destroy);
+async function credentialDialog({ title, subtitle, needCode = true, primary = "Open vault", submit }) {
+  const st = needCode ? await twoFactorStatus() : null;
+  const d = vaultDialog({ title, subtitle, width: 460 });
+  const pw = passwordField({ label: "Vault password" });
+  const picker = needCode ? factorPicker({ status: st, post }) : null;
+  if (picker) d.onCleanup(picker.destroy);
   d.body.append(pw.el);
-  if (code) d.body.append(code.el);
+  if (picker) d.body.append(picker.el);
   d.addAction("Cancel", { onClick: () => d.close(null) });
   const go = async () => {
     if (d.busy) return;
     d.notice(null);
     if (!pw.value()) { d.notice("danger", "Type the vault password."); pw.input.focus(); return; }
-    if (code && !code.value()) { d.notice("danger", "Type the code your authenticator app shows now."); code.input.focus(); return; }
+    let factor = null;
+    if (picker) {
+      const got = await picker.collect();
+      if (got.error) { d.notice("danger", got.error); if (got.focus) picker.focus(); return; }
+      factor = got.factor;
+    }
     d.setBusy(true, "Checking…");
     let out;
-    try { out = await submit({ password: pw.value(), code: code ? code.value() : "" }); }
+    try { out = await submit({ password: pw.value(), factor }); }
     catch (e) { out = { error: String(e?.message || e) }; }
-    if (out?.ok || out?.enrol) { d.close(out); return; }
+    if (out?.ok || out?.enrol) {
+      picker?.succeeded();
+      d.close(out);
+      afterFactor(out);
+      return;
+    }
     d.setBusy(false);
+    const data = out?.data || {};
+    if (picker && data.reason === "method_not_allowed") picker.restrict(data.allowed || data.methods);
     d.notice("danger", out?.error || "That did not work. Check the password and try again.");
-    if (code) { code.clear(); code.input.focus(); } else pw.input.select();
+    if (picker && ["wrong", "reused", "clock", "not_set_up"].includes(data.reason)) picker.failed();
+    else if (!picker || !data.reason) pw.input.select();
   };
   d.addAction(primary, { primary: true, onClick: go });
   d.onSubmit(go);
   return d.result;
 }
 
+/** The "Second factor for editing" block of a lock / access dialog: a host now, the choice once the status arrived.
+ *  ready() -> {ok, methods} | {ok: false, error}. */
+function secondFactorChoice(current = null) {
+  const host = vel("div");
+  const editor = twoFactorStatus().then((st) => {
+    const e = policyEditor({ status: st, current });
+    host.replaceChildren(e.el);
+    return e;
+  });
+  return { el: host, ready: async () => (await editor).value() };
+}
+
+/** After a recovery code: say how many are left, and offer a new set when few remain. */
+function afterFactor(out) {
+  const left = out?.data?.recovery_codes_left ?? out?.recovery_codes_left;
+  if (left == null) return;
+  toast(left <= 2 ? `Recovery code used - ${left} left. Generate a new set under H2Vault menu › Second factor.`
+    : `Recovery code used - ${left} left.`, left <= 2 ? "warn" : "info");
+}
+
+async function twoFactorStatus() {
+  try { return await (await api.fetchApi("/h2vault/2fa/status")).json(); } catch (_) { return {}; }
+}
+
+/** No method set up yet: the Second factor dialog in first-run form. -> true when one is set up. */
+async function setUpSecondFactor() {
+  return secondFactorDialog({ post, getStatus: twoFactorStatus, enrolTotp: enrolDialog, firstRun: true });
+}
+
 /** A server answer for a failed open / access check, in words (reused code, clock drift, wrong password ...). */
 function authError(r, fallback) {
   const d = r?.data || {};
-  if (d.reason === "reused") return `That code was already used. Wait for the next one${d.next_in ? ` (${d.next_in} s)` : ""}, then type it.`;
+  if (d.reason === "reused" || d.reason === "method_not_allowed") return factorErrorText(d);
   if (d.reason === "clock") return d.error || "The code is for another time: this computer's or the phone's clock is off. Set both to automatic time.";
   if (r?.status === 429) return d.error || "Too many attempts. Wait a few minutes, then try again.";
   return d.error || fallback;
 }
 
-async function enrolDialog() {
-  const st = await post("/h2vault/2fa/enrol/begin", {});
+async function enrolDialog(manageToken = null) {
+  const st = await post("/h2vault/2fa/enrol/begin", manageToken ? { manage_token: manageToken } : {});
   if (!st.ok) { toast(st.data.error || "Could not start the setup.", "error"); return false; }
   const data = st.data;
   const d = vaultDialog({ title: "Set up two-factor for H2Vault",
@@ -1015,7 +1079,9 @@ async function enrolDialog() {
     try { await navigator.clipboard.writeText(codes.join("\n")); copyAll.querySelector(".h2v-btn__label").textContent = "Copied"; }
     catch (_) { /* the grid is selectable */ }
   } });
-  const keep = stepSection(2, "Save your recovery codes",
+  const keep = !codes.length ? stepSection(2, "Recovery codes",
+    vel("p", { class: "h2v-dim", text: `You keep your ${data.recovery_kept ?? 0} recovery codes. A new set: H2Vault menu › ` +
+      "Second factor." })) : stepSection(2, "Save your recovery codes",
     vel("p", { class: "h2v-dim", text: "Each works once instead of a code if you lose the phone. They are not shown again." }),
     vel("div", { class: "h2v-codes" }, codes.map((c) => vel("span", { text: c }))),
     vel("div", { class: "h2v-row", style: { justifyContent: "space-between", flexWrap: "wrap" } }, [
@@ -1029,7 +1095,7 @@ async function enrolDialog() {
   const go = async () => {
     if (d.busy) return;
     d.notice(null);
-    if (!saved.checked) { d.notice("danger", "Confirm that you saved the recovery codes first."); saved.focus(); return; }
+    if (codes.length && !saved.checked) { d.notice("danger", "Confirm that you saved the recovery codes first."); saved.focus(); return; }
     if (!/^\d{6}$/.test(code.value())) { d.notice("danger", "Type the 6-digit code your app shows now."); code.input.focus(); return; }
     d.setBusy(true, "Confirming…");
     const r = await post("/h2vault/2fa/enrol/confirm", { code: code.value() });
@@ -1050,60 +1116,34 @@ async function enrolDialog() {
   return d.result;
 }
 
-/** Two-factor setup from the vault menu: a second setup first needs a current code or a recovery code (owner: the
- *  pasted setup key is exposed - setting it up again must be possible from here). */
+/** H2Vault menu › Second factor: every method of this installation (owner 2026-11-23: "more options than just
+ *  authenticator"). Changing them needs one proof first (a code, a recovery code, a passkey or the backup password). */
 async function twoFactorSetup() {
-  const st = await (await api.fetchApi("/h2vault/2fa/status")).json().catch(() => ({}));
-  if (st.enrolled) {
-    const d = vaultDialog({ title: "Set up the authenticator again",
-      subtitle: "Use this when the setup key was shared or the phone changed. The old key stops working.", width: 460 });
-    d.body.append(noticeEl("info", `An authenticator is set up on this installation (${st.recovery_codes_left ?? 0} ` +
-      "recovery codes left). Confirm with a code from it, or with a recovery code."));
-    const code = codeField({ label: "Current code or a recovery code", allowRecovery: true });
-    d.onCleanup(code.destroy);
-    d.body.append(code.el);
-    d.addAction("Cancel", { onClick: () => d.close(false) });
-    const go = async () => {
-      if (d.busy) return;
-      d.notice(null);
-      if (!code.value()) { d.notice("danger", "Type a current code or a recovery code."); return; }
-      d.setBusy(true, "Checking…");
-      const r = await post("/h2vault/2fa/reset", { code: code.value() });
-      if (r.ok) { d.close(true); return; }
-      d.setBusy(false);
-      d.notice("danger", authError(r, "That code is not right."));
-      code.clear();
-      code.input.focus();
-    };
-    d.addAction("Replace", { primary: true, onClick: go });
-    d.onSubmit(go);
-    if (!(await d.result)) return false;
-  }
-  return enrolDialog();
+  return secondFactorDialog({ post, getStatus: twoFactorStatus, enrolTotp: enrolDialog });
 }
 
 // ── opening (auth -> native subgraph) and auto-lock on leaving ──────────────────────────────────────────────
 async function openVault(v) {
-  const st = await (await api.fetchApi("/h2vault/2fa/status")).json().catch(() => ({}));
+  const st = await twoFactorStatus();
   if (!st.enrolled) {
-    toast("Opening a vault needs an authenticator app on this installation. Set it up now.");
-    if (!(await enrolDialog())) return;
+    toast("Opening a vault for editing needs a second factor on this installation. Set one up now.");
+    if (!(await setUpSecondFactor())) return;
   }
   const payload = v.widgets.find((w) => w.name === "vault_payload")?.value;
   const vaultId = v.widgets.find((w) => w.name === "vault_id")?.value;
   const title = v.title || "vault";
   let opened = null;
   const out = await credentialDialog({ title: `Open "${title}"`, primary: "Open vault",
-    subtitle: "Type the vault password and the code your authenticator app shows.",
-    submit: async ({ password, code }) => {
-      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, code, client_id: api.clientId });
-      if (r.ok) { opened = r.data; return { ok: true }; }
+    subtitle: "Type the vault password, then confirm with your second factor.",
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, factor, client_id: api.clientId });
+      if (r.ok) { opened = r.data; return { ok: true, data: r.data }; }
       if (r.data.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "Could not open the vault.") };
+      return { data: r.data, error: authError(r, "Could not open the vault.") };
     } });
   if (!out) return;
   if (out.enrol) {
-    if (await enrolDialog()) await openVault(v);
+    if (await setUpSecondFactor()) await openVault(v);
     return;
   }
   try {
@@ -1342,6 +1382,9 @@ async function snapshotOpen() {
 }
 
 async function ensureRunKeys(output) {
+  const lockedHere = Object.entries(output || {}).some(([id, n]) => VAULT_TYPES.has(n.class_type) &&
+    vaultInfo((app.rootGraph ?? app.graph).getNodeById?.(id.split(":")[0]) || {}).profile === "locked");
+  if (lockedHere) await syncRunKeys();                    // one request per queue, only when a Locked vault runs
   for (const [id, n] of Object.entries(output || {})) {
     if (!VAULT_TYPES.has(n.class_type)) continue;
     const graphNode = (app.rootGraph ?? app.graph).getNodeById?.(id.split(":")[0]);
@@ -1453,7 +1496,7 @@ async function lockSelection(canvas, profileHint, items = null) {
   if (!vault) return null;
   try { canvas?.deselectAll?.(); canvas?.select?.(vault); } catch (_) { /* selection is a nicety */ }
   const what = r.kind === "subgraph" ? "the subgraph" : `${r.nodes.length} node${r.nodes.length === 1 ? "" : "s"}`;
-  toast(`Locked ${what} into "${vault.title}". Double-click it to open (password + authenticator).`, "success",
+  toast(`Locked ${what} into "${vault.title}". Double-click it to open (password + second factor).`, "success",
     "Vault locked");
   return vault;
 }
@@ -1559,7 +1602,7 @@ function exposureOf(r, boundary) {
 async function protectWithFeedback(nodes, opts) {
   try {
     await protectTransaction(nodes, opts);
-    toast("Locked. Double-click the vault to open it (password + authenticator).", "success", "Vault locked");
+    toast("Locked. Double-click the vault to open it (password + second factor).", "success", "Vault locked");
     return true;
   } catch (e) {
     // never a success message for a half-done protect: the original graph is back
@@ -1682,7 +1725,7 @@ function accessDialog(v, res, focus, apply) {
       "there are no installations to manage here." : "Portable vault: it runs anywhere (obfuscation only)."));
   }
   d.body.append(section("editors", "Editors", "Installations that may open it for editing - each with the password " +
-    "and its own authenticator. This one stays an editor."));
+    "and a second factor of their own. This one stays an editor."));
   const pw = passwordField({ label: "New vault password", strength: true });
   const pw2 = passwordField({ label: "Repeat the new password" });
   const pwBox = vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]);
@@ -1690,6 +1733,8 @@ function accessDialog(v, res, focus, apply) {
     onChange: (on) => { pwBox.style.display = on ? "" : "none"; if (on) pw.input.focus(); } });
   pwBox.style.display = change.checked() ? "" : "none";
   d.body.append(vel("div", { class: "h2v-block" }, [change.el, pwBox]));
+  const sfAccess = secondFactorChoice(res.methods);
+  d.body.append(sfAccess.el);
   d.body.append(noticeEl("info", (sealed ? "Removing an installation protects new copies only: a copy it already has " +
     "still runs there. " : "") + "Applying re-encrypts the vault with fresh keys; save the workflow afterwards so the " +
     "new access goes with it."));
@@ -1705,10 +1750,12 @@ function accessDialog(v, res, focus, apply) {
     }
     const labels = {};
     for (const r of [...lists.editors, ...lists.recipients]) if (String(r.label || "").trim()) labels[r.code] = r.label.trim();
+    const sf = await sfAccess.ready();
+    if (!sf.ok) { d.notice("danger", sf.error); return; }
     d.setBusy(true, "Applying…");
     d.status("Re-encrypting the vault…");
     const out = await apply({ editors: lists.editors.map((r) => r.code), recipients: lists.recipients.map((r) => r.code),
-      labels, new_password: newPassword });
+      labels, new_password: newPassword, second_factor: { methods: sf.methods } });
     if (out?.error) { d.setBusy(false); d.status(""); d.notice("danger", out.error); return; }
     d.close(out);
   };
@@ -1863,10 +1910,10 @@ function onExecutionError(e) {
 }
 
 async function manageAccess(v, focus) {
-  const st = await (await api.fetchApi("/h2vault/2fa/status")).json().catch(() => ({}));
+  const st = await twoFactorStatus();
   if (!st.enrolled) {
-    toast("Managing a vault's access needs an authenticator app on this installation. Set it up now.");
-    if (!(await enrolDialog())) return;
+    toast("Managing a vault's access needs a second factor on this installation. Set one up now.");
+    if (!(await setUpSecondFactor())) return;
   }
   const W = (name) => v.widgets.find((w) => w.name === name);
   const payload = W("vault_payload")?.value;
@@ -1874,17 +1921,17 @@ async function manageAccess(v, focus) {
   let res = null;
   const verb = focus === "password" ? "Change the password of" : "Manage access to";
   const ok = await credentialDialog({ title: `${verb} "${v.title || "vault"}"`, primary: "Continue",
-    subtitle: "Confirm with the vault password and your authenticator code. The inside stays closed.",
-    submit: async ({ password, code }) => {
-      const r = await post("/h2vault/vault/access/open", { payload, vault_id: vaultId, password, code,
+    subtitle: "Confirm with the vault password and your second factor. The inside stays closed.",
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/vault/access/open", { payload, vault_id: vaultId, password, factor,
         client_id: api.clientId });
-      if (r.ok) { res = r.data; return { ok: true }; }
+      if (r.ok) { res = r.data; return { ok: true, data: r.data }; }
       if (r.data.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "Could not unlock the vault's access.") };
+      return { data: r.data, error: authError(r, "Could not unlock the vault's access.") };
     } });
   if (!ok) return;
   if (ok.enrol) {
-    if (await enrolDialog()) await manageAccess(v, focus);
+    if (await setUpSecondFactor()) await manageAccess(v, focus);
     return;
   }
   const out = await accessDialog(v, res, focus, async (choice) => {
@@ -1941,7 +1988,7 @@ async function lockNodeParameters(node, locked, opts) {
   if (typeof opts.title === "string" && opts.title.trim()) req.lock.look.title = opts.title.trim().slice(0, 80);
   const vault = await protectTransaction([node], { profile: opts.profile, password: opts.password,
     recipients: opts.recipients || [], editors: [], title: req.lock.look.title, lock: req.lock,
-    extraParams: req.extraParams, onStage: opts.onStage });
+    extraParams: req.extraParams, onStage: opts.onStage, secondFactor: opts.secondFactor });
   if (opts.lockSet) {
     vault.properties.h2vault.lock_set = opts.lockSet;            // one password unlocks the set (ensureRunKeys)
   }
@@ -1984,11 +2031,12 @@ async function lockParameters(items) {
         summary: p.run })), onChange: () => { recip.el.style.display = choice.value() === "sealed_installs" ? "" : "none"; } });
   const pw2 = passwordField({ label: "Repeat the password" });
   const pw = passwordField({ label: "Password", strength: true, generate: true,
-    hint: "Opens the nodes for editing, together with your authenticator app.", onGenerate: (v) => pw2.setValue(v) });
+    hint: "Opens the nodes for editing, together with your second factor.", onGenerate: (v) => pw2.setValue(v) });
+  const sfLock = secondFactorChoice();
   const recip = textArea({ label: "Other installations that may run them (optional)", placeholder: "h2vk1:...", rows: 2,
     hint: "Installation codes, one per line. Yours is always included." });
   d.body.append(...perNode.map((p) => p.el), vel("div", { class: "h2v-row" }, [usual]), showRows.el, showKind.el,
-    choice.el, vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), recip.el);
+    choice.el, vel("div", { class: "h2v-grid2" }, [pw.el, pw2.el]), sfLock.el, recip.el);
   d.status(PROTECT_FOOT);
   d.addAction("Cancel", { onClick: () => d.close(null) });
   const done = [];
@@ -1997,6 +2045,8 @@ async function lockParameters(items) {
     d.notice(null);
     if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the password."); pw.input.focus(); return; }
     if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); pw2.input.focus(); return; }
+    const sf = await sfLock.ready();
+    if (!sf.ok) { d.notice("danger", sf.error); return; }
     const plan = perNode.map((p) => ({ id: p.node.id, title: p.title.input.value,
       locked: p.checks.filter((c) => c.box.checked()).map((c) => c.name) }));
     const empty = plan.find((x) => !x.locked.length);
@@ -2010,7 +2060,8 @@ async function lockParameters(items) {
         if (!node) throw new Error("The node is no longer in the graph on screen.");
         d.status(`Locking "${x.title || node.title}"…`);
         await lockNodeParameters(node, x.locked, { profile: choice.value(), password: pw.value(), title: x.title,
-          recipients: splitCodes(recip.input.value), showRows: showRows.checked(), showKind: showKind.checked(), lockSet });
+          recipients: splitCodes(recip.input.value), showRows: showRows.checked(), showKind: showKind.checked(), lockSet,
+          secondFactor: sf.methods });
         done.push(x.id);
       } catch (e) {
         d.setBusy(false);
@@ -2042,17 +2093,17 @@ async function removeProtection(v) {
     onClick: () => sure.close(true) });
   if (!(await sure.result)) return;
   const st = await (await api.fetchApi("/h2vault/2fa/status")).json().catch(() => ({}));
-  if (!st.enrolled && !(await enrolDialog())) return;
+  if (!st.enrolled && !(await setUpSecondFactor())) return;
   const payload = v.widgets.find((w) => w.name === "vault_payload")?.value;
   const vaultId = v.widgets.find((w) => w.name === "vault_id")?.value;
   let opened = null;
   const out = await credentialDialog({ title: `Remove the protection of "${v.title || "vault"}"`, primary: "Remove",
-    subtitle: "Type the password and the code your authenticator app shows.",
-    submit: async ({ password, code }) => {
-      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, code, client_id: api.clientId });
-      if (r.ok) { opened = r.data; return { ok: true }; }
+    subtitle: "Type the password, then confirm with your second factor.",
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/vault/open", { payload, vault_id: vaultId, password, factor, client_id: api.clientId });
+      if (r.ok) { opened = r.data; return { ok: true, data: r.data }; }
       if (r.data.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "Could not open the vault.") };
+      return { data: r.data, error: authError(r, "Could not open the vault.") };
     } });
   if (!out?.ok || !opened) return;
   post("/h2vault/vault/cancel", { edit_token: opened.edit_token });     // nothing is re-sealed: the session ends
@@ -2193,14 +2244,14 @@ async function issueLicence(v) {
   if (!terms) return;
   let issued = null;
   const out = await credentialDialog({ title: "Sign the licence", primary: "Issue licence",
-    subtitle: "Type this workflow's password and your authenticator code.",
-    submit: async ({ password, code: c }) => {
-      const r = await post("/h2vault/licence/issue", { ...vaultRefs(v), password, code: c, title: v.title || "", ...terms });
-      if (r.ok && r.data.licence_text) { issued = r.data; return { ok: true }; }
+    subtitle: "Type this workflow's password, then confirm with your second factor.",
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/licence/issue", { ...vaultRefs(v), password, factor, title: v.title || "", ...terms });
+      if (r.ok && r.data.licence_text) { issued = r.data; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "The licence could not be issued.") };
+      return { data: r.data, error: authError(r, "The licence could not be issued.") };
     } });
-  if (out?.enrol) { await enrolDialog(); return; }
+  if (out?.enrol) { await setUpSecondFactor(); return; }
   if (!issued) return;
   showLicences([{ ...issued, label: terms.label }], v.title);
 }
@@ -2240,14 +2291,14 @@ async function rotateLicences(v) {
   if (!reissue) return;
   let res = null;
   const out = await credentialDialog({ title: "Revoke licences", primary: "Revoke and re-seal",
-    subtitle: "Type this workflow's password and your authenticator code.",
-    submit: async ({ password, code }) => {
-      const r = await post("/h2vault/licence/rotate", { ...refs, password, code, reissue });
-      if (r.ok && r.data.payload) { res = r.data; return { ok: true }; }
+    subtitle: "Type this workflow's password, then confirm with your second factor.",
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/licence/rotate", { ...refs, password, factor, reissue });
+      if (r.ok && r.data.payload) { res = r.data; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "The licences could not be revoked.") };
+      return { data: r.data, error: authError(r, "The licences could not be revoked.") };
     } });
-  if (out?.enrol) { await enrolDialog(); return; }
+  if (out?.enrol) { await setUpSecondFactor(); return; }
   if (!res) return;
   v.widgets.find((w) => w.name === "vault_payload").value = res.payload;
   LICENCE_ASKED.delete(refs.vault_id);
@@ -2325,15 +2376,15 @@ async function exportAuthorKey(node) {
   if (!filePassword) return;
   let file = null;
   const out = await credentialDialog({ title: "Prove it is your key", primary: "Download backup",
-    subtitle: `Type the password of "${v.title || "this vault"}" and your authenticator code.`,
-    submit: async ({ password, code }) => {
-      const r = await post("/h2vault/licence/author/export", { ...vaultRefs(v), password, code,
+    subtitle: `Type the password of "${v.title || "this vault"}" and confirm with your second factor.`,
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/licence/author/export", { ...vaultRefs(v), password, factor,
         file_password: filePassword });
-      if (r.ok && r.data.file) { file = r.data.file; return { ok: true }; }
+      if (r.ok && r.data.file) { file = r.data.file; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "The backup could not be made.") };
+      return { data: r.data, error: authError(r, "The backup could not be made.") };
     } });
-  if (out?.enrol) { await enrolDialog(); return; }
+  if (out?.enrol) { await setUpSecondFactor(); return; }
   if (!file) return;
   downloadText("h2vault-author-key.h2vauthor", JSON.stringify(file, null, 1), "application/json");
   toast("Author key backup downloaded. Keep the file and its password apart.", "success");
@@ -2347,7 +2398,7 @@ async function importAuthorKey(node) {
   const f = await pickTextFile(".h2vauthor,.json");
   if (!f) return;
   const d = vaultDialog({ title: "Restore author key", subtitle: f.name, width: 480 });
-  const fpw = passwordField({ label: "Backup file password", autocomplete: "current-password" });
+  const fpw = passwordField({ label: "Backup file password" });
   const replace = checkRow("Replace the author key this installation has now", false,
     "(it is saved first to a dated backup file)");
   d.body.append(fpw.el, replace.el);
@@ -2360,15 +2411,15 @@ async function importAuthorKey(node) {
   if (!opts) return;
   let done = null;
   const out = await credentialDialog({ title: "Prove it is your workflow", primary: "Restore",
-    subtitle: `Type the password of "${v.title || "this vault"}" and your authenticator code.`,
-    submit: async ({ password, code }) => {
-      const r = await post("/h2vault/licence/author/import", { ...vaultRefs(v), password, code, file: f.text,
+    subtitle: `Type the password of "${v.title || "this vault"}" and confirm with your second factor.`,
+    submit: async ({ password, factor }) => {
+      const r = await post("/h2vault/licence/author/import", { ...vaultRefs(v), password, factor, file: f.text,
         file_password: opts.file_password, ...(opts.replace ? { replace: true, confirm: "replace" } : {}) });
-      if (r.ok) { done = r.data; return { ok: true }; }
+      if (r.ok) { done = r.data; return { ok: true, data: r.data }; }
       if (r.data?.needs_enrolment) return { enrol: true };
-      return { error: authError(r, "The backup could not be restored.") };
+      return { data: r.data, error: authError(r, "The backup could not be restored.") };
     } });
-  if (out?.enrol) { await enrolDialog(); return; }
+  if (out?.enrol) { await setUpSecondFactor(); return; }
   if (!done) return;
   toast(done.backup ? `Author key restored. The previous key was saved as ${done.backup} in the H2Vault user folder ` +
     "(same password as this backup)." : "Author key restored.", "success");
@@ -2444,7 +2495,7 @@ app.registerExtension({
       function: () => lockSelection(app.canvas, "locked") },
     { id: "h2vault.protect.wholeWorkflow", label: "H2Vault: Protect the whole workflow", icon: "pi pi-shield",
       function: () => protectWholeWorkflow() },
-    { id: "h2vault.twoFactor.setup", label: "H2Vault: Two-factor setup", icon: "pi pi-mobile",
+    { id: "h2vault.twoFactor.setup", label: "H2Vault: Second factor", icon: "pi pi-mobile",
       function: () => twoFactorSetup() },
     { id: "h2vault.installCode.show", label: "H2Vault: My installation code", icon: "pi pi-key",
       function: () => showInstallCode() },
@@ -2475,6 +2526,11 @@ app.registerExtension({
     installGuards();
     app.canvas?.canvas?.addEventListener("litegraph:set-graph", onSetGraph);
     api.addEventListener("execution_error", onExecutionError);      // offer the install on every failed attempt
+    // a (re)connected tab learns what it unlocked before a reload - and the server keeps it (RELOAD_GRACE)
+    let synced = null;
+    const onStatus = () => { if (api.clientId && synced !== api.clientId) { synced = api.clientId; syncRunKeys(); } };
+    api.addEventListener("status", onStatus);
+    api.addEventListener("reconnected", () => { synced = null; onStatus(); });
     api.addEventListener("h2vault.phase", onPhase);
     for (const ev of ["execution_success", "execution_error", "execution_interrupted"]) {
       api.addEventListener(ev, clearPhases);
@@ -2532,7 +2588,7 @@ app.registerExtension({
         { content: vaultInfo(node).lock ? "🔓 Unlock parameters (remove protection)…" : "🗝️ Remove protection…",
           callback: () => removeProtection(node) },
         { content: "🔑 My installation code", callback: showInstallCode },
-        { content: "📱 Two-factor setup…", callback: () => twoFactorSetup() }];
+        { content: "📱 Second factor…", callback: () => twoFactorSetup() }];
     }
     if (OPEN.has(node)) return concealMenuItems(OPEN.get(node));
     if (node?.id == null || Number(node.id) < 0) return [];

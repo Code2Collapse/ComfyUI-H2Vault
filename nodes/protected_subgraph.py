@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Any, Optional
 
 from . import concealment
@@ -64,22 +65,54 @@ class _BoundaryInputs(dict):
 
 class RunSessions:
     """Locked profile: the key a browser tab unlocked, in memory only, per (client id, vault id) - owner A18:
-    "once per browser tab". Dropped when the tab's websocket closes or ComfyUI restarts."""
+    "once per browser tab". Dropped when the tab closes (forget_later + RELOAD_GRACE_SECONDS) or ComfyUI restarts.
+
+    2026-11-23 (owner: "asking again and again"): a page RELOAD fires the same beforeunload as closing the tab, and
+    the frontend keeps the tab's client id across a reload (sessionStorage). Dropping at once made every reload ask
+    again; now the drop waits RELOAD_GRACE_SECONDS and the reloaded tab cancels it (touch) when it reconnects."""
+
+    RELOAD_GRACE_SECONDS = 120
 
     def __init__(self):
         self._lock = threading.Lock()
         self._keys: dict[tuple[str, str], bytes] = {}
+        self._leaving: dict[str, float] = {}               # client id -> monotonic time its keys are dropped
+
+    def _expire(self) -> None:
+        now = time.monotonic()
+        for cid in [c for c, at in self._leaving.items() if at <= now]:
+            self._leaving.pop(cid, None)
+            for k in [k for k in self._keys if k[0] == cid]:
+                del self._keys[k]
 
     def put(self, client_id: str, vault_id: str, key: bytes) -> None:
         with self._lock:
+            self._expire()
+            self._leaving.pop(str(client_id), None)
             self._keys[(str(client_id), str(vault_id))] = key
 
     def get(self, client_id: str, vault_id: str) -> Optional[bytes]:
         with self._lock:
+            self._expire()
             return self._keys.get((str(client_id), str(vault_id)))
+
+    def touch(self, client_id: str) -> list:
+        """The tab is (back) here: cancel a pending drop -> the vault ids it has unlocked."""
+        with self._lock:
+            self._expire()
+            self._leaving.pop(str(client_id), None)
+            return sorted(v for c, v in self._keys if c == str(client_id))
+
+    def forget_later(self, client_id: str, delay: Optional[float] = None) -> None:
+        with self._lock:
+            self._expire()
+            if any(c == str(client_id) for c, _v in self._keys):
+                self._leaving[str(client_id)] = time.monotonic() + (self.RELOAD_GRACE_SECONDS if delay is None
+                                                                    else delay)
 
     def drop_client(self, client_id: str) -> None:
         with self._lock:
+            self._leaving.pop(str(client_id), None)
             for k in [k for k in self._keys if k[0] == str(client_id)]:
                 del self._keys[k]
 
