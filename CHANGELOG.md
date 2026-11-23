@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased - V8 zero information
+
+- Files saved or previewed inside any vault (PNG text chunks) carry no workflow and no prompt; nodes outside a vault are unchanged.
+- The step count of a concealed vault counts kinds of work ("Sampling", "Decoding", ...), no longer inner nodes; a concealed error names only the kind of step that failed.
+- Log files ComfyUI writes itself (`--verbose LEVEL FILE`) get `[H2Vault] concealed output` for lines written inside a concealed vault, like the console and the log panel.
+- Model lists (`/object_info`, `/models`, `/experiment/models`, `/embeddings`, `/api/assets`) never show the hash-named model copies a vault downloaded; their safetensors metadata and previews are not served.
+- Installing a vault's missing extensions never repeats git's error text or a folder path (both name the extension).
+
 ## 0.2.0 - 2026-11-23
 
 - **Lock parameters**: right-click a node, a selection or a group > Lock parameters. Each node becomes a one-node vault

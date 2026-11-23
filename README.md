@@ -73,8 +73,10 @@ encrypted payload:
   and choice lists that show file names.
 - While a concealed vault runs, the server rewrites progress, results, history, job list and errors so they name only
   the vault (errors become a plain sentence without a traceback), and console lines printed by its inner nodes become
-  `[H2Vault] concealed output`.
-- While it runs, the vault node shows **what the current step does in simple words** - "Loading models", "Preparing prompts", "Sampling", "Decoding", "Upscaling", "Saving results" - and "step 3 of 7". The words come from the kind of data a step takes and makes, never from its name, so they cannot reveal a node pack or a model.
+  `[H2Vault] concealed output` - in the console, in the log panel and in log files ComfyUI writes with
+  `--verbose LEVEL FILE`. An error names only the kind of step that failed ("failed step: Decoding").
+- While it runs, the vault node shows **what the current step does in simple words** - "Loading models", "Preparing prompts", "Sampling", "Decoding", "Upscaling", "Saving results" - and "step 2 of 4". The words come from the kind of data a step takes and makes, never from its name, so they cannot reveal a node pack or a model. The step count counts these kinds of work,
+  not the nodes inside, so it does not tell how big the inside is.
 - **Hosted mode** (`H2VAULT_HOSTED=1`, for a render server you operate): model lists are emptied, the log and model-list
   routes are refused and only vault prompts are accepted.
 
@@ -102,7 +104,8 @@ Hosted mode on a server you operate, behind your own login.
 A vault can carry, inside its encryption, where to download each model file it uses (URL, size, SHA-256). When
 someone opens the workflow on a ComfyUI that lacks a model, H2Vault downloads it in the background - over HTTPS only,
 resumable, capped at the declared size and checked against the SHA-256 before use - and stores it under a hash name
-(`models/<folder>/h2v/<hash>.<ext>`), so the file name on disk reveals nothing. The vault node shows only
+(`models/<folder>/h2v/<hash>.<ext>`). Model lists in the browser (node menus, the model library, `/object_info`,
+`/models`, `/api/assets`) never show these copies, and their file metadata is not served. The vault node shows only
 "Preparing this vault · 42 %"; the browser never learns a file name, URL or folder. Missing extensions install from
 the commits pinned inside the vault (they are code: ComfyUI needs a restart). Setting *H2Vault > Run > Install what a
 vault needs*: Install automatically (default) / Ask first / Never.
@@ -190,7 +193,7 @@ workflow is open, the ComfyUI front end keeps a draft of it in this browser's st
 |---|---|
 | The inside of a vault (nodes, wiring, values, model names) | AES-256-GCM. Locked: key from Argon2id(password). Sealed: a per-vault key wrapped with X25519 for each authorized installation, and with the password for editing. The header (format, vault id, KDF parameters, interface hashes) is authenticated. |
 | Opening a vault for editing | Password + TOTP second factor (RFC 6238, codes single-use, 8 recovery codes) + the vault's editor list. 5 wrong passwords lock that vault for 5 minutes; one key derivation at a time. |
-| Workflow JSON, PNG metadata, history, logs, the queued prompt | The vault node carries only the encrypted payload and its public sockets / controls. Server messages about inner nodes are rewritten to the vault; errors keep the inner node type and the message, never values or tracebacks. |
+| Workflow JSON, PNG metadata, history, logs, the queued prompt | The vault node carries only the encrypted payload and its public sockets / controls. Images and other files saved or previewed INSIDE a vault carry no workflow or prompt metadata. Server messages about inner nodes are rewritten to the vault; errors keep the inner node type and the message, never values or tracebacks (a concealed vault: only the kind of step). |
 | Local secrets (install key, TOTP secret, remembered keys) | OS credential store (keyring) or an encrypted file in `ComfyUI/user/h2vault/`. Never in a workflow, log or git. |
 | Routes that set up the second factor, manage remembered keys, licences or the author key, or install custom nodes | Answer only the ComfyUI page on the same machine (loopback peer + loopback Host + no cross-site request). |
 | Licences (Licensed profile) | Ed25519-signed, offline, bound to one installation's X25519 key; the vault opens only with a licence key unwrapped there. End dates and run limits are honour-system (see *Licences*). |
