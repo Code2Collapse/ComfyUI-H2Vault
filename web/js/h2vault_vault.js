@@ -2603,6 +2603,6 @@ app.registerExtension({
 globalThis.__h2vault = { lockSelection: (profile) => lockSelection(app.canvas, profile),
   protectNodes: (nodes, opts) => protectWithFeedback(nodes, opts), protectTransaction, protectWholeWorkflow,
   lockNodeParameters, lockRequest, refreshLicence, LICENCE_STATE, issueLicence, addLicence, ledgerDialog, lockParameters,
-  removeProtection };
+  removeProtection, openVault, secondFactor: twoFactorSetup, syncRunKeys, RUN_UNLOCKED };
 
 export { buildApi, exportUi, scrub, OPEN };

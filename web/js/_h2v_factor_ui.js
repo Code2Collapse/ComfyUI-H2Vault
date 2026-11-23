@@ -273,6 +273,10 @@ export async function secondFactorDialog({ post, getStatus, enrolTotp, firstRun 
   d.addAction("Done", { primary: true, onClick: () => d.close(true) });
   d.onCleanup(() => proof?.destroy());
 
+  if (!status.enrolled) {                 // nothing to prove yet: the token covers every method set up in this dialog
+    const t = await post("/h2vault/2fa/manage/begin", {});
+    if (t.ok) token = t.data.manage_token;
+  }
   const refresh = async () => { status = await getStatus(); draw(); };
   const call = async (route, body = {}) => {
     const r = await post(route, { ...body, manage_token: token });
