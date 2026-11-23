@@ -893,17 +893,51 @@ def licence_ledger(_body: dict) -> dict:
     return {"ok": True, "rows": rows}
 
 
+NOT_THIS_AUTHOR = "This backup is not the author key of this workflow."
+
+
 @_lic_error
 def author_export(body: dict) -> dict:
-    from . import licence as L
-    return {"ok": True, "file": L.export_author(str(body.get("password") or ""))}
+    """Back up the author key - with the same proof as issuing a licence (review P1-4): a Licensed vault of this
+    author, its password, the authenticator code and the editor list; the stored key must be that vault's author key."""
+    from . import crypto as v2, licence as L
+    payload, vault_id, p = _licensed(body)
+    if p["mode"] != v2.MODE_SEALED_LICENSED:
+        raise _BadRequest(NOT_LICENSED)
+    file_password = str(body.get("file_password") or "")
+    if len(file_password) < 8:                                 # checked before the password: never a counted guess
+        raise _BadRequest("Choose a password of at least 8 characters for the backup.")
+    _plain, _k, _factor, refused = _authorize(body)
+    if refused:
+        return refused
+    _author_for(p)
+    return {"ok": True, "file": L.export_author(file_password)}
 
 
 @_lic_error
 def author_import(body: dict) -> dict:
-    from . import licence as L
-    kid = L.import_author(body.get("file"), str(body.get("password") or ""), replace=bool(body.get("replace")))
-    return {"ok": True, "author": kid}
+    """Restore the author key - same proof as issuing, and the backup must be THIS vault's author key. Replacing a
+    different key needs `replace: true` AND `confirm: "replace"`, and the current key is first written to a dated,
+    password-encrypted backup file in the H2Vault user folder (review P1-4)."""
+    from . import crypto as v2, licence as L
+    payload, vault_id, p = _licensed(body)
+    if p["mode"] != v2.MODE_SEALED_LICENSED:
+        raise _BadRequest(NOT_LICENSED)
+    file_password = str(body.get("file_password") or "")
+    _plain, _k, _factor, refused = _authorize(body)
+    if refused:
+        return refused
+    priv = L.read_author_file(body.get("file"), file_password)
+    if L.ed25519_public(priv) != p["author_pub"]:
+        raise _BadRequest(NOT_THIS_AUTHOR)
+    backup = None
+    cur = L.author_private_key(create=False)
+    if cur and cur != priv:
+        if not (body.get("replace") is True and body.get("confirm") == "replace"):
+            raise VaultError(L.OTHER_AUTHOR_KEY)
+        backup = L.backup_current_author(file_password)
+    L.store_author(priv)
+    return {"ok": True, "author": L.key_id(L.ed25519_public(priv)), "backup": backup.name if backup else None}
 
 
 # ── second factor (CNP vault_node /c2c_vault/2fa/*) ──────────────────────────────────────────────────────────────
@@ -946,8 +980,9 @@ def register_routes(server) -> None:
 
     routes = server.routes
 
-    def wrap(fn, status_on_error=403, offload=False, local_only=None):
-        """`local_only`: a phrase naming the feature - the route then answers only the ComfyUI page on this machine."""
+    def wrap(fn, status_on_error=403, offload=False, local_only=None, local_when=None):
+        """`local_only`: a phrase naming the feature - the route then answers only the ComfyUI page on this machine.
+        `local_when(body)` -> such a phrase for requests that need it (a Licensed protect creates the author key)."""
         async def handler(request):
             if local_only:
                 refused = refuse_remote(request, local_only)
@@ -957,6 +992,11 @@ def register_routes(server) -> None:
                 body = await request.json() if request.method == "POST" else {}
             except Exception:  # noqa: BLE001
                 body = {}
+            phrase = local_when(body) if local_when and isinstance(body, dict) else None
+            if phrase:
+                refused = refuse_remote(request, phrase)
+                if refused is not None:
+                    return refused
             try:
                 if offload:                                   # L9.263: the password KDF runs off the event loop
                     import asyncio
@@ -972,7 +1012,8 @@ def register_routes(server) -> None:
                 return web.json_response({"ok": False, "error": str(exc)}, status=429)
         return handler
 
-    routes.post("/h2vault/vault/protect")(wrap(protect, 400, offload=True))   # V7: hashing model files is slow
+    routes.post("/h2vault/vault/protect")(wrap(protect, 400, offload=True, local_when=lambda b: (
+        "Protecting as Licensed (it creates your author key)" if b.get("profile") == "sealed_licensed" else None)))   # V7: hashing model files is slow
     routes.post("/h2vault/vault/conceal/check")(wrap(conceal_check, 400))
     routes.post("/h2vault/vault/protect/abort")(wrap(protect_abort))
     routes.post("/h2vault/vault/unlock_run")(wrap(unlock_run, offload=True))

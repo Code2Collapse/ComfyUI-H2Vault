@@ -9,9 +9,16 @@
   server log while the node runs. Nodes locked together unlock with one password prompt per tab. *Unlock parameters
   (remove protection)* restores the node (password + authenticator).
 - **Licensed profile** (envelope version 2, mode 3; existing vaults unchanged): one public workflow, one offline
-  Ed25519-signed licence per installation carrying the vault's licence key wrapped to that installation. Issue, add,
-  revoke (new licence key + re-issue), *Licences issued* overview, author key backup / restore. End dates and run limits
-  are honour-system and labelled so. No licence server, no network call.
+  Ed25519-signed licence per installation carrying the vault's licence key wrapped to that installation. Stops casual
+  sharing of the workflow file; it is not copy protection (one licence key per workflow, shared by its licensees, who
+  can extract it). Issue, add, revoke (new licence key + re-issue; run limits restart), *Licences issued* overview,
+  author key backup / restore (vault password + authenticator; a replaced key is saved to a dated backup first). The
+  newest licence for a copy decides. End dates and run limits are honour-system and labelled so. No licence server,
+  no network call. Protecting as Licensed is local-page only.
+- Locked nodes are envelope version 3: H2Vault 0.1.x refuses them instead of running them without the blanking.
+- Blanking: other number / string spellings; numbers only in the node's own messages; `print()` output through core's
+  log interceptor; nothing carried over to the next prompt.
+- *Save again with the same password* checks the password against the file it was opened from (and asks twice).
 - Encrypted workflows: *Save workflow encrypted again (same key)*; the dialogs say that images rendered from a
   decrypted workflow carry it in their metadata.
 - Every password field warns when the page is reached over plain http from another machine.

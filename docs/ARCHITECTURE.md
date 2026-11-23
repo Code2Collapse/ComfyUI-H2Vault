@@ -214,6 +214,10 @@ Publishing is the lead's / owner's decision.
 Design and threat model: workspace `docs/h2vault/V5_enhancements_design.md`. A Locked node is a one-node vault with a
 `lock` section in its plaintext (`routes._with_lock`; public part = title, colours, count, and the setting names / node
 kind only when the author publishes them); `protected_subgraph.register_redaction` blanks its values in messages and the
-log while its prompt runs. Licensed vaults are envelope version 2 / mode 3 (`crypto.py`: author Ed25519 key in the
+log while its prompt runs (numbers only in its own messages; strings also in the server log via core's stdout /
+stderr interceptor; state cleared per prompt). Locked-node vaults are envelope version 3 (v1 layout) so 0.1.x refuses
+them. Licensed vaults are envelope version 2 / mode 3 (`crypto.py`: author Ed25519 key in the
 header, a licence slot = the data key under the licence key); `licence.py` signs, verifies, stores licences and counts
-runs; `protected_subgraph.open_licensed` tries the stored licences newest first until one opens this copy.
+runs; `protected_subgraph.open_licensed` -> `licence.best_for_run`: the newest licence that opens this copy decides
+(no fall-back to an older one). Licences stop casual sharing; one licence key per vault is shared by its licensees,
+so they are not copy protection. Author key backup / restore need a Licensed vault's password + authenticator.

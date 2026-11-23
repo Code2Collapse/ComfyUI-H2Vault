@@ -151,13 +151,17 @@ async function saveSameKey() {
     const d = vaultDialog({ title: "Save again with the same password", width: 480,
       subtitle: `"${fileName}" was protected with a password. Type it again (it is never kept).` });
     const pw = passwordField({ label: "Password", autocomplete: "current-password" });
-    d.body.append(pw.el, noticeEl("info", METADATA_NOTE));
+    const pw2 = passwordField({ label: "Repeat the password", autocomplete: "current-password" });
+    d.body.append(pw.el, pw2.el, noticeEl("info", METADATA_NOTE));
     d.addAction("Cancel", { onClick: () => d.close(null) });
     const go = async () => {
       if (d.busy) return;
       if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters for the password."); return; }
-      d.setBusy(true, "Encrypting…");
-      const r = await post("/h2vault/workflow/encrypt", { workflow, scheme: "argon2id-aesgcm", password: pw.value() });
+      if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); return; }
+      d.setBusy(true, "Checking the password…");
+      // review P2-10: the server first opens the file this tab opened with this password (a typo is refused)
+      const r = await post("/h2vault/workflow/encrypt", { workflow, scheme: "argon2id-aesgcm", password: pw.value(),
+        same_as_file: LAST_OPENED.file });
       if (!r.ok) { d.setBusy(false); d.notice("danger", r.data.error || `Encrypting failed (${r.status}).`); return; }
       d.close(r.data);
     };
@@ -203,7 +207,7 @@ async function decryptFile(file, fileName) {
   const first = await post("/h2vault/workflow/decrypt", { file });
   if (first.ok) {
     if (first.data.used_remembered) toast("Opened with the key this installation remembers.", "success", "Decrypted");
-    LAST_OPENED = { fingerprint: first.data.fingerprint, scheme: first.data.scheme, name: fileName };
+    LAST_OPENED = { fingerprint: first.data.fingerprint, scheme: first.data.scheme, name: fileName, file };
     return first.data.workflow;
   }
   if (first.status !== 401) { toast(first.data.error || `Could not open the file (${first.status}).`, "error"); return null; }
@@ -239,7 +243,7 @@ async function decryptFile(file, fileName) {
       : { file, key: value, remember: !!remember?.checked(), label: fileName || "" });
     if (r.ok) {
       workflow = r.data.workflow;
-      LAST_OPENED = { fingerprint: r.data.fingerprint, scheme: r.data.scheme, name: fileName };
+      LAST_OPENED = { fingerprint: r.data.fingerprint, scheme: r.data.scheme, name: fileName, file };
       d.close(true);
       return;
     }

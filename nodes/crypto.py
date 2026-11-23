@@ -46,7 +46,11 @@ def boundary_hash(boundary_in: list, boundary_out: list) -> str:
 MAGIC2 = b"H2VAULT"
 VERSION = 1                 # every vault of modes 0-2 is written as version 1, byte for byte as before V5
 VERSION_LICENSED = 2        # V5: mode 3 only (author key in the header + licence slot)
-MAX_VERSION = 2             # the newest envelope this build reads; newer -> "made by a newer H2Vault"
+# V5 review P1-3: a Lock-parameters vault of modes 0-2 is written as version 3 (the v1 layout; only the number
+# differs). H2Vault 0.1.x refuses `version > 1` in words, so it never runs a Locked node without the V5 redaction and
+# with its inner class in errors. The number is in the authenticated header: it cannot be lowered to 1.
+VERSION_LOCKED = 3
+MAX_VERSION = 3             # the newest envelope this build reads; newer -> "made by a newer H2Vault"
 PLAIN_FORMAT = 1            # the plaintext's "format" field
 CONTENT_SCHEMA = 1          # the plaintext's "schema" field: 1 = A18 {api, ui, interface, editors, profile, packs}
 FORMAT = {"magic": "H2VAULT", "version": VERSION, "aead": "AES-256-GCM (96-bit nonce, 128-bit tag)",
@@ -133,12 +137,14 @@ def key_id(public_raw: bytes) -> bytes:
 
 # ── the header ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
-def _version_of(mode: int) -> int:
-    return VERSION_LICENSED if mode == MODE_SEALED_LICENSED else VERSION
+def _version_of(mode: int, locked: bool = False) -> int:
+    if mode == MODE_SEALED_LICENSED:
+        return VERSION_LICENSED
+    return VERSION_LOCKED if locked else VERSION
 
 
 def _header(mode: int, vault_id: str, kdf: dict, salt: bytes, bhash: bytes, ihash: bytes,
-            author_pub: Optional[bytes] = None) -> bytes:
+            author_pub: Optional[bytes] = None, locked: bool = False) -> bytes:
     vid = vault_id.encode("utf-8")
     if mode not in ALL_MODES or not vid or len(vid) > 255 or len(salt) != SALT_LEN or len(bhash) != 32 \
             or len(ihash) != 32:
@@ -146,7 +152,7 @@ def _header(mode: int, vault_id: str, kdf: dict, salt: bytes, bhash: bytes, ihas
     licensed = mode == MODE_SEALED_LICENSED
     if licensed != (author_pub is not None) or (licensed and len(author_pub) != 32):
         raise VaultError("Malformed vault header fields.")
-    return b"".join([MAGIC2, struct.pack("!BB", _version_of(mode), mode), struct.pack("!B", len(vid)), vid,
+    return b"".join([MAGIC2, struct.pack("!BB", _version_of(mode, locked), mode), struct.pack("!B", len(vid)), vid,
                      struct.pack("!BIIB", KDF_ARGON2ID, int(kdf["memory_kib"]), int(kdf["iterations"]),
                                  int(kdf["lanes"])), salt, bhash, ihash, author_pub or b""])
 
@@ -176,11 +182,11 @@ def parse(payload: str) -> dict:
         if version > MAX_VERSION:
             raise VaultError(f"This vault was made by a newer H2Vault (vault format {version}); update "
                              "ComfyUI-H2Vault to open it.")
-        if version not in (VERSION, VERSION_LICENSED):
+        if version not in (VERSION, VERSION_LICENSED, VERSION_LOCKED):
             raise VaultError(f"Unsupported vault format version {version}.")
         if mode not in ALL_MODES:
             raise VaultError("Malformed vault: unknown mode.")
-        if version != _version_of(mode):
+        if version not in (_version_of(mode), _version_of(mode, True)):
             raise VaultError("Malformed vault: mode and version disagree.")
         (vlen,) = struct.unpack_from("!B", blob, i); i += 1
         vault_id = blob[i:i + vlen].decode("utf-8"); i += vlen
@@ -238,7 +244,7 @@ def parse(payload: str) -> dict:
         raise VaultError("Truncated vault payload.")
     if (mode == MODE_SEALED_PORTABLE) != (portable is not None):
         raise VaultError("Malformed vault: mode and wraps disagree.")
-    return {"header": header, "version": VERSION, "mode": mode, "vault_id": vault_id, "kdf": kdf, "salt": salt,
+    return {"header": header, "version": version, "mode": mode, "vault_id": vault_id, "kdf": kdf, "salt": salt,
             "bhash": bhash, "ihash": ihash, "pw": pw, "installs": installs, "portable": portable, "body": body,
             "author_pub": None, "licence_slot": None}
 
@@ -278,7 +284,8 @@ def _encrypt(plain: dict, *, mode: int, vault_id: str, kdf: dict, salt: bytes, k
 
     aes = _aes()
     header = _header(mode, vault_id, kdf, salt, bhash, ihash,
-                     author_pub=licensing["author_pub"] if mode == MODE_SEALED_LICENSED else None)
+                     author_pub=licensing["author_pub"] if mode == MODE_SEALED_LICENSED else None,
+                     locked=isinstance(plain.get("lock"), dict))
     dek = os.urandom(KEY_LEN)                                   # fresh for every lock: nonces never repeat under it
     parts = []
     n = os.urandom(NONCE_LEN)

@@ -46,8 +46,9 @@ const PROFILES = [
     net: "None - licences are checked offline, nothing is sent anywhere.", where: "On each licensed installation's GPU.",
     custody: "A per-vault licence key, wrapped inside each licence for that installation's own key pair; licences " +
       "are signed with your author key.",
-    security: "Encrypted. Without a licence for their installation nobody can run or read it. End dates and run " +
-      "limits are kept by H2Vault on their computer (see the licence dialog).", risk: "" },
+    security: "Encrypted. Stops casual sharing: the workflow file alone does not run without a licence for that " +
+      "installation. One licence key per workflow, shared by all licensees: a determined licensee can extract it. " +
+      "End dates and run limits are kept by H2Vault on their computer. Revoking = a new licence key.", risk: "" },
   { id: "locked", title: "Locked — password to run", tag: "",
     run: "Anyone with the vault password; asked once per browser tab.",
     edit: "Vault password + your authenticator code + editor list.",
@@ -1996,10 +1997,26 @@ async function removeProtection(v) {
     } });
   if (!out?.ok || !opened) return;
   post("/h2vault/vault/cancel", { edit_token: opened.edit_token });     // nothing is re-sealed: the session ends
+  // the open controls' CURRENT values (the layout keeps the values of when it was locked)
+  const openVals = {};
+  for (const prm of vaultInfo(v).interface?.params || []) {
+    const w = v.widgets?.find((x) => x.name === `p_${prm.key}`);
+    if (prm.input && w) openVals[prm.input] = w.value;
+  }
   try {
     const graph = v.graph;
+    const before = new Set((graph.nodes || graph._nodes || []).map((n) => n));
     const sg = materialize(v, opened);
-    if (isLock && typeof graph.unpackSubgraph === "function") graph.unpackSubgraph(sg);
+    if (isLock && typeof graph.unpackSubgraph === "function") {
+      graph.unpackSubgraph(sg);
+      const back = (graph.nodes || graph._nodes || []).filter((n) => !before.has(n) && n !== sg);
+      if (back.length === 1) {
+        for (const [name, value] of Object.entries(openVals)) {
+          const w = back[0].widgets?.find((x) => x.name === name);
+          if (w) w.value = value;
+        }
+      }
+    }
     graph.setDirtyCanvas?.(true, true);
     toast(isLock ? "The node is back with its values." : "The vault is now an ordinary subgraph.", "success",
       "Protection removed");
@@ -2153,7 +2170,8 @@ async function rotateLicences(v) {
     subtitle: "A new licence key is made and the vault is sealed again. Every licence issued so far stops working " +
       "for the NEW copy of the workflow; tick the people who should get a new licence right away." });
   d.body.append(noticeEl("warn", "People who already have the old copy of the workflow and its licence can keep " +
-    "running that old copy - an offline licence cannot be taken back. Send everyone the new copy."));
+    "running that old copy - an offline licence cannot be taken back. Send everyone the new copy. Re-issued " +
+    "licences start their run limits from zero again."));
   const checks = rows.map((r) => ({ lid: r.lid, box: checkRow(`${r.label || "Unnamed"} · ${ledgerState(r).detail}`, true) }));
   if (checks.length) d.body.append(block("Issue new licences to", null, ...checks.map((c) => c.box.el)));
   else d.body.append(vel("p", { class: "h2v-dim", text: "No licence of this workflow is listed on this installation." }));
@@ -2205,58 +2223,96 @@ async function ledgerDialog() {
   await d.result;
 }
 
-async function exportAuthorKey() {
+/** The Licensed vault an author-key action works through: the one right-clicked, or the only one on screen. */
+function licensedVaultFor(v) {
+  if (v && vaultInfo(v).profile === "sealed_licensed") return v;
+  const found = [];
+  const walk = (g, seen = new Set()) => {
+    if (!g || seen.has(g)) return;
+    seen.add(g);
+    for (const n of g.nodes || g._nodes || []) {
+      if (VAULT_TYPES.has(n.type) && vaultInfo(n).profile === "sealed_licensed") found.push(n);
+      if (isSubgraphNode(n)) walk(n.subgraph, seen);
+    }
+  };
+  try { walk(app.rootGraph ?? app.graph); } catch (_) { /* none */ }
+  if (found.length === 1) return found[0];
+  toast(found.length ? "Right-click the Licensed vault whose author key you mean, then choose the action there."
+    : "Open a workflow with one of your Licensed vaults first: the author key is proven with that vault's password " +
+      "and your authenticator.", "warn");
+  return null;
+}
+
+/** Back up the author key: the same proof as issuing a licence (vault password + authenticator, review P1-4). */
+async function exportAuthorKey(node) {
+  const v = licensedVaultFor(node);
+  if (!v) return;
   const d = vaultDialog({ title: "Back up my author key", width: 480,
     subtitle: "Your author key signs every licence. Without it (a new computer, a reinstall) you cannot issue licences " +
       "for the workflows you already shared." });
-  const pw2 = passwordField({ label: "Repeat the password" });
+  const pw2 = passwordField({ label: "Repeat the backup password" });
   const pw = passwordField({ label: "Password for the backup file", strength: true, generate: true,
     onGenerate: (x) => pw2.setValue(x) });
   d.body.append(pw.el, pw2.el);
   d.addAction("Cancel", { onClick: () => d.close(null) });
-  const go = async () => {
-    if (d.busy) return;
+  const next = () => {
     if (pw.value().length < 8) { d.notice("danger", "Use at least 8 characters."); return; }
     if (pw.value() !== pw2.value()) { d.notice("danger", "The two passwords differ."); return; }
-    d.setBusy(true, "Encrypting…");
-    const r = await post("/h2vault/licence/author/export", { password: pw.value() });
-    d.setBusy(false);
-    if (!r.ok) { d.notice("danger", r.data?.error || "The backup could not be made."); return; }
-    downloadText("h2vault-author-key.h2vauthor", JSON.stringify(r.data.file, null, 1), "application/json");
-    d.close(true);
+    d.close(pw.value());
   };
-  d.addAction("Download backup", { primary: true, onClick: go });
-  d.onSubmit(go);
-  if (await d.result) toast("Author key backup downloaded. Keep the file and its password apart.", "success");
+  d.addAction("Next", { primary: true, onClick: next });
+  d.onSubmit(next);
+  const filePassword = await d.result;
+  if (!filePassword) return;
+  let file = null;
+  const out = await credentialDialog({ title: "Prove it is your key", primary: "Download backup",
+    subtitle: `Type the password of "${v.title || "this vault"}" and your authenticator code.`,
+    submit: async ({ password, code }) => {
+      const r = await post("/h2vault/licence/author/export", { ...vaultRefs(v), password, code,
+        file_password: filePassword });
+      if (r.ok && r.data.file) { file = r.data.file; return { ok: true }; }
+      if (r.data?.needs_enrolment) return { enrol: true };
+      return { error: authError(r, "The backup could not be made.") };
+    } });
+  if (out?.enrol) { await enrolDialog(); return; }
+  if (!file) return;
+  downloadText("h2vault-author-key.h2vauthor", JSON.stringify(file, null, 1), "application/json");
+  toast("Author key backup downloaded. Keep the file and its password apart.", "success");
 }
 
-async function importAuthorKey() {
+/** Restore the author key: vault password + authenticator, the backup must belong to that vault; replacing a
+ *  different key needs an explicit confirmation and saves the current key to a dated file first (review P1-4). */
+async function importAuthorKey(node) {
+  const v = licensedVaultFor(node);
+  if (!v) return;
   const f = await pickTextFile(".h2vauthor,.json");
   if (!f) return;
-  const d = vaultDialog({ title: "Restore author key", subtitle: f.name, width: 460 });
-  const pw = passwordField({ label: "Backup password", autocomplete: "current-password" });
-  let replace = false;
-  d.body.append(pw.el);
+  const d = vaultDialog({ title: "Restore author key", subtitle: f.name, width: 480 });
+  const fpw = passwordField({ label: "Backup file password", autocomplete: "current-password" });
+  const replace = checkRow("Replace the author key this installation has now", false,
+    "(it is saved first to a dated backup file)");
+  d.body.append(fpw.el, replace.el);
   d.addAction("Cancel", { onClick: () => d.close(null) });
-  const go = async () => {
-    if (d.busy) return;
-    d.setBusy(true, "Restoring…");
-    const r = await post("/h2vault/licence/author/import", { file: f.text, password: pw.value(), replace });
-    d.setBusy(false);
-    if (!r.ok) {
-      d.notice("danger", r.data?.error || "The backup could not be restored.");
-      if (/different author key/.test(r.data?.error || "") && !replace) {
-        replace = true;
-        d.notice("warn", "This installation has another author key. Press Restore again to REPLACE it (licences " +
-          "signed with the old key keep working only for the vaults that key sealed).");
-      }
-      return;
-    }
-    d.close(true);
-  };
-  d.addAction("Restore", { primary: true, onClick: go });
-  d.onSubmit(go);
-  if (await d.result) toast("Author key restored.", "success");
+  const next = () => { if (!fpw.value()) { d.notice("danger", "Type the backup file's password."); return; }
+    d.close({ file_password: fpw.value(), replace: replace.checked() }); };
+  d.addAction("Next", { primary: true, onClick: next });
+  d.onSubmit(next);
+  const opts = await d.result;
+  if (!opts) return;
+  let done = null;
+  const out = await credentialDialog({ title: "Prove it is your workflow", primary: "Restore",
+    subtitle: `Type the password of "${v.title || "this vault"}" and your authenticator code.`,
+    submit: async ({ password, code }) => {
+      const r = await post("/h2vault/licence/author/import", { ...vaultRefs(v), password, code, file: f.text,
+        file_password: opts.file_password, ...(opts.replace ? { replace: true, confirm: "replace" } : {}) });
+      if (r.ok) { done = r.data; return { ok: true }; }
+      if (r.data?.needs_enrolment) return { enrol: true };
+      return { error: authError(r, "The backup could not be restored.") };
+    } });
+  if (out?.enrol) { await enrolDialog(); return; }
+  if (!done) return;
+  toast(done.backup ? `Author key restored. The previous key was saved as ${done.backup} in the H2Vault user folder ` +
+    "(same password as this backup)." : "Author key restored.", "success");
 }
 
 // ── commands, menus, settings ───────────────────────────────────────────────────────────────────────────────
@@ -2408,7 +2464,9 @@ app.registerExtension({
         ...(licensed ? [
           { content: "🎫 Add licence…", callback: () => addLicence(node) },
           { content: "🧾 Issue a licence…", callback: () => issueLicence(node) },
-          { content: "♻️ Revoke licences (new licence key)…", callback: () => rotateLicences(node) }] : []),
+          { content: "♻️ Revoke licences (new licence key)…", callback: () => rotateLicences(node) },
+          { content: "💾 Back up my author key…", callback: () => exportAuthorKey(node) },
+          { content: "📥 Restore author key…", callback: () => importAuthorKey(node) }] : []),
         { content: "👥 Manage installations & editors…", callback: () => manageAccess(node, "access") },
         { content: "🔐 Change password…", callback: () => manageAccess(node, "password") },
         { content: "📦 Install missing custom nodes…", callback: () => installMissing(node) },
@@ -2429,6 +2487,7 @@ app.registerExtension({
 // browser tests: protect given nodes without the dialog
 globalThis.__h2vault = { lockSelection: (profile) => lockSelection(app.canvas, profile),
   protectNodes: (nodes, opts) => protectWithFeedback(nodes, opts), protectTransaction, protectWholeWorkflow,
-  lockNodeParameters, lockRequest, refreshLicence, LICENCE_STATE, issueLicence, addLicence, ledgerDialog, lockParameters };
+  lockNodeParameters, lockRequest, refreshLicence, LICENCE_STATE, issueLicence, addLicence, ledgerDialog, lockParameters,
+  removeProtection };
 
 export { buildApi, exportUi, scrub, OPEN };

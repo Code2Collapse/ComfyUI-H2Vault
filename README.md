@@ -138,13 +138,28 @@ re-issues licences to the people you tick; **H2Vault > Licences issued** lists e
 author key** keeps the key that signs your licences (without it you cannot issue licences for workflows you already
 shared). Nothing is sent anywhere: there is no licence server.
 
-| What a licence guarantees | How |
+What licences are: a way to stop **casual sharing** of the workflow file - passed on without a licence for the
+receiving installation, it does not run. What they are not: copy protection. A workflow has ONE licence key, shared
+by everyone you licensed; any of them can, with effort, extract it on their own machine and pass it on (a modified
+H2Vault then runs the copy anywhere). Revoking someone means a new licence key and sending the new copy only to the
+others.
+
+| What a licence does | How |
 |---|---|
-| Without a licence for their installation, nobody can run or read the workflow | The vault's data key is wrapped only under its licence key; the licence key travels only inside licences, wrapped to one installation's own X25519 key |
+| The workflow file alone does not run on an installation without a licence for it | The vault's data key is wrapped only under its licence key; the licence key travels only inside licences, wrapped to one installation's own X25519 key. **Not** proof against a licensee: they hold the licence key and can extract it |
 | A licence works on one installation and for one workflow only | That installation's private key is needed to unwrap it; the licence names the workflow |
 | Only you can issue licences | Ed25519 signature checked against your author key, which is bound into the vault (authenticated, cannot be swapped) |
 | After *Revoke licences*, the new copy refuses the old licences | A new licence key |
-| **Honour-system only:** end dates, run limits, the clock check, newest licence wins | Kept by the unmodified H2Vault on the other person's computer. Someone who has already run the workflow and changes software on their own machine can ignore them, and can keep running a copy they already hold. For limits that are truly enforced, run the vault on your own server (Hosted mode). |
+| **Honour-system only:** end dates, run limits, the clock check, newest licence wins (the newest licence for a copy decides; an older one is never used instead) | Kept by the unmodified H2Vault on the other person's computer. Someone who changes software on their own machine can ignore them, and can keep running a copy they already hold. For limits that are truly enforced, run the vault on your own server (Hosted mode). |
+
+**Revoking resets run limits:** *Revoke licences* re-issues new licences to the people you tick, and a re-issued
+licence counts its runs from zero again (same end date, same limit).
+
+**Author key backup and restore** ask for the password of one of your Licensed vaults and your authenticator code,
+like issuing a licence; a backup can only be restored for workflows it signed. Replacing a different author key
+needs an explicit tick, and the key it replaces is saved first to `ComfyUI/user/h2vault/author-key-backup-<date>-<id>.h2vauthor`
+(encrypted with the same backup password). Protecting as Licensed (which creates your author key) and every licence
+action answer only the ComfyUI page on this machine.
 
 ## Encrypted workflow files
 
@@ -181,6 +196,17 @@ workflow is open, the ComfyUI front end keeps a draft of it in this browser's st
 | Licences (Licensed profile) | Ed25519-signed, offline, bound to one installation's X25519 key; the vault opens only with a licence key unwrapped there. End dates and run limits are honour-system (see *Licences*). |
 | Locked nodes | One-node vaults: values only in the ciphertext; blanked in messages and the log while they run. |
 | Passwords typed on a remote page over plain http | Every password field warns that the password travels unencrypted (use an SSH tunnel or https). |
+
+### Limits of Lock parameters' blanking
+
+While a Locked node runs, its OWN messages (its error text, progress text, text outputs and history) lose every
+locked value - strings in their common spellings (as typed, escaped, with / or \\, any letter case), numbers in any
+decimal spelling (7.5, 7.50, 7.5e0), True / False. The rest of the server log (logging records and `print()` output,
+through ComfyUI 0.39's stdout / stderr interceptor that feeds `/internal/logs`) loses only locked text values of 3+
+characters: blanking a locked `1` in every log line would hide everything else. Not covered: log handlers that
+write elsewhere than stdout / stderr (e.g. a file handler another extension adds), encodings other than those above
+(hex, base64, a value split across lines), and anything reading process memory. Older H2Vault versions (0.1.x)
+refuse a Locked node ("made by a newer H2Vault"), so it never runs there without the blanking.
 
 Honest limits: a machine that runs a vault has to decrypt its inside to run it, so someone who controls that machine
 (memory, a debugger, a modified ComfyUI) can read it. A Locked vault can be decrypted by anyone with its password. A

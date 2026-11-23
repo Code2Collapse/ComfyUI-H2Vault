@@ -15,6 +15,7 @@ inner node type + message but lose inputs, outputs and traceback (owner A18: "ty
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -115,9 +116,9 @@ def open_for_run(payload: str, vault_id: str, client_id: Optional[str] = None) -
     return _open_for_run(payload, vault_id, client_id)[0]
 
 
-def open_licensed(payload: str, vault_id: str) -> tuple:
-    """V5 Licensed vault: the newest licence stored on this installation that verifies, may run now and opens THIS copy
-    (after a licence-key rotation an installation can hold licences for the old and the new copy). -> (plain,
+def open_licensed(payload: str, vault_id: str, now: Optional[float] = None) -> tuple:
+    """V5 Licensed vault: the newest licence stored on this installation that verifies and opens THIS copy decides
+    (licence.best_for_run); its end date / run limit is checked, never bypassed by an older licence. -> (plain,
     licence). Every refusal is the plain-English text of nodes/licence.py. Never counts a run."""
     from . import crypto as v2, keys as vault_keys, licence
 
@@ -126,20 +127,19 @@ def open_licensed(payload: str, vault_id: str) -> tuple:
         raise VaultError(licence.NEEDS_LICENCE)
     pub = vault_keys.install_public_key()
     author_pub = v2.parse(payload)["author_pub"]
-    cands = licence.candidates(vault_id, author_pub=author_pub, install_pub=pub)
-    if not cands:
-        raise VaultError(licence.NEEDS_LICENCE)
-    problem = None
-    for lic in cands:
-        p = licence.policy(lic)
-        if p:
-            problem = problem or p
-            continue
+    opened: dict = {}
+
+    def opens(lic: dict) -> bool:
         try:
-            return v2.open_with_licence_key(payload, licence.unwrap(lic, priv), vault_id=vault_id), lic
+            opened[lic["lid"]] = v2.open_with_licence_key(payload, licence.unwrap(lic, priv), vault_id=vault_id)
+            return True
         except (licence.LicenceError, VaultError):
-            continue                                       # a licence for another copy of this vault
-    raise VaultError(problem or licence.OTHER_VERSION)
+            return False                                   # a licence for another copy of this vault
+
+    lic, problem = licence.best_for_run(vault_id, author_pub=author_pub, install_pub=pub, now=now, opens=opens)
+    if problem:
+        raise VaultError(problem)
+    return opened[lic["lid"]], lic
 
 
 def _open_licensed(payload: str, vault_id: str) -> tuple:
@@ -496,86 +496,122 @@ def missing_message(s: dict) -> str:
 
 # ── V5: redaction of a Locked node's values ─────────────────────────────────────────────────────────────────
 # A vault whose plaintext has a `lock` section (Lock parameters, design 5.3) registers its locked values when it
-# expands. While such a vault's prompt runs, every message the filter rewrites (error text, progress text, executed
-# text outputs, history) and every log record has those values replaced by REDACTED. The window opens at the
-# expansion and closes when the prompt ends (task_done) or the next one starts, so ordinary log lines outside a run
-# are never touched. Numbers match only as whole tokens ("20" never matches "20.5" or "v20").
-REDACTED = "\u2022\u2022\u2022"
+# expands. Two scopes (review P2-5):
+#   the node's OWN messages and payloads (its error text, its progress text, its `executed` outputs, its history
+#   outputs): every locked value - strings in any common spelling (as typed, repr / JSON-escaped, with / for \, any
+#   letter case; short strings as whole words), numbers in any decimal spelling ("7.5", "7.50", "7.5e0"; whole
+#   tokens only, so "37" never blanks "37.5" or "v37"), booleans as True / true / False / false;
+#   everything else written to the server log while the prompt runs (logging records AND print() output through core's
+#   stdout / stderr interceptor, app/logger.py LogInterceptor, core 0.39): only locked STRINGS of 3+ characters - a
+#   locked "1" must not blank every "1" of every log line.
+# All of it is per prompt (review P2-6): cleared when a prompt starts and when it ends, so a node id reused by the next
+# prompt never inherits another vault's terms or its hidden type.
+REDACTED = "•••"
 MAX_REDACT = 64
-_REDACT: dict = {}                  # vault id -> compiled pattern of its locked values (insertion order = age)
-_REDACT_WINDOW: set = set()         # vault ids whose prompt is running now
+_REDACT: dict = {}                  # vault id -> {"node": compiled | None, "log": compiled | None, "nums": [float]}
+_REDACT_WINDOW: set = set()         # vault ids registered in the running prompt
+_HIDE_TYPE: set = set()             # Locked nodes whose author did not publish the node's kind
+_NUM_TOKEN = re.compile(r"(?<![\w.])(?<!\d\.)[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?(?![\w]|\.\d)")
 
 
-def _redact_terms(plain: dict) -> list:
+def _string_forms(s: str) -> set:
+    """The spellings a string value takes in messages: as typed, repr- and JSON-escaped, path separators swapped."""
+    forms = {s, repr(s)[1:-1], json.dumps(s)[1:-1], s.replace("\\", "/"), s.replace("/", "\\"),
+             s.replace("\\", "\\\\")}
+    return {f for f in forms if f.strip()}
+
+
+def _locked_values(plain: dict) -> list:
     lock = plain.get("lock") if isinstance(plain, dict) else None
     if not isinstance(lock, dict):
         return []
     node = (api_of(plain).get("nodes") or {}).get(str(lock.get("node")))
     inputs = (node or {}).get("inputs") or {}
-    terms = []
+    out = []
     for row in lock.get("rows") or []:
         v = inputs.get(str(row))
-        if isinstance(v, bool) or v is None or _is_link(v) or isinstance(v, (dict, list)):
+        if v is None or _is_link(v) or isinstance(v, (dict, list)):
             continue
-        if isinstance(v, (int, float)):
-            forms = {repr(v), str(v)}
-            if isinstance(v, float) and v.is_integer():
-                forms.add(str(int(v)))
-            terms += [("num", f) for f in forms]
-        elif isinstance(v, str) and len(v.strip()) >= 3:
-            terms.append(("str", v))
-    return terms
+        out.append(v)
+    return out
 
 
-_HIDE_TYPE: set = set()             # Locked nodes whose author did not publish the node's kind
+def _alternation(parts: list) -> Optional[re.Pattern]:
+    return re.compile("|".join(parts), re.IGNORECASE) if parts else None
 
 
 def register_redaction(vault_id: str, plain: dict) -> None:
     lock = plain.get("lock") if isinstance(plain, dict) else None
-    if isinstance(lock, dict):
-        look = lock.get("look") if isinstance(lock.get("look"), dict) else {}
-        (_HIDE_TYPE.discard if look.get("node_label") else _HIDE_TYPE.add)(str(vault_id))
-    terms = _redact_terms(plain)
-    if not terms:
+    if not isinstance(lock, dict):
         return
-    alts = []
-    for kind, t in sorted(set(terms), key=lambda x: len(x[1]), reverse=True):
-        esc = re.escape(t)
-        alts.append(rf"(?<![\w.]){esc}(?![\w.])" if kind == "num" else esc)
-    _REDACT.pop(vault_id, None)
-    _REDACT[vault_id] = re.compile("|".join(alts))
+    look = lock.get("look") if isinstance(lock.get("look"), dict) else {}
+    (_HIDE_TYPE.discard if look.get("node_label") else _HIDE_TYPE.add)(str(vault_id))
+    long_forms, short_words, nums = set(), set(), []
+    for v in _locked_values(plain):
+        if isinstance(v, bool):
+            short_words |= {"True", "False"} & {str(v)}
+        elif isinstance(v, (int, float)):
+            nums.append(float(v))
+        elif isinstance(v, str) and v.strip():
+            (long_forms if len(v.strip()) >= 3 else short_words).update(
+                _string_forms(v) if len(v.strip()) >= 3 else {v.strip()})
+    longs = [re.escape(f) for f in sorted(long_forms, key=len, reverse=True)]
+    words = [rf"(?<!\w){re.escape(w)}(?!\w)" for w in sorted(short_words, key=len, reverse=True)]
+    vid = str(vault_id)
+    _REDACT.pop(vid, None)
+    _REDACT[vid] = {"node": _alternation(longs + words), "log": _alternation(longs), "nums": nums}
     while len(_REDACT) > MAX_REDACT:
         _REDACT.pop(next(iter(_REDACT)))
-    _REDACT_WINDOW.add(vault_id)
+    _REDACT_WINDOW.add(vid)
 
 
-def redact(vault_id: Optional[str], obj: Any) -> Any:
+def _redact_text(entry: dict, text: str, scope: str) -> str:
+    pat = entry.get(scope)
+    if pat is not None:
+        text = pat.sub(REDACTED, text)
+    if scope == "node" and entry["nums"]:
+        nums = entry["nums"]
+
+        def num(m):
+            try:
+                return REDACTED if float(m.group(0)) in nums else m.group(0)
+            except ValueError:
+                return m.group(0)
+        text = _NUM_TOKEN.sub(num, text)
+    return text
+
+
+def redact(vault_id: Optional[str], obj: Any, scope: str = "node") -> Any:
     """`obj` with the locked values of `vault_id` replaced (strings inside dicts / lists too)."""
-    pat = _REDACT.get(vault_id) if vault_id else None
-    if pat is None:
+    entry = _REDACT.get(str(vault_id)) if vault_id else None
+    if entry is None:
         return obj
     if isinstance(obj, str):
-        return pat.sub(REDACTED, obj)
+        return _redact_text(entry, obj, scope)
     if isinstance(obj, dict):
-        return {k: redact(vault_id, v) for k, v in obj.items()}
+        return {k: redact(vault_id, v, scope) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        vals = [redact(vault_id, x) for x in obj]
+        vals = [redact(vault_id, x, scope) for x in obj]
         return tuple(vals) if isinstance(obj, tuple) else vals
     return obj
 
 
 def _redact_window_text(text: str) -> str:
+    """Server-log scope: only the locked strings of the vaults in the running prompt."""
     for v in list(_REDACT_WINDOW):
-        text = redact(v, text)
+        text = redact(v, text, scope="log")
     return text
 
 
 def end_redaction_window() -> None:
+    """A prompt started or ended: nothing of the previous one stays (P2-6)."""
     _REDACT_WINDOW.clear()
+    _REDACT.clear()
+    _HIDE_TYPE.clear()
 
 
 class _RedactLogFilter(logging.Filter):
-    """Log records written while a Locked node's prompt runs lose its values (message and exception text)."""
+    """Log records written while a Locked node's prompt runs lose its locked strings (message and exception text)."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not _REDACT_WINDOW:
@@ -598,6 +634,7 @@ class _RedactLogFilter(logging.Filter):
 
 
 _LOG_FILTER = _RedactLogFilter()
+_STREAMS_WRAPPED: set = set()
 
 
 def install_log_redaction() -> None:
@@ -608,6 +645,32 @@ def install_log_redaction() -> None:
     for h in root.handlers:
         if _LOG_FILTER not in h.filters:
             h.addFilter(_LOG_FILTER)
+
+
+def install_stream_redaction() -> None:
+    """print() output and handlers added later: core 0.39 sends stdout / stderr through app.logger's LogInterceptor
+    (the /internal/logs buffer, the websocket `logs` feed and the console). Its write() is wrapped on the instance, the
+    same way V3's concealment does (concealment.install wraps it again, outermost, after this)."""
+    try:
+        import app.logger as core_logger
+    except Exception:  # noqa: BLE001 - outside ComfyUI
+        return
+    for attr in ("stdout_interceptor", "stderr_interceptor"):
+        s = getattr(core_logger, attr, None)
+        if s is None or id(s) in _STREAMS_WRAPPED:
+            continue
+        orig_write = s.write
+
+        def write(data, _orig=orig_write):
+            if _REDACT_WINDOW and isinstance(data, str):
+                try:
+                    data = _redact_window_text(data)
+                except Exception:  # noqa: BLE001 - never break the console
+                    pass
+            return _orig(data)
+
+        s.write = write
+        _STREAMS_WRAPPED.add(id(s))
 
 
 # ── leak control on the server's messages ───────────────────────────────────────────────────────────────────
@@ -813,6 +876,7 @@ def install_message_filter(server=None) -> bool:
 
         server.send_sync = send_sync
         install_log_redaction()
+        install_stream_redaction()
         q = getattr(server, "prompt_queue", None)
         if q is not None and hasattr(q, "task_done"):
             orig_done = q.task_done

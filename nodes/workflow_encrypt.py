@@ -282,6 +282,24 @@ def _clear(fp: str) -> None:
         _fails.pop(fp, None)
 
 
+def _verify_same_password(file, password: str) -> None:
+    """The password must open the file it claims to be the same as (counted like any decrypt attempt)."""
+    wrapper = parse_file(file)
+    if wrapper["scheme"] != SCHEME_PASSWORD:
+        raise Malformed("The file you opened was not protected with a password.")
+    fp = wrapper["fingerprint"]
+    wait = _locked_out(fp)
+    if wait > 0:
+        raise PermissionError(f"Too many wrong passwords. Try again in {int(wait // 60) + 1} minute(s).")
+    try:
+        decrypt_password(wrapper, password)
+    except VaultError as exc:
+        if not isinstance(exc, (Malformed, NeedsSecret)):
+            _note_failure(fp)
+        raise
+    _clear(fp)
+
+
 # ── route bodies (plain functions: body dict in, dict out) ──────────────────────────────────────────────────────
 def encrypt(body: dict) -> dict:
     scheme = str(body.get("scheme") or SCHEME_FERNET)
@@ -289,6 +307,8 @@ def encrypt(body: dict) -> dict:
         raise Malformed(f"Unknown encryption scheme {scheme[:30]!r}.")
     workflow = body.get("workflow")
     if scheme == SCHEME_PASSWORD:
+        if body.get("same_as_file") is not None:           # V5 review P2-10: same password = the opened file's one
+            _verify_same_password(body["same_as_file"], str(body.get("password") or ""))
         file = encrypt_password(workflow, str(body.get("password") or ""))
         return {"ok": True, "file": file, "fingerprint": file["fingerprint"], "remembered": False}
     same = body.get("same_key_of")

@@ -8,12 +8,16 @@ limit, and carries the vault's licence key (LK) wrapped to that installation's X
 Ed25519 key whose public half is bound into the vault header (AES-GCM associated data), so only that Author can issue
 licences for that vault.
 
-What is cryptographic and what is not (README "Licences", design 6.1):
-  cryptographic   no licence for this installation -> no LK -> the vault cannot be decrypted here; a licence works only
-                  on its installation and only for its vault; nobody but the Author can issue one; after a licence-key
-                  rotation, later versions of the vault refuse earlier licences.
-  honour-system   expiry, not-before, run count, the clock check, "newest licence wins": kept by the unmodified H2Vault
-                  runtime; someone who already ran the vault and modifies software on their own machine can ignore them.
+What licences are and are not (README "Licences", design 6.1, independent review P1-1):
+  they stop casual sharing  the workflow FILE does not run on an installation without a licence for it; a licence
+                  works only on its installation (its X25519 key unwraps LK) and only for its vault; nobody but the
+                  Author can sign one; after a licence-key rotation, later copies of the vault refuse earlier licences.
+  they are not DRM  LK is ONE key per vault, shared by every licensee, and present in the decrypted plaintext: any
+                  licensee can extract it on their own machine and pass it on (with a modified H2Vault the copy then
+                  runs anywhere). Revoking = rotating LK and sending the new copy to the others only.
+  honour-system   expiry, not-before, run count, the clock check, "newest licence wins" (best_for_run: the newest
+                  licence that opens this copy decides; an older one is never used instead): kept by the unmodified
+                  H2Vault runtime; someone who modifies software on their own machine can ignore them.
 
 Everything stays on the machine: no network call is ever made. Stored state lives in H2Vault's secrets store (OS
 credential store or its encrypted file): scopes `licences`, `licence_usage`, `licence_clock`, `licence_ledger`,
@@ -29,7 +33,8 @@ import re
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 PREFIX = "h2vl1:"
 MAX_TEXT = 4096
@@ -385,22 +390,20 @@ def policy(lic: dict, now: Optional[float] = None) -> Optional[str]:
     return check_policy(lic, now=now, used_runs=usage(lic["lid"])["runs"], last_seen=clock_last_seen())
 
 
-def best_for_run(vault_id: str, *, author_pub: bytes, install_pub: bytes,
-                 now: Optional[float] = None) -> tuple:
-    """-> (licence, None) for the newest stored licence that verifies for this vault and installation and may run
-    now, else (None, refusal text). The refusal names the newest matching licence's problem."""
+def best_for_run(vault_id: str, *, author_pub: bytes, install_pub: bytes, now: Optional[float] = None,
+                 opens: Optional[Callable[[dict], bool]] = None) -> tuple:
+    """-> (licence, None) or (None, refusal text). The NEWEST stored licence that verifies for this vault and
+    installation - and, with `opens`, that opens this copy of the vault (after a licence-key rotation an installation
+    may hold licences for the old and the new copy) - decides alone: when its end date or run limit is reached the run
+    is refused, an older licence for the same copy is never used instead (review P1-2: "newest licence wins")."""
     now = float(now if now is not None else time.time())
-    valid = []
-    for t in stored(vault_id):
-        try:
-            valid.append(verify(parse(t), author_pub=author_pub, vault_id=vault_id, install_pub=install_pub))
-        except LicenceError:
-            continue
-    if not valid:
+    cands = candidates(vault_id, author_pub=author_pub, install_pub=install_pub)
+    if not cands:
         return None, NEEDS_LICENCE
-    lic = max(valid, key=lambda m: m["issued"])
-    u = usage(lic["lid"])
-    problem = check_policy(lic, now=now, used_runs=u["runs"], last_seen=clock_last_seen())
+    lic = next((c for c in cands if opens is None or opens(c)), None)
+    if lic is None:
+        return None, OTHER_VERSION
+    problem = policy(lic, now)
     return (None, problem) if problem else (lic, None)
 
 
@@ -458,14 +461,21 @@ def _author_aad(obj: dict) -> bytes:
 
 
 def export_author(password: str) -> dict:
-    """The author key as a password-protected file object (Argon2id + AES-256-GCM; the header is the AAD)."""
+    """The author key as a password-protected file object (Argon2id + AES-256-GCM; the header is the AAD). The
+    route asks for the vault password + authenticator first (review P1-4); this function only encrypts."""
+    priv = author_private_key(create=False)
+    if priv is None:
+        raise LicenceError("This installation has no author key yet.")
+    return _encrypt_author(priv, password)
+
+
+def _encrypt_author(priv: bytes, password: str) -> dict:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     from . import crypto
 
     if not isinstance(password, str) or len(password) < 8:
         raise LicenceError("Choose a password of at least 8 characters for the backup.")
-    priv = author_private_key(create=True)
     salt = os.urandom(crypto.SALT_LEN)
     kdf = dict(crypto.ARGON2_V1)
     obj = {"format": AUTHOR_FILE_FORMAT, "v": 1, "kdf": kdf, "salt": b64u(salt),
@@ -475,8 +485,8 @@ def export_author(password: str) -> dict:
     return {**obj, "nonce": b64u(nonce), "ct": b64u(ct)}
 
 
-def import_author(obj: Any, password: str, replace: bool = False) -> str:
-    """Restore an author key backup. -> its key id."""
+def read_author_file(obj: Any, password: str) -> bytes:
+    """Decrypt an author key backup. -> the raw private key (never stored by this function)."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     from . import crypto
@@ -492,17 +502,40 @@ def import_author(obj: Any, password: str, replace: bool = False) -> str:
         kdf = {k: int(obj["kdf"][k]) for k in ("memory_kib", "iterations", "lanes")}
         crypto.check_kdf(kdf)
         salt, nonce, ct = unb64u(obj["salt"]), unb64u(obj["nonce"]), unb64u(obj["ct"])
-        header = {**obj, "kdf": obj["kdf"]}
-        priv = AESGCM(crypto.kek_from_password(str(password or "x"), salt, kdf)).decrypt(
-            nonce, ct, _author_aad(header))
+        priv = AESGCM(crypto.kek_from_password(str(password or "x"), salt, kdf)).decrypt(nonce, ct, _author_aad(obj))
     except crypto.VaultError as exc:
         raise LicenceError("This author key file is malformed.") from exc
     except Exception as exc:  # noqa: BLE001
         raise LicenceError(WRONG_FILE_PASSWORD) from exc
-    kid = key_id(ed25519_public(priv))
+    if len(priv) != 32:
+        raise LicenceError("This author key file is malformed.")
+    return priv
+
+
+def backup_current_author(password: str) -> Optional[Path]:
+    """Before a replace: the current author key, encrypted with `password`, as a dated file in the H2Vault user
+    folder (review P1-4). -> its path, or None when there is no current key."""
+    from . import secrets_store
+
+    priv = author_private_key(create=False)
+    if priv is None:
+        return None
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    path = secrets_store._user_dir() / f"author-key-backup-{stamp}-{key_id(ed25519_public(priv))}.h2vauthor"
+    path.write_text(json.dumps(_encrypt_author(priv, password), indent=1), encoding="utf-8")
+    return path
+
+
+def store_author(priv: bytes) -> None:
+    _ss().set_(SCOPE_AUTHOR, _AUTHOR_NAME, base64.b64encode(priv).decode("ascii"))
+
+
+def import_author(obj: Any, password: str, replace: bool = False) -> str:
+    """Restore an author key backup (no proof checks: the route does them). -> its key id."""
+    priv = read_author_file(obj, password)
     with _lock:
         cur = author_private_key(create=False)
         if cur and cur != priv and not replace:
             raise LicenceError(OTHER_AUTHOR_KEY)
-        _ss().set_(SCOPE_AUTHOR, _AUTHOR_NAME, base64.b64encode(priv).decode("ascii"))
-    return kid
+        store_author(priv)
+    return key_id(ed25519_public(priv))

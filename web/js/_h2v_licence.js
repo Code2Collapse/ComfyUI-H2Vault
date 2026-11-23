@@ -1,11 +1,16 @@
 // H2Vault (AGPL-3.0) - workstream V5, offline licences (docs/h2vault/V5_enhancements_design.md section 6): the pure
 // part of the licence UI - status lines, the "valid until" choices and the terms sent to /h2vault/licence/issue.
+// What licences are (review P1-1): they stop casual sharing of the workflow FILE - without a licence for that
+// installation it does not run. They are not DRM: a workflow has ONE licence key shared by every licensee, so a
+// determined licensee can extract it from their own machine and pass it on; revoking = a new licence key.
 // The idea of per-recipient access keys with an expiry was inspired by ComfyUI-XLJworkflowCipher (weiqing1987); no
 // code or text was taken from it. See NOTICE. No DOM, no ComfyUI import (tests run it under node).
 
-export const HONOUR_NOTE = "Expiry dates and run limits are kept by H2Vault on the other person's computer. Someone " +
-  "who has already run the workflow and changes software on their own machine can ignore them. What cannot be " +
-  "bypassed: without a licence for their installation the workflow does not run at all.";
+export const HONOUR_NOTE = "A licence stops casual sharing: the workflow file alone does not run without a licence " +
+  "for that installation. It is not copy protection: someone who has a licence can, with effort, extract the " +
+  "workflow's licence key on their own machine and pass it on. End dates and run limits are kept by H2Vault on " +
+  "their computer and can be ignored by modified software. To cut people off, revoke (new licence key) and send " +
+  "the new copy only to the others.";
 
 export const EXPIRY_CHOICES = Object.freeze([
   { value: "none", label: "No end date" },
