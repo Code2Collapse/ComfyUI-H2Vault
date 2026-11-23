@@ -505,6 +505,9 @@ def open_for_edit(body: dict) -> dict:
                          "lock": plain.get("lock"),                        # V5
                          "licensing": v2_licensing(plain),                 # V5: an edit keeps the licence key
                          "second_factor": plain.get("second_factor"),      # an edit keeps the author's methods
+                         # L9.327: commit rebuilds the inside; these were lost on every edit (model download links,
+                         # editor name labels, creation time)
+                         "carry": {key: plain[key] for key in ("models", "access_labels", "created") if key in plain},
                          "client_id": str(body.get("client_id") or "")}
     out = {"ok": True, "edit_token": token, "interface": plain.get("interface"), "profile": _EDITS[token]["profile"],
            **_factor_answer(detail)}
@@ -755,6 +758,8 @@ def commit(body: dict) -> dict:
              "updated": int(time.time())}
     if isinstance(s.get("second_factor"), dict):
         plain["second_factor"] = s["second_factor"]
+    for key, value in (s.get("carry") or {}).items():          # L9.327: never drop what the author set up
+        plain.setdefault(key, value)
     public = _with_conceal(plain, conceal)
     # V5: an explicit `lock` is checked strictly; the session's lock is kept only while it still fits the inside
     public_lock = (_with_lock(plain, body["lock"]) if "lock" in body
