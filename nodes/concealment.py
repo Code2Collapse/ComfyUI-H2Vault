@@ -43,10 +43,51 @@ CONCEALED_PREFIX = "H2Vault/concealed"
 CONCEALED_LOG_LINE = "[H2Vault] concealed output"
 CONCEALED_EXCEPTION_TYPE = "H2VaultConcealedError"
 
+# Vault OUTPUT types (design S11; owner 2026-11-23). A concealed vault never hands out a model. The decision is by
+# type name (output_type_kind) at sealing, plus a check of the real VALUE at run time (check_output_value).
+# `*` is NOT a model type: a wildcard output is judged by what really reaches it (review_outputs traces it).
 MODEL_BEARING_TYPES = frozenset({
     "MODEL", "CLIP", "VAE", "CLIP_VISION", "CONTROL_NET", "STYLE_MODEL", "GLIGEN", "UPSCALE_MODEL",
-    "LATENT_UPSCALE_MODEL", "HOOKS", "LORA_MODEL", "PHOTOMAKER", "IPADAPTER", "INSTANTID", "PULID", "INSIGHTFACE", "*",
+    "LATENT_UPSCALE_MODEL", "HOOKS", "LORA_MODEL", "PHOTOMAKER", "IPADAPTER", "INSTANTID", "PULID", "INSIGHTFACE",
+    # custom packs, checked in their code (2026-11-23): SeC SeCModelLoader, Impact KSamplerWrapper / UpscalerWrapper
+    # (both hold the model), LivePortrait cropper (face models), WhisperX ASR pipeline, cubiq FaceAnalysis
+    "SEC_MODEL", "KSAMPLER", "KSAMPLER_ADVANCED", "UPSCALER", "LPCROPPER", "WHISPER_ASR", "FACE_ANALYSIS",
 })
+_SEALING_V1_MODEL_TYPES = frozenset({
+    "MODEL", "CLIP", "VAE", "CLIP_VISION", "CONTROL_NET", "STYLE_MODEL", "GLIGEN", "UPSCALE_MODEL",
+    "LATENT_UPSCALE_MODEL", "HOOKS", "LORA_MODEL", "PHOTOMAKER", "IPADAPTER", "INSTANTID", "PULID", "INSIGHTFACE"})
+# any type NAME with one of these words is treated as model-bearing (custom packs name their model types this way:
+# SAM_MODEL, SAM2MODEL, BBOX_DETECTOR, BASIC_PIPE, PIPE_LINE, WANVAE, WANTEXTENCODER, WANVIDLORA ...)
+_MODEL_WORDS = re.compile(r"MODEL|CLIP|VAE|PIPE|CHECKPOINT|CKPT|LORA|PREDICTOR|DETECTOR|GUIDER|IPADAPTER|INSIGHTFACE"
+                          r"|CONTROL_?NET|UNET|ENCODER|UPSCALER|CLASSIFIER|RESAMPLER|(?:^|_)SAM\d*(?:_|$)")
+# core's plain data types: never flagged, nothing to say about them
+CORE_DATA_TYPES = frozenset({
+    "IMAGE", "MASK", "LATENT", "AUDIO", "VIDEO", "STRING", "INT", "FLOAT", "BOOLEAN", "COMBO", "CONDITIONING",
+    "SIGMAS", "NOISE", "SAMPLER", "TIMESTEPS_RANGE", "TRACKS", "LOSS_MAP", "BBOX", "POINT", "WAN_CAMERA_EMBEDDING",
+})
+# data types whose NAME has a model word, decided from their producer's code (2026-11-23):
+#   SAM3_TRACK_DATA      core comfy_extras/nodes_sam3.py SAM3_VideoTrack -> comfy/ldm/sam3/tracker.py: a dict of
+#                        packed_masks (tensor), n_frames, scores, orig_size - no model, no predictor
+#   CLIP_VISION_OUTPUT   comfy/clip_vision.py Output: tensors (image_embeds, last_hidden_state, ...)
+#   AUDIO_ENCODER_OUTPUT comfy/audio_encoders: a dict of tensors
+DECIDED_DATA_TYPES = frozenset({"SAM3_TRACK_DATA", "CLIP_VISION_OUTPUT", "AUDIO_ENCODER_OUTPUT"})
+
+
+def output_type_kind(t) -> str:
+    """'model' (hands out something that could be saved as a model), 'data' (core data or a decided custom data
+    type), 'custom' (another custom type: allowed, checked at run time), 'any' (a wildcard / run-time type)."""
+    s = str(getattr(t, "value", t) if t is not None else "").strip().upper()
+    if not s or s == "*" or s == "ANY" or s.startswith("COMFY_"):
+        return "any"
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) > 1:
+        kinds = {output_type_kind(p) for p in parts}
+        return next(k for k in ("model", "any", "custom", "data") if k in kinds)
+    if s in CORE_DATA_TYPES or s in DECIDED_DATA_TYPES:
+        return "data"
+    if s in MODEL_BEARING_TYPES or _MODEL_WORDS.search(s):
+        return "model"
+    return "custom"
 HOSTED_ALLOWED_CLASSES = frozenset({
     "H2Vault_ProtectedSubgraph", "H2Vault_ProtectedSubgraphOutput", "LoadImage", "LoadImageMask", "PreviewImage",
     "SaveImage", "PrimitiveInt", "PrimitiveFloat", "PrimitiveString", "PrimitiveStringMultiline", "PrimitiveBoolean",
@@ -187,8 +228,9 @@ def _contains_term(s, low_terms) -> Optional[str]:
 
 # ── sealing (author side) ───────────────────────────────────────────────────────────────────────────────────
 
-def check_public(plain, interface=None) -> list:
-    """Author-facing problems that would make the published vault name its inside; [] = fine to seal."""
+def check_public(plain, interface=None, *, class_of: Optional[Callable[[str], Any]] = None) -> list:
+    """Author-facing problems that would make the published vault name its inside or hand out a model; [] = fine to
+    seal. `class_of(class_type)` -> node class (default: ComfyUI's registry) - used to trace wildcard outputs."""
     if not is_concealed(plain):
         return ["This vault is not concealed (no conceal section)."]
     iface = _iface(plain, interface)
@@ -205,12 +247,7 @@ def check_public(plain, interface=None) -> list:
         for s in iface.get(kind) or []:
             if isinstance(s, dict):
                 public(s.get("name"), f"Socket {s.get('name')!r}")
-    out_types = [s.get("type") for s in (iface.get("out") or []) if isinstance(s, dict)]
-    out_types += [o.get("type") for o in (_api(plain).get("outputs") or []) if isinstance(o, dict)]
-    for t in sorted({str(t) for t in out_types if t is not None}):
-        if t.upper() in MODEL_BEARING_TYPES:
-            problems.append(f"An output of type {t} would hand out a model (it could be saved and identified). "
-                            "Expose images, latents, masks, audio or video instead.")
+    problems += [r["message"] for r in review_outputs(plain, interface, class_of=class_of) if r["blocking"]]
     aliases = _aliases(plain)
     params = [p for p in (iface.get("params") or []) if isinstance(p, dict)]
     by_key = {str(p.get("key")): p for p in params}
@@ -243,6 +280,185 @@ def check_public(plain, interface=None) -> list:
         if str(pv) not in inner:
             problems.append("A preview is declared for a node that is not inside the vault.")
     return problems
+
+
+# ── the vault's outputs (owner 2026-11-23): what each one really carries ──────────────────────────────────────
+
+def _is_link(v) -> bool:
+    return isinstance(v, (list, tuple)) and len(v) == 2 and isinstance(v[0], str) and isinstance(v[1], int) \
+        and not isinstance(v[1], bool)
+
+
+def _tname(t) -> str:
+    if isinstance(t, (list, tuple)):
+        return "COMBO"
+    return str(getattr(t, "value", t) if t is not None else "")
+
+
+def _signature(cls):
+    """(output types, {input name: type}) of a V1 class or a V3 schema node; (None, {}) when unreadable."""
+    info = None
+    if cls is not None and hasattr(cls, "GET_NODE_INFO_V1"):
+        try:
+            info = cls.GET_NODE_INFO_V1()
+        except Exception:  # noqa: BLE001
+            info = None
+    if isinstance(info, dict):
+        outs, spec = info.get("output"), info.get("input") or {}
+    else:
+        try:
+            outs = getattr(cls, "RETURN_TYPES", None)
+        except Exception:  # noqa: BLE001
+            outs = None
+        try:
+            spec = cls.INPUT_TYPES() if cls is not None else {}
+        except Exception:  # noqa: BLE001 - a broken INPUT_TYPES says nothing
+            spec = {}
+    outs = [_tname(o) for o in outs] if isinstance(outs, (list, tuple)) else None
+    ins = {}
+    for section in ("required", "optional"):
+        sect = spec.get(section) if isinstance(spec, dict) else None
+        if isinstance(sect, dict):
+            for name, v in sect.items():
+                ins[name] = _tname(v[0] if isinstance(v, (list, tuple)) and v else v)
+    return outs, ins
+
+
+UNKNOWN = "?"
+
+
+def _types_of(t) -> frozenset:
+    return frozenset(p.strip().upper() for p in _tname(t).split(",") if p.strip())
+
+
+def _trace(api, nid, slot, class_of, memo, depth=0) -> frozenset:
+    """The concrete types that can reach output `slot` of inner node `nid`: its declared type, or - for a wildcard
+    output (Lazy Switch, any-switches, reroute-like nodes) - the union over its wildcard inputs, followed upstream.
+    UNKNOWN stands for "cannot be told before it runs" (a node not installed, a wildcard with nothing to follow)."""
+    key = (str(nid), slot)
+    if key in memo:
+        return memo[key]                       # in progress (a malformed cycle) contributes nothing
+    if depth > 64:
+        return frozenset({UNKNOWN})
+    memo[key] = frozenset()
+    res = frozenset({UNKNOWN})
+    node = (api.get("nodes") or {}).get(str(nid)) if isinstance(api, dict) else None
+    if isinstance(node, dict):
+        cls = class_of(node.get("class_type"))
+        outs, ins = _signature(cls) if cls is not None else (None, {})
+        if outs is not None and isinstance(slot, int) and 0 <= slot < len(outs):
+            if output_type_kind(outs[slot]) != "any":
+                res = _types_of(outs[slot])
+            else:
+                found: set = set()
+                for name, v in (node.get("inputs") or {}).items():
+                    if name in ins and output_type_kind(ins[name]) != "any":
+                        continue                   # a typed input (the switch's BOOLEAN) is not passed through
+                    if _is_link(v):
+                        found |= _trace(api, v[0], v[1], class_of, memo, depth + 1)
+                    elif isinstance(v, dict) and isinstance(v.get("vault_in"), int):
+                        found |= _vault_in_types(api, v["vault_in"])
+                res = frozenset(found) or frozenset({UNKNOWN})
+    memo[key] = res
+    return res
+
+
+def _vault_in_types(api, i) -> frozenset:
+    ins = api.get("inputs") if isinstance(api, dict) else None
+    t = ins[i].get("type") if isinstance(ins, list) and 0 <= i < len(ins) and isinstance(ins[i], dict) else None
+    return frozenset({UNKNOWN}) if output_type_kind(t) == "any" else _types_of(t)
+
+
+_RUN_CHECK = "When the vault runs, it checks the value and stops it if it carries a model."
+
+
+def _a(t: str) -> str:
+    return f"an {t}" if t[:1] in "AEIOU" else f"a {t}"
+
+
+def review_outputs(plain, interface=None, *, class_of: Optional[Callable[[str], Any]] = None) -> list:
+    """One entry per vault output: {index, key, name, type, shown, resolved, verdict, blocking, message, fixes}.
+    verdict: "model" (blocking: it hands out a model), "data", "custom" (a custom type), "unknown" (a wildcard that
+    cannot be traced; allowed - the run-time check stops a model). `fixes` are the dialog's actions: "remove" (take
+    the output out of the vault), "unconceal" (lock without concealment), "show_as" (publish a traced wildcard as its
+    one concrete type). Text names only the socket's public label and type names."""
+    class_of = class_of or _class_of
+    api, iface = _api(plain), _iface(plain, interface)
+    outs = [o for o in (api.get("outputs") or []) if isinstance(o, dict)]
+    socks = [s for s in (iface.get("out") or []) if isinstance(s, dict)]
+    memo: dict = {}
+    review = []
+    for j in range(max(len(outs), len(socks))):
+        o = outs[j] if j < len(outs) else {}
+        s = socks[j] if j < len(socks) else {}
+        name = str(s.get("name") or o.get("name") or f"Output {j + 1}")
+        real = _tname(o.get("type", s.get("type", "*")))
+        shown = _tname(s.get("type", real))
+        key = None
+        if "node" in o:
+            key = f"{o.get('node')}#{o.get('slot')}"
+        elif "input" in o:
+            key = f"in:{o.get('input')}"
+        r = {"index": j, "key": key, "name": name, "type": real, "shown": shown, "blocking": False, "message": "",
+             "fixes": []}
+        if "input" in o:                         # the recipient's own input passed straight through
+            r.update(resolved=sorted(_types_of(real)) or [UNKNOWN], verdict="data")
+            review.append(r)
+            continue
+        if output_type_kind(real) == "any":
+            resolved = _trace(api, o.get("node"), o.get("slot"), class_of, memo) if "node" in o else {UNKNOWN}
+        else:
+            resolved = _types_of(real)
+        resolved = sorted(resolved)
+        r["resolved"] = resolved
+        known = [t for t in resolved if t != UNKNOWN]
+        models = [t for t in known if output_type_kind(t) == "model"]
+        customs = [t for t in known if output_type_kind(t) == "custom"]
+        wild = output_type_kind(real) == "any"
+        if models or output_type_kind(shown) == "model":
+            what = " or ".join(_a(t) for t in (models or [shown.upper()]))
+            r.update(verdict="model", blocking=True, fixes=[{"id": "remove"}, {"id": "unconceal"}],
+                     message=(f"Output {name!r} (type *) can pass on {what} from inside" if wild else
+                              f"Output {name!r} gives out {what}") +
+                     ": a model the person who runs the vault could save and identify. Remove this output from the "
+                     "vault, or lock without concealment.")
+        elif UNKNOWN in resolved:
+            r.update(verdict="unknown", message=f"Output {name!r} (type *) passes on a value whose type cannot be told "
+                                                f"before it runs. {_RUN_CHECK}")
+        elif customs:
+            r.update(verdict="custom", message=f"Output {name!r} is {' or '.join(_a(t) for t in customs)}: the person "
+                                               f"who runs the vault sees this type name. {_RUN_CHECK}")
+        else:
+            r["verdict"] = "data"
+            decided = [t for t in known if t in DECIDED_DATA_TYPES]
+            if wild:
+                r["message"] = f"Output {name!r} (type *) carries {' or '.join(_a(t) for t in known)}."
+                if len(known) == 1 and shown.upper() != known[0]:
+                    r["fixes"] = [{"id": "show_as", "type": known[0]}]
+            elif decided:
+                r["message"] = (f"Output {name!r} is {_a(decided[0])} (checked: data only, no model). The person who "
+                                "runs the vault sees this type name.")
+        if shown != real and r["verdict"] != "model":
+            # "show as": allowed only for a wildcard that carries exactly that one data type
+            if not (wild and r["verdict"] == "data" and [shown.upper()] == known):
+                r.update(blocking=True, fixes=[{"id": "show_as_undo"}],
+                         message=f"Output {name!r} cannot be shown as {shown}: it carries "
+                                 f"{' or '.join(_a(t) for t in known) or 'a value of unknown type'}.")
+        review.append(r)
+    return review
+
+
+def review_inputs(plain, interface=None) -> list:
+    """Notes (never blocking) about the vault's inputs: an input of a model type means the person who runs the vault
+    wires in their own model - nothing of the author's leaves through it."""
+    notes = []
+    for s in (_iface(plain, interface).get("in") or []):
+        if isinstance(s, dict) and output_type_kind(s.get("type")) == "model":
+            t = _tname(s.get("type"))
+            notes.append({"name": str(s.get("name") or ""), "type": t, "blocking": False,
+                          "message": f"Input {str(s.get('name') or '')!r} takes {_a(t)}: the person who runs the "
+                                     f"vault wires in their own {t}. Nothing of yours leaves through it."})
+    return notes
 
 
 PUBLIC_PARAM_FIELDS = ("name", "type", "value", "options", "min", "max", "step", "multiline")
@@ -280,6 +496,7 @@ def merge_exposure(api, interface, conceal):
     sockets = conceal.get("sockets") if isinstance(conceal.get("sockets"), dict) else {}
     outs = sockets.get("out") if isinstance(sockets.get("out"), dict) else {}
     iface_out = iface.get("out") if isinstance(iface.get("out"), list) else []
+    shown = sockets.get("types") if isinstance(sockets.get("types"), dict) else {}
     for j, o in enumerate(api.get("outputs") or []):
         if not isinstance(o, dict) or "node" not in o:
             continue
@@ -288,6 +505,11 @@ def merge_exposure(api, interface, conceal):
             o["name"] = label.strip()
             if j < len(iface_out) and isinstance(iface_out[j], dict):
                 iface_out[j]["name"] = label.strip()
+        # "Show it as <type>" (owner 2026-11-23): only the PUBLIC socket type changes; the real type stays in `api`
+        # and check_public / review_outputs verify that the output really carries exactly that type
+        t = shown.get(f"{o.get('node')}#{o.get('slot')}")
+        if isinstance(t, str) and t.strip() and j < len(iface_out) and isinstance(iface_out[j], dict):
+            iface_out[j]["type"] = t.strip().upper()
     ins = sockets.get("in") if isinstance(sockets.get("in"), dict) else {}
     iface_in = iface.get("in") if isinstance(iface.get("in"), list) else []
     api_in = api.get("inputs") if isinstance(api.get("inputs"), list) else []
@@ -341,7 +563,9 @@ def resolve_params(plain, params: dict) -> dict:
         return params
     out_types = [o.get("type") for o in (_api(plain).get("outputs") or []) if isinstance(o, dict)]
     out_types += [s.get("type") for s in (_iface(plain).get("out") or []) if isinstance(s, dict)]
-    if any(str(t).upper() in MODEL_BEARING_TYPES for t in out_types if t is not None):
+    # what sealing has always refused (a vault sealed before 2026-11-23 keeps running as it did); everything else -
+    # wildcards and newly recognised model types included - is checked by VALUE when it runs (guard_outputs)
+    if any(str(t).upper() in _SEALING_V1_MODEL_TYPES for t in out_types if t is not None):
         raise ConcealError("This protected workflow offers an output that cannot be concealed. Ask its author for a "
                            "fresh copy.")
     names = {str(p.get("key")): str(p.get("name") or "a control")
@@ -356,6 +580,151 @@ def resolve_params(plain, params: dict) -> dict:
                                "Pick one of its listed choices.")
         out[key] = table[label]
     return out
+
+
+# ── run time: the vault's outputs are checked BEFORE they leave (owner 2026-11-23, defence in depth) ──────────
+# A concealed vault's expansion routes every inner output through one H2Vault_OutputCheck node, which refuses a
+# value that is or contains a model (torch module, ComfyUI model wrapper, anything with weights to save). This is
+# what lets a wildcard output whose type cannot be traced be allowed at sealing.
+
+OUTPUT_CHECK_TYPE = "H2Vault_OutputCheck"
+REFUSED_PREFIX = "The protected workflow stopped its output"
+# methods that give out weights: torch state_dict / parameters, ComfyUI ModelPatcher.model_state_dict, CLIP / VAE get_sd
+_WEIGHT_METHODS = ("state_dict", "parameters", "named_parameters", "model_state_dict", "get_sd")
+_MAX_DEPTH, _MAX_VISITS = 8, 20000
+
+
+class H2VaultOutputRefused(RuntimeError):
+    """A concealed vault's output carried a model. Its text names only the public socket label."""
+
+
+OutputRefused = H2VaultOutputRefused
+
+
+class _Budget(Exception):
+    pass
+
+
+def _carries_model(value) -> bool:
+    """Is `value` a model, or does it contain one (dict / list / tuple / set values, dataclass fields, an object's
+    attributes, a bound method's object, a closure's or partial's captured values)? Depth- and size-capped; a value
+    past the caps (a very large list of tensors) is not refused - the type check at sealing still applies."""
+    import sys as _sys
+    torch = _sys.modules.get("torch")
+    np = _sys.modules.get("numpy")
+    tensor = getattr(torch, "Tensor", None) if torch is not None else None
+    module = getattr(getattr(torch, "nn", None), "Module", None) if torch is not None else None
+    seen: set = set()
+    visits = [0]
+
+    def walk(v, depth) -> bool:
+        if v is None or isinstance(v, (str, bytes, bytearray, int, float, complex, bool, range)):
+            return False
+        if module is not None and isinstance(v, module):
+            return True
+        if tensor is not None and isinstance(v, tensor):
+            return False
+        if np is not None and isinstance(v, (np.ndarray, np.generic)):
+            return False
+        if isinstance(v, type):
+            return False
+        if id(v) in seen:
+            return False
+        seen.add(id(v))
+        visits[0] += 1
+        if visits[0] > _MAX_VISITS:
+            raise _Budget
+        cls = type(v)
+        if any(callable(getattr(cls, m, None)) for m in _WEIGHT_METHODS):
+            return True
+        if depth >= _MAX_DEPTH:
+            return False
+        if isinstance(v, dict):
+            return any(walk(x, depth + 1) for x in list(v.values()))
+        if isinstance(v, (list, tuple, set, frozenset)) or cls.__name__ == "deque":
+            return any(walk(x, depth + 1) for x in list(v))
+        kids = []
+        if hasattr(v, "__self__") and not isinstance(getattr(v, "__self__", None), type(_sys)):
+            kids.append(getattr(v, "__self__", None))          # a bound method carries its object
+        for c in getattr(v, "__closure__", None) or ():
+            try:
+                kids.append(c.cell_contents)
+            except ValueError:
+                pass
+        if cls.__name__ == "partial":
+            kids += [getattr(v, "func", None), getattr(v, "args", ()), getattr(v, "keywords", None)]
+        try:
+            kids += list(vars(v).values())
+        except TypeError:
+            pass
+        for slot in getattr(cls, "__slots__", ()) or ():
+            if isinstance(slot, str) and hasattr(v, slot):
+                kids.append(getattr(v, slot, None))
+        return any(walk(x, depth + 1) for x in kids)
+
+    try:
+        return walk(value, 0)
+    except _Budget:
+        log.debug("[H2Vault] output check: value too large to walk completely")
+        return False
+    except RecursionError:
+        return False
+
+
+def check_output_value(value, label: str) -> None:
+    if _carries_model(value):
+        raise H2VaultOutputRefused(
+            f"{REFUSED_PREFIX} \"{str(label)[:80]}\" because it carries a model, which could be saved and identified. "
+            "Ask the workflow's author for a copy without that output.")
+
+
+class _AnyType(str):
+    def __ne__(self, other):
+        return False
+
+
+class H2Vault_OutputCheck:
+    """Internal: placed by a concealed H2Vault vault between its inside and each of its outputs (never added by
+    hand). Passes the value on unchanged, or stops the run if the value carries a model."""
+
+    CATEGORY = "H2Vault"
+    FUNCTION = "check"
+    RETURN_TYPES = (_AnyType("*"),)
+    RETURN_NAMES = ("value",)
+    INPUT_IS_LIST = True                       # one call sees every item of a list output, unchanged
+    OUTPUT_IS_LIST = (True,)
+    DEV_ONLY = True                            # hidden from the node library (core 0.39 node_info "dev_only")
+    DESCRIPTION = ("Used inside a concealed H2Vault vault when it runs: lets the vault's output through unless it "
+                   "carries a model. Added automatically; not for use in a workflow.")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"value": (_AnyType("*"), {}), "label": ("STRING", {"default": ""})}}
+
+    def check(self, value, label=None):
+        name = label[0] if isinstance(label, list) and label else (label or "an output")
+        for item in (value if isinstance(value, list) else [value]):
+            check_output_value(item, str(name))
+        return (value,)
+
+
+def guard_outputs(plain, graph: dict, result: list, prefix: str, display_id) -> tuple:
+    """Route every inner output of a CONCEALED vault's expansion through H2Vault_OutputCheck. Outputs that pass a
+    boundary input straight on (an outer link) are the recipient's own value and are left as they are. Ordinary
+    vaults are returned unchanged. -> (graph, result)."""
+    if not is_concealed(plain):
+        return graph, result
+    socks = [s for s in (_iface(plain).get("out") or []) if isinstance(s, dict)]
+    graph, result = dict(graph), list(result)
+    for j, r in enumerate(result):
+        if not (_is_link(r) and r[0] in graph):
+            continue
+        cid = f"{prefix}h2v_out{j}"
+        label = str(socks[j].get("name") or f"Output {j + 1}") if j < len(socks) else f"Output {j + 1}"
+        graph[cid] = {"class_type": OUTPUT_CHECK_TYPE, "inputs": {"value": list(r), "label": label},
+                      "override_display_id": str(display_id)}
+        result[j] = [cid, 0]
+    return graph, result
 
 
 # ── functional phase names (owner 2026-11-23): what a step DOES, in simple words, never what it is ─────────────
@@ -651,6 +1020,13 @@ class Concealer:
             d["executed"] = [x for x in d["executed"] if self.vault_of(x) is None]
         if event == "execution_error":
             text = f"{d.get('exception_type', '')} {d.get('exception_message', '')}".lower()
+            raw = str(d.get("exception_message") or "")
+            if str(d.get("exception_type") or "").endswith(H2VaultOutputRefused.__name__) and \
+                    raw.startswith(REFUSED_PREFIX):
+                # the vault's own output check: its text names only a public socket label - say what happened
+                d.update({"exception_type": CONCEALED_EXCEPTION_TYPE, "exception_message": raw[:400],
+                          "traceback": [], "current_inputs": {}, "current_outputs": []})
+                return d
             if "out of memory" in text or "outofmemory" in text:
                 msg = MSG_OOM
             elif "filenotfound" in text or "no such file" in text or "not found" in text:

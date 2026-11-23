@@ -450,6 +450,8 @@ class H2Vault_ProtectedSubgraph:
         from comfy_execution.graph_utils import GraphBuilder
         prefix = GraphBuilder.alloc_prefix()
         graph, result = build_expansion(api, my_inputs, params, prefix, str(unique_id))
+        # owner 2026-11-23: a concealed vault's outputs pass a model check before they leave (no-op otherwise)
+        graph, result = concealment.guard_outputs(plain, graph, result, prefix, str(unique_id))
         from . import provision                                # V7: hash-named model copies, server side
         graph = provision.remap(graph, plain)
         graph = concealment.after_expansion(str(unique_id), plain, graph, prefix)   # V3: registers a concealed run
@@ -900,8 +902,12 @@ def install_message_filter(server=None) -> bool:
 NODE_CLASS_MAPPINGS = {
     "H2Vault_ProtectedSubgraph": H2Vault_ProtectedSubgraph,
     "H2Vault_ProtectedSubgraphOutput": H2Vault_ProtectedSubgraphOutput,
+    # internal (DEV_ONLY, hidden from the library): the expansion of a concealed vault uses it - core runs only
+    # registered classes (owner 2026-11-23, run-time output check)
+    concealment.OUTPUT_CHECK_TYPE: concealment.H2Vault_OutputCheck,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H2Vault_ProtectedSubgraph": "H2Vault (protected subgraph)",
     "H2Vault_ProtectedSubgraphOutput": "H2Vault (protected subgraph, saves)",
+    concealment.OUTPUT_CHECK_TYPE: "H2Vault output check (internal)",
 }

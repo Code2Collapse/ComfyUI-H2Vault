@@ -39,7 +39,9 @@ const TYPE_LABEL = { IMAGE: "Image", LATENT: "Latent", MASK: "Mask", CONDITIONIN
 
 const isFile = (v) => typeof v === "string" && FILE_RE.test(v);
 const humanize = (s) => { const t = String(s).replace(/_+/g, " ").trim(); return t.charAt(0).toUpperCase() + t.slice(1); };
-const typeLabel = (t) => TYPE_LABEL[String(t).toUpperCase()] ?? humanize(String(t).toLowerCase() || "Value");
+const typeLabel = (t, kind = "out") => (String(t ?? "*").trim() === "*" || !String(t ?? "").trim() ?
+  (kind === "in" ? "Input" : "Output") :                        // a wildcard socket: never the name "*"
+  TYPE_LABEL[String(t).toUpperCase()] ?? humanize(String(t).toLowerCase()));
 
 /** The role of one inner control (by its input name, value and spec). */
 export function roleOf(name, value, spec = {}) {
@@ -182,11 +184,12 @@ export function socketsOf({ kind, nodes = [], boundary = null, sg = null } = {})
       const l = linkOf(sub, (inp.linkIds || [])[0]);
       const t = l && sub.getNodeById?.(l.target_id);
       const name = t?.inputs?.[l.target_slot]?.widget?.name ?? t?.inputs?.[l.target_slot]?.name;
-      if (t && name) socks.push({ kind: "in", key: `${t.id}:${name}`, type: String(inp.type || "*"), label: typeLabel(inp.type) });
+      if (t && name) socks.push({ kind: "in", key: `${t.id}:${name}`, type: String(inp.type || "*"), label: typeLabel(inp.type, "in") });
     });
-    (sub.outputs || []).forEach((o) => {
+    (sub.outputs || []).forEach((o, j) => {
       const l = linkOf(sub, (o.linkIds || [])[0]);
-      if (l) socks.push({ kind: "out", key: `${l.origin_id}#${l.origin_slot}`, type: String(o.type || "*"), label: typeLabel(o.type) });
+      if (l) socks.push({ kind: "out", key: `${l.origin_id}#${l.origin_slot}`, type: String(o.type || "*"),
+        label: typeLabel(o.type), wires: (sg.outputs?.[j]?.links || []).length });
     });
     return numberLabels(socks);
   }
@@ -196,13 +199,14 @@ export function socketsOf({ kind, nodes = [], boundary = null, sg = null } = {})
     if (seenIn.has(outer)) continue;
     seenIn.add(outer);
     socks.push({ kind: "in", key: `${e.target_id}:${e.widget ?? e.target_name}`, type: String(e.type || "*"),
-      label: typeLabel(e.type) });
+      label: typeLabel(e.type, "in") });
   }
   for (const e of boundary?.leaving || []) {
     const key = `${e.origin_id}#${e.origin_slot}`;
     if (seenOut.has(key)) continue;
     seenOut.add(key);
-    socks.push({ kind: "out", key, type: String(e.type || "*"), label: typeLabel(e.type) });
+    socks.push({ kind: "out", key, type: String(e.type || "*"), label: typeLabel(e.type),
+      wires: (boundary.leaving || []).filter((x) => `${x.origin_id}#${x.origin_slot}` === key).length });
   }
   return numberLabels(socks);
 }
@@ -244,11 +248,19 @@ export function buildConceal(inv, { title = "", sockets = [], previews = [] } = 
     controls.push(entry);
   }
   const sock = { in: {}, out: {} };
+  const types = {};
   for (const s of sockets || []) {
+    if (s.kind === "out" && s.drop) continue;          // removed from the vault (owner 2026-11-23)
     const label = String(s.label || "").trim();
-    if (!label) { problems.push("Every socket needs a name - one is empty."); continue; }
+    if (!label) {
+      problems.push(`The ${s.kind === "in" ? "input" : "output"} socket of type ${s.type || "*"} needs a name - ` +
+        "its name field is empty.");
+      continue;
+    }
     sock[s.kind === "in" ? "in" : "out"][s.key] = label;
+    if (s.kind === "out" && s.showAs) types[s.key] = String(s.showAs);
   }
+  if (Object.keys(types).length) sock.types = types;
   return { conceal: { version: 1, title: String(title).trim(), controls, aliases, sockets: sock,
     previews: (previews || []).map(String) }, problems };
 }
@@ -257,12 +269,31 @@ export function buildConceal(inv, { title = "", sockets = [], previews = [] } = 
  *  values, the author's own node titles, socket types. Sealing judges the real extracted graph again. */
 export function candidate(nodes, sockets = []) {
   const list = (nodes || []).filter((n) => n && !isSub(n));
+  const byId = new Map(list.map((n) => [String(n.id), n]));
+  // the real source of a wire: frontend-only nodes (a legacy Reroute) are followed through their first input, like
+  // graphToPrompt does; null when the source is not one of these nodes (a subgraph input, a nested subgraph)
+  const sourceOf = (g, id, slot, depth = 0) => {
+    const n = byId.get(String(id)) ?? g?.getNodeById?.(id) ?? null;
+    if (!n || depth > 32) return null;
+    if (n.isVirtualNode && !isSub(n)) {
+      const l = linkOf(n.graph ?? g, (n.inputs || [])[0]?.link);
+      return l ? sourceOf(n.graph ?? g, l.origin_id, l.origin_slot, depth + 1) : null;
+    }
+    return byId.has(String(n.id)) ? [String(n.id), Number(slot)] : null;
+  };
   const apiNodes = {};
   for (const n of list) {
     const inputs = {};
     for (const w of n.widgets || []) {
       if (!w?.name || typeof w.value === "function" || String(w.name).startsWith("$$") || FRONTEND_ONLY.has(w.name)) continue;
       inputs[w.name] = w.value;
+    }
+    // owner 2026-11-23: the inner wires, so the check can trace a "*" output to what really reaches it
+    for (const inp of n.inputs || []) {
+      const l = inp?.link != null ? linkOf(n.graph, inp.link) : null;
+      const src = l && sourceOf(n.graph, l.origin_id, l.origin_slot);
+      const name = inp.widget?.name ?? inp.name;
+      if (src && name) inputs[name] = src;
     }
     apiNodes[String(n.id)] = { class_type: String(n.type), inputs };
   }
@@ -272,9 +303,10 @@ export function candidate(nodes, sockets = []) {
       const [nid, name] = String(s.key).split(":");
       if (apiNodes[nid]) apiNodes[nid].inputs[name] = { vault_in: ins.length };
       ins.push({ name: String(s.label || ""), type: String(s.type || "*") });
-    } else {
+    } else if (!s.drop) {
       const [nid, slot] = String(s.key).split("#");
-      outs.push({ name: String(s.label || ""), type: String(s.type || "*"), node: nid, slot: Number(slot) });
+      const src = sourceOf(list[0]?.graph, nid, Number(slot)) ?? [nid, Number(slot)];
+      outs.push({ name: String(s.label || ""), type: String(s.type || "*"), node: src[0], slot: src[1] });
     }
   }
   const titled = list.map((n) => ({ id: n.id, type: String(n.type), title: String(n.title || "") }))
@@ -282,4 +314,43 @@ export function candidate(nodes, sockets = []) {
   return { api: { nodes: apiNodes, inputs: ins, outputs: outs, promoted: [] },
     interface: { in: ins.map((x) => ({ ...x })), out: outs.map(({ name, type }) => ({ name, type })), params: [] },
     ui: { definitions: [{ id: "candidate", nodes: titled }] } };
+}
+
+// ── owner 2026-11-23: the dialog's per-output fixes ("never a dead end") ───────────────────────────────────────
+/** Apply one fix the server's output review offers (nodes/concealment.py review_outputs) to an output socket:
+ *  "remove" (the output leaves the vault when it is locked), "keep" (undo), "show_as" (publish a traced "*" output as
+ *  its one concrete type), "show_as_undo". -> true when something changed. */
+export function applyOutputFix(sock, fix) {
+  if (!sock || sock.kind !== "out" || !fix) return false;
+  if (fix.id === "remove") { sock.drop = true; return true; }
+  if (fix.id === "keep") { sock.drop = false; return true; }
+  // a socket still called by its default name ("Output") is renamed after the type it is shown as, and back
+  if (fix.id === "show_as" && fix.type) {
+    if (sock.label === typeLabel(sock.showAs ?? sock.type)) sock.label = typeLabel(fix.type);
+    sock.showAs = String(fix.type);
+    return true;
+  }
+  if (fix.id === "show_as_undo") {
+    if (sock.showAs && sock.label === typeLabel(sock.showAs)) sock.label = typeLabel(sock.type);
+    delete sock.showAs;
+    return true;
+  }
+  return false;
+}
+
+/** The keys of the outputs the author removed (the protect transaction removes them from the subgraph). */
+export function droppedOutputs(sockets) {
+  return (sockets || []).filter((s) => s.kind === "out" && s.drop).map((s) => s.key);
+}
+
+/** The server's review entries -> the output socket each belongs to (Map socket -> entry), by key; entries of
+ *  outputs with the same inner source go to the next socket with that key. Removed sockets get none. */
+export function matchReview(sockets, review) {
+  const outs = (sockets || []).filter((s) => s.kind === "out" && !s.drop);
+  const map = new Map();
+  (review || []).forEach((r, j) => {
+    const s = outs.find((x) => x.key === r?.key && !map.has(x)) ?? (!map.has(outs[r?.index ?? j]) ? outs[r?.index ?? j] : null);
+    if (s) map.set(s, r);
+  });
+  return map;
 }

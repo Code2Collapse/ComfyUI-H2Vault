@@ -5,7 +5,7 @@
 // (POST /h2vault/vault/conceal/check). Problems are shown inline and block locking until fixed.
 //
 // Text only (never HTML), native form controls (keyboard and screen readers work as everywhere), H2Vault tokens.
-import { ROLES, buildConceal } from "./_h2v_expose.js";
+import { ROLES, applyOutputFix, buildConceal, droppedOutputs, matchReview } from "./_h2v_expose.js";
 import { renderPreview } from "./_h2v_conceal.js";
 import { el, ensureVaultStyles, vbutton } from "./_h2v_ui.js";
 
@@ -56,6 +56,14 @@ const CSS = `
   font-size: 11.5px; }
 .h2v-pv__more { grid-column: 1 / -1; font-size: 11px; color: var(--h2v-ink-dim); }
 .h2v-pv__empty { margin: 0; padding: 8px 10px; font-size: 12px; color: var(--h2v-ink-dim); }
+.h2v-xsock__status { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center;
+  font-size: 12px; }
+.h2v-xsock__status:empty { display: none; }
+.h2v-xsock__msg { flex-basis: 100%; color: var(--h2v-ink-soft); line-height: 1.4; }
+.h2v-xsock__msg--danger { color: var(--h2v-danger); }
+.h2v-xrow--blocking > .h2v-input { border-color: var(--h2v-danger); }
+.h2v-xrow--flash { outline: 2px solid var(--h2v-danger); outline-offset: 3px; border-radius: var(--h2v-r-ctl); }
+.h2v-xproblems li button { margin-left: 6px; }
 `;
 
 function ensureStyles() {
@@ -81,7 +89,7 @@ const nextAlias = (rows) => {
  * asks the server (-> {problems, public_interface}). Returns {el, ready(), refresh(), destroy()}; ready() resolves with
  * {ok, conceal, problems} after the latest check.
  */
-export function exposeStep({ controls, sockets, previews, title, check }) {
+export function exposeStep({ controls, sockets, previews, title, check, onUnconceal = null, onChecked = null }) {
   ensureStyles();
   const rowsByLabel = new Map();          // label input -> control (for inline marks)
   const list = el("div", { class: "h2v-expose__list" });
@@ -106,6 +114,7 @@ export function exposeStep({ controls, sockets, previews, title, check }) {
     recount();
     list.append(group);
   }
+  const sockRows = new Map();             // socket -> {row, inp, status} (owner 2026-11-23: per-output state + fixes)
   if (sockets.length) {
     const group = el("fieldset", { class: "h2v-xgroup" }, [el("legend", { text: "Socket names" })]);
     for (const s of sockets) {
@@ -113,11 +122,97 @@ export function exposeStep({ controls, sockets, previews, title, check }) {
         "aria-label": `Name of the ${s.kind === "in" ? "input" : "output"} socket (${s.type})` });
       inp.addEventListener("input", () => { s.label = inp.value; schedule(); });
       rowsByLabel.set(inp, () => s.label);
-      group.append(el("div", { class: "h2v-xrow" }, [el("span"), inp,
-        el("span", { class: "h2v-xsock__type", text: `${s.kind === "in" ? "Input" : "Output"} · ${s.type}` })]));
+      const status = el("div", { class: "h2v-xsock__status", role: "group", "aria-live": "polite" });
+      const row = el("div", { class: "h2v-xrow" }, [el("span"), inp,
+        el("span", { class: "h2v-xsock__type", text: `${s.kind === "in" ? "Input" : "Output"} · ${s.type}` }), status]);
+      sockRows.set(s, { row, inp, status });
+      group.append(row);
     }
     list.append(group);
   }
+
+  // ── output fixes: every blocking problem names its socket and offers a way out, right on its row ──
+  function fix(s, f) {
+    if (!applyOutputFix(s, f)) return;
+    for (const u of sockRows.values()) u.row.classList.remove("h2v-xrow--flash");
+    renderSockets(lastReview);
+    schedule();
+  }
+  const msg = (text, danger = false) => el("span", { class: `h2v-xsock__msg${danger ? " h2v-xsock__msg--danger" : ""}`, text });
+  const act = (label, onClick, { kind = "secondary", disabled = false, hint = null } = {}) => {
+    const b = vbutton(label, { kind, small: true, onClick });
+    b.disabled = disabled;
+    if (hint) b.title = hint;
+    return b;
+  };
+  const sharedText = (n) => `This subgraph is used ${n} more time${n === 1 ? "" : "s"} in the workflow, so this ` +
+    "output cannot be removed here (it would change the other copies). Remove the output inside the subgraph " +
+    "yourself, or lock without concealment.";
+  function statusOf(s, r, inputNotes) {
+    if (s.kind === "in") {
+      const n = inputNotes.find((x) => x.name === String(s.label || "").trim());
+      return n ? [msg(n.message)] : [];
+    }
+    if (s.drop) {
+      const w = s.wires || 0;
+      return [msg(`Removed: this output is not part of the vault when you lock it${w ? `, and its ${w} wire` +
+        `${w === 1 ? "" : "s"} outside will be disconnected` : ""}.`),
+        act("Keep this output", () => fix(s, { id: "keep" }))];
+    }
+    if (!r) return [];
+    const out = [];
+    if (r.message) out.push(msg(r.message, !!r.blocking));
+    for (const f of r.fixes || []) {
+      if (f.id === "remove") {
+        const shared = s.shared || 0;
+        out.push(act("Remove this output from the vault", () => fix(s, f), {
+          kind: r.blocking ? "primary" : "secondary", disabled: shared > 0, hint: shared > 0 ? sharedText(shared) : null }));
+        if (shared > 0) out.push(msg(sharedText(shared)));
+      } else if (f.id === "unconceal" && onUnconceal) {
+        out.push(act("Lock without concealment", () => onUnconceal()));
+      } else if (f.id === "show_as") {
+        out.push(act(`Show it as ${f.type}`, () => fix(s, f)));
+      } else if (f.id === "show_as_undo") {
+        out.push(act("Show its real type", () => fix(s, f), { kind: "primary" }));
+      }
+    }
+    if (s.showAs && !r.blocking) {
+      out.push(msg(`Shown to the person who runs the vault as ${s.showAs}.`));
+      out.push(act("Show its real type", () => fix(s, { id: "show_as_undo" })));
+    }
+    return out;
+  }
+  let lastReview = { outputs: [], inputs: [] };
+  function renderSockets(review) {
+    const m = matchReview(sockets, review?.outputs || []);
+    for (const [s, ui] of sockRows) {
+      const r = m.get(s);
+      if (ui.inp.value !== s.label && document.activeElement !== ui.inp) ui.inp.value = s.label;
+      ui.inp.disabled = !!s.drop;
+      ui.row.classList.toggle("h2v-xrow--off", !!s.drop);
+      ui.row.classList.toggle("h2v-xrow--blocking", !!r?.blocking && !s.drop);
+      ui.status.replaceChildren(...statusOf(s, r, review?.inputs || []));
+    }
+  }
+  function reveal(row) {
+    if (!row) return;
+    row.scrollIntoView?.({ block: "center", behavior: "smooth" });
+    row.classList.add("h2v-xrow--flash");
+    setTimeout(() => row.classList.remove("h2v-xrow--flash"), 1800);
+    const target = row.querySelector(".h2v-xsock__status button:not([disabled])") ?? row.querySelector("input:not([disabled])");
+    target?.focus?.({ preventScroll: true });
+  }
+  const rowOfProblem = (p) => {
+    for (const [s, ui] of sockRows) {
+      const l = String(s.label || "").trim();
+      if (l && (p.includes(`'${l}'`) || p.includes(`"${l}"`))) return ui.row;
+    }
+    for (const [inp, get] of rowsByLabel) {
+      const l = String(get() || "").trim();
+      if (l && (p.includes(`'${l}'`) || p.includes(`"${l}"`))) return inp.closest(".h2v-xrow");
+    }
+    return null;
+  };
 
   function controlRow(c, changed) {
     const id = uid("c");
@@ -174,7 +269,10 @@ export function exposeStep({ controls, sockets, previews, title, check }) {
   // ── the check (debounced; the latest answer wins) ──
   let timer = null, gen = 0, pending = null, last = { ok: false, conceal: null, problems: [] };
   function showProblems(problems) {
-    problemsEl.replaceChildren(...problems.map((p) => el("li", { text: p })));
+    problemsEl.replaceChildren(...problems.map((p) => {
+      const row = rowOfProblem(p);
+      return el("li", {}, [p, row ? vbutton("Show me", { kind: "text", small: true, onClick: () => reveal(row) }) : null]);
+    }));
     for (const [inp, get] of rowsByLabel) {
       const l = String(get() || "").trim();
       const bad = !inp.disabled && (!l || problems.some((p) => p.includes(`'${l}'`) || p.includes(`"${l}"`)));
@@ -191,13 +289,16 @@ export function exposeStep({ controls, sockets, previews, title, check }) {
     catch (e) { server = { problems: [String(e?.message || e || "The check could not run.")], public_interface: null }; }
     if (my !== gen) return last;
     const problems = [...new Set([...local, ...(server.problems || [])])];
+    lastReview = { outputs: server.outputs || [], inputs: server.inputs || [] };
+    renderSockets(lastReview);
     showProblems(problems);
     if (server.public_interface) renderPreview(pvHost, server.public_interface);
     const ok = !problems.length && !!server.public_interface;
     stateEl.className = `h2v-xstate${ok ? " h2v-xstate--ok" : ""}`;
     stateEl.textContent = ok ? "This is all the recipient will see." :
       `${problems.length} thing${problems.length === 1 ? "" : "s"} to fix before locking.`;
-    last = { ok, conceal, problems };
+    last = { ok, conceal, problems, dropped: droppedOutputs(sockets) };
+    onChecked?.(last);
     return last;
   }
   function schedule() {
@@ -209,7 +310,12 @@ export function exposeStep({ controls, sockets, previews, title, check }) {
     el: root,
     refresh: schedule,
     async ready() { clearTimeout(timer); return run(); },
-    focusProblem() { (list.querySelector("[aria-invalid=true]") ?? problemsEl).focus?.(); },
+    // "Fix what is listed": scroll to the first row that blocks, highlight it, focus its first fix
+    focusProblem() {
+      const first = [...sockRows.values()].find((u) => u.row.classList.contains("h2v-xrow--blocking"))?.row ??
+        list.querySelector("[aria-invalid=true]")?.closest(".h2v-xrow");
+      if (first) reveal(first); else problemsEl.scrollIntoView?.({ block: "nearest" });
+    },
     destroy() { clearTimeout(timer); gen++; },
     get pending() { return pending; },
   };

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**Vault outputs when locking with concealment** - "Lock as a vault" no longer refuses a subgraph with no way out:
+
+- A `*` (any-type) output is judged by what really reaches it: it is traced through pass-through nodes (Lazy Switch,
+  any-switches, reroutes) to the nodes that make the value. Masks, images and other data pass; an output that can
+  carry a model is refused; one that cannot be traced is allowed, because the vault checks it when it runs.
+- Model outputs are recognised beyond the core types (`SEC_MODEL`, `SAM_MODEL`, detectors, pipes, `WANVAE`, ...).
+  `SAM3_TRACK_DATA` is data (masks and scores only) and passes.
+- When a concealed vault runs, every output is checked before it leaves the vault: a value that is or contains a
+  model (a torch module, a ComfyUI model, CLIP or VAE) stops the run with a plain message naming only the output.
+  This uses a hidden internal node, `H2Vault_OutputCheck`.
+- Every problem in "Choose what to expose" names the output and offers fixes on its row: *Remove this output from the
+  vault*, *Lock without concealment*, *Show it as MASK* (for a traced `*` output). Locking with problems left scrolls
+  to and highlights the row; the notice goes away once the problems are fixed. A `*` socket is no longer called "*".
+
 ## 0.2.0 - 2026-11-23
 
 **Zero information (V8)** - a concealed vault tells nobody (and no AI reading the page, the logs, the history or the
