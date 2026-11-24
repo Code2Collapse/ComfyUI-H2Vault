@@ -28,6 +28,7 @@ server's absolute path) and `workflow` (a side file) are not passed to the vault
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections import OrderedDict
 from typing import Any, Callable, Optional
@@ -141,6 +142,37 @@ def _kind(key: str, entry: dict) -> str:
     return "file"
 
 
+FILE_TYPES = frozenset({"output", "temp", "input"})
+
+
+def safe_file(entry) -> bool:
+    """L9.342 (owner PART 3 F): a file reference the vault may show - a bare file name, a relative sub folder without
+    "..", one of core's media folder types. Core's /view checks again; this keeps anything else off the vault (and off
+    the browser's URL bar) entirely."""
+    if not isinstance(entry, dict):
+        return False
+    name, sub, typ = entry.get("filename"), entry.get("subfolder", ""), entry.get("type")
+    if not isinstance(name, str) or not name or len(name) > 255 or name in (".", ".."):
+        return False
+    if any(c in name for c in "/\\:\x00"):
+        return False
+    if sub is None:
+        sub = ""
+    if not isinstance(sub, str) or len(sub) > 512 or any(c in sub for c in ":\x00") or sub[:1] in ("/", "\\"):
+        return False
+    if ".." in sub.replace("\\", "/").split("/"):
+        return False
+    return typ is None or (isinstance(typ, str) and typ in FILE_TYPES)
+
+
+def _file_fields(e: dict) -> dict:
+    f = {k: e[k] for k in FILE_FIELDS if k in e and isinstance(e[k], (str, int, float)) and not isinstance(e[k], bool)}
+    fr = f.get("frame_rate")
+    if fr is not None and not (isinstance(fr, (int, float)) and math.isfinite(fr) and 0 < fr <= 1000):
+        f.pop("frame_rate")                               # the player's frame stepping needs a real rate, else it measures
+    return f
+
+
 def merge(groups: list) -> dict:
     """[(label, inner ui output)] -> the vault's output (see the module docstring)."""
     images, items, animated = [], [], False
@@ -155,13 +187,19 @@ def merge(groups: list) -> dict:
                 if len(items) >= MAX_ITEMS:
                     break
                 if isinstance(e, dict) and isinstance(e.get("filename"), str) and e.get("filename"):
+                    if not safe_file(e):                  # counted on the vault, never shown or linked
+                        items.append({"label": label, "kind": "other", "source": key, "unsafe": True})
+                        continue
                     kind = _kind(key, e)
-                    f = {k: e[k] for k in FILE_FIELDS if k in e and isinstance(e[k], (str, int, float))}
+                    f = _file_fields(e)
                     core = key == "images" and kind == "image"
                     if core:
                         images.append({k: v for k, v in e.items() if k not in ("fullpath", "workflow")})
                         animated = animated or (anim and _ext(e["filename"]) in (".webp", ".png"))
-                    items.append({"label": label, "kind": kind, "source": key, "file": f, "core": core})
+                    item = {"label": label, "kind": kind, "source": key, "file": f, "core": core}
+                    if kind == "image" and anim:
+                        item["animated"] = True
+                    items.append(item)
                 elif isinstance(e, (str, int, float)) and not isinstance(e, bool) and key in ("text", "string"):
                     items.append({"label": label, "kind": "text", "source": key, "text": str(e)[:MAX_TEXT]})
                 else:
@@ -182,6 +220,8 @@ def history_form(groups: list) -> dict:
     for _label, output in groups:
         for key, val in (output or {}).items():
             vals = list(val) if isinstance(val, (list, tuple)) else [val]
+            vals = [x for x in vals if not (isinstance(x, dict) and isinstance(x.get("filename"), str)
+                                            and not safe_file(x))]      # L9.342: no unsafe file reference
             vals = [{k: v for k, v in x.items() if k not in ("fullpath",)} if isinstance(x, dict) else x for x in vals]
             out[key] = list(out.get(key, [])) + vals
     return out

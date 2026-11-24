@@ -329,18 +329,41 @@ runs and stops if one would hand out a model.
 - Password boxes no longer trigger the browser's "Save password?" prompt, and a page reload no longer asks again for
   a Locked vault's password.
 
-## Previews from inside show on the vault (2026-11-23)
+## Previews from inside show on the vault (2026-11-23, viewer 2026-11-24)
 
-Lock preview or save nodes inside a vault and their results appear on the vault node when you queue it:
+Lock preview or save nodes inside a vault and their results appear on the vault node when you queue it, in one
+*Previews from inside* viewer (classic and Nodes 2.0, also when the vault sits inside a subgraph):
 
-- **Images** (Preview Image, Save Image, any node that shows images): ComfyUI's own image preview on the vault, all of
-  them together (several preview nodes inside = one gallery), in classic and Nodes 2.0.
-- **Videos, audio, text** (VHS Video Combine, Save Video, Save Audio, "show text" nodes): a *Previews from inside*
-  panel on the vault plays and shows them.
-- **Live sampler previews** of a sampler inside the vault, also with KJNodes' **Model Preview Override** (its live
-  frames show in the vault's panel, with the step count).
+- **Navigation**: every preview is one entry - previous / next buttons, "3 / 7", and a chip per label that jumps to it.
+  Switching never restarts the run, and each video keeps its own position, pause, speed, loop and volume.
+- **Images** (Preview Image, Save Image, any node that shows images; PNG, JPEG, WebP, GIF, ...): fit, actual size,
+  zoom buttons, + / - / 0 / 1 keys and the mouse wheel once the image is clicked (or Ctrl + wheel), drag to pan, a
+  **Large view** over the whole window with previous / next, and *Original* to open the file. Animated GIF / WebP play.
+- **Videos** (VHS Video Combine, Save Video, ...): a real player streamed from the file - play / pause, back / forward
+  1 s, a draggable seek bar, current / total time, previous / next **frame** at the clip's own frame rate (VHS reports
+  it; otherwise it is measured while the clip plays, and "assuming 30" shows until then), **reverse playback**, loop,
+  speed 0.25x-2x, mute and volume, fullscreen, *Inspect* (the current frame in the large view) and *Frame* (save the
+  current frame as PNG). Keys when the player has focus: Space play / pause, Left / Right (or , / .) frame step, Shift
+  +Left / Right 1 s, J reverse, Home / End, L loop, M mute, F fullscreen. A format the browser cannot decode (ProRes in
+  Chrome, for example) is said in words, with a link to the file.
+- **Audio and text**: an audio player; text with a *Copy* button.
+- **Live sampler previews**: while the inside runs, the sampler's frames show at the top of the viewer with
+  "step 12 / 30" - core samplers (KSampler, KSampler Advanced, custom samplers), KJNodes' **Model Preview Override**,
+  older servers without preview metadata, and Video Helper Suite's animated-preview format (also KJNodes' LTX2
+  preview override): VHS draws those itself when its *animated previews* setting is on, else the viewer shows them.
+  For a vault inside a subgraph, the subgraph's node also shows the frame.
+  A new run clears them; the results replace them; if a run shows no results, the last frame stays, captioned.
 - **Progress**: the vault's bar follows the step that runs inside (a sampler's steps).
 - **Cached runs**: when ComfyUI serves the vault from its cache, its previews come back too.
+
+How reverse playback works: browsers do not play video backwards reliably (Chrome and Firefox refuse a negative speed),
+so the player keeps the video paused and steps it back one frame position at a time against the clock, one seek at a
+time (slow decoders drop frames instead of piling up seeks).
+
+ComfyUI's own image preview and live preview are no longer drawn on the vault node (they showed everything twice);
+the history, the queue and the assets panel still list the files. Trade-offs: the queue's thumbnail of a running
+job shows no live frame for a vault on the main graph (the frame is on the vault), and the vault node has no core
+"Open Image" / "Save Image" menu entries (the viewer's *Original* and *Large view* replace them).
 
 Each preview is labelled **Preview 1, Preview 2, ...** (the inner graph's order) or with a name you give in the lock
 dialog (*Previews › Preview names*) - never with an inner node's name, type or id. The lock dialog has **Show previews
@@ -350,6 +373,9 @@ encryption.
 
 What a preview can say: saved files keep the file name prefix / folder you set (the person who runs the vault sees
 them in their output folder anyway; the dialog warns when a prefix is your own), and a text preview shows its text.
-VHS's server file path is not passed on, nor KJNodes' sigma schedule. Concealed vaults show only the previews their
-author ticked, saved under H2Vault's own neutral file prefix. Kinds the panel cannot show (anything that is not an image, video,
-audio or text) are named by label and counted, never dropped silently.
+VHS's server file path is not passed on, nor KJNodes' sigma schedule. A file reference that is not a plain file name in
+ComfyUI's output / temp / input folders (a path, "..", a drive letter) is never shown or linked: it is counted and
+said. Live captions never name a node or an extension. Nothing of the viewer is saved; frames grabbed for *Inspect* /
+*Frame* are released when closed. Concealed vaults show only the previews their author ticked, saved under H2Vault's
+own neutral file prefix. Kinds the panel cannot show (anything that is not an image, video, audio or text) are named by
+label and counted, never dropped silently.
